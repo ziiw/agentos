@@ -1,28 +1,38 @@
 name: disk
 
 # A bootable agentos disk image (qcow2) for a VM or cloud, on demand:
-# Actions → disk → Run workflow. Takes a while and makes a ~2 GB artifact.
+# Actions → disk → Run workflow. Builds it, boots it in QEMU, logs in over
+# SSH and runs agentos inside the booted system, then uploads the disk
+# (~1.2 GB) as an artifact.
 on:
   workflow_dispatch:
 
 jobs:
   disk:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - name: Build the image into podman's storage
         run: sudo podman build -f image/Containerfile --build-arg AGENTOS_REV="$(git rev-parse --short HEAD)" -t localhost/agentos:latest .
 
-      - name: Make a qcow2 disk with bootc-image-builder
+      - name: Users for the disk
         env:
           # Optional repository secret: your SSH public key, to log in as `agent`.
           SSH_KEY: ${{ secrets.AGENTOS_SSH_KEY }}
         run: |
-          mkdir -p output
+          # A throwaway key for the boot test below; the private half is
+          # never kept, so the `ci` user it creates is unusable afterwards.
+          ssh-keygen -q -t ed25519 -N '' -f boot-test-key
+          printf '[[customizations.user]]\nname = "ci"\nkey = "%s"\ngroups = ["wheel"]\n' "$(cat boot-test-key.pub)" > image/disk.toml
           if [ -n "$SSH_KEY" ]; then
-            printf '[[customizations.user]]\nname = "agent"\nkey = "%s"\ngroups = ["wheel"]\n' "$SSH_KEY" > image/disk.toml
+            printf '\n[[customizations.user]]\nname = "agent"\nkey = "%s"\ngroups = ["wheel"]\n' "$SSH_KEY" >> image/disk.toml
           fi
+
+      - name: Make a qcow2 disk with bootc-image-builder
+        run: |
+          mkdir -p output
           sudo podman run --rm --privileged --pull=newer \
             --security-opt label=type:unconfined_t \
             -v ./image/disk.toml:/config.toml:ro \
@@ -33,6 +43,26 @@ jobs:
             localhost/agentos:latest
           sudo chown -R "$(id -u)" output
           ls -la output/qcow2
+
+      - name: Boot it and run agentos inside
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 >/dev/null
+          accel="-accel tcg"
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; accel="-accel kvm -cpu host"; fi
+          echo "acceleration: $accel"
+          # Boot a copy, so the uploaded disk is the pristine one.
+          cp output/qcow2/disk.qcow2 boot.qcow2
+          qemu-system-x86_64 $accel -m 4096 -smp 2 \
+            -drive file=boot.qcow2,if=virtio \
+            -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n0 \
+            -display none -serial file:serial.log -daemonize
+          vm() { ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -i boot-test-key -p 2222 ci@127.0.0.1 "$@"; }
+          for i in $(seq 120); do vm true && break; sleep 5; done
+          vm true || { echo "never came up over SSH"; tail -50 serial.log; exit 1; }
+          vm 'grep PRETTY_NAME /etc/os-release; agent --version; sudo bootc status --format=humanreadable 2>/dev/null | head -5 || true'
+          vm agent doctor
+          vm 'mkdir -p ~/app && cd ~/app && echo one > notes.txt && agent run -- sh -c "echo two >> notes.txt" && agent diff && test "$(cat notes.txt)" = one && agent commit && test "$(tail -1 notes.txt)" = two && echo "BOOTED SYSTEM: transaction committed"'
+          vm 'cat /usr/lib/motd.d/agentos | head -3'
 
       - uses: actions/upload-artifact@v4
         with:
