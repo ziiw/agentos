@@ -111,6 +111,27 @@ check "store invisible through a read-only grant" "$AGENT" run --ro "$WORK" -- s
 check "store refused as a writable grant" test $? -eq 2
 check "/usr is read-only" "$AGENT" run -- sh -c '! touch /usr/agentos-probe'
 
+section "syscall filter (seccomp)"
+check "seccomp is enforced" bash -c "'$AGENT' run -- true 2>/dev/null; grep -q '\"seccomp\":\"enforced\"' \"\$(ls -td '$AGENTOS_HOME'/tasks/*/ | head -1)events.jsonl\""
+check "no new namespaces from inside (nested sandbox escape)" "$AGENT" run -- sh -c '! unshare -U true 2>/dev/null'
+if command -v python3 >/dev/null && command -v script >/dev/null; then
+  cat > "$PROJ/tiocsti.py" <<'PY'
+import errno, fcntl, termios
+try:
+    fcntl.ioctl(0, termios.TIOCSTI, b"x")
+    print("TIOCSTI allowed")
+except OSError as e:
+    print("TIOCSTI", errno.errorcode[e.errno])
+PY
+  out="$(script -qec "$AGENT run -- python3 tiocsti.py" /dev/null 2>&1)"
+  check "can't type into your terminal (TIOCSTI)" grep -q 'TIOCSTI EPERM' <<<"$out"
+  check "threads, fork and exec still work" "$AGENT" run -- python3 -c '
+import subprocess, threading
+t = threading.Thread(target=lambda: None); t.start(); t.join()
+subprocess.run(["sh", "-c", "true"], check=True)'
+  rm -f "$PROJ/tiocsti.py"
+fi
+
 section "secrets stay out"
 export SECRET_TOKEN=s3cr3t-value
 check "env is scrubbed by default" "$AGENT" run -- sh -c 'test -z "${SECRET_TOKEN:-}"'

@@ -401,7 +401,7 @@ fn describe(p: Paint, e: &Event) -> String {
                 format!("{} {target} · {}", p.red("✗ blocked"), s(&d["reason"]))
             }
         }
-        "sandbox.ready" => format!("landlock {} · proc {}", s(&d["landlock"]), s(&d["proc"])),
+        "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
         "agent.tool" => format!("{} {}", s(&d["name"]), truncate(&s(&d["target"]), 80)),
         "agent.result" => {

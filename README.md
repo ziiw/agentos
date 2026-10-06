@@ -100,6 +100,7 @@ scripts/dev.sh shell
 | network | `agent run`: loopback only by default. `agent do`: the agent's allowlist. `--allow HOST` adds hosts (and switches `agent run` to an allowlist); `--net host` shares your network. |
 | environment | `PATH TERM LANG LC_* TZ USER SHELL EDITOR…`, `HOME`, `AGENTOS_TASK`, and only what you pass with `-e` |
 | the task store | never visible, even through a grant |
+| syscalls | no new namespaces, mounts, bpf, io_uring, keyrings, kernel modules, or typing into your terminal (seccomp) |
 
 Conflicts: if a file changed on your side while the agent worked on its copy, `commit` refuses, tells you which files, and applies nothing. `--force` takes the agent's version.
 
@@ -141,7 +142,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
 - **Credentials are visible to the agent**: the API key it's given, or its login in its own home. The credential broker fixes this.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
-- **No seccomp filter yet.** In particular, on kernels before 6.2 (or with `dev.tty.legacy_tiocsti=1`), a process sharing your terminal can inject keystrokes into it.
+- **The syscall filter is a denylist** (seccomp): it blocks typing into your terminal (TIOCSTI), new namespaces, mounts, kernel modules, bpf, io_uring, keyrings and userfaultfd. Kernel bugs reachable through the remaining syscalls are out of scope until the microVM tier.
 - **Only your own uid is mapped.** Files in a writable grant owned by another user (e.g. root-owned build output) can be read but not modified.
 - **Writable grants must be directories**, and their paths can't contain `,` `:` or `\`.
 - **Conflict detection uses mtimes.** If you *delete* a file on the host that the agent modified, commit recreates it without warning.

@@ -36,7 +36,8 @@ pub fn run(store_root: &Path) -> Vec<Check> {
     } else {
         sandbox(store_root)
     };
-    vec![kernel(), user(), userns_policy(), store, sandbox, landlock()]
+    let userns = userns_policy(sandbox.level == Level::Ok);
+    vec![kernel(), user(), userns, store, sandbox, landlock(), seccomp()]
 }
 
 fn kernel() -> Check {
@@ -58,14 +59,20 @@ fn user() -> Check {
     }
 }
 
-fn userns_policy() -> Check {
+/// `probe_ok`: the live sandbox probe worked, which is what actually counts;
+/// the sysctls only explain a failure.
+fn userns_policy(probe_ok: bool) -> Check {
     let read = |p: &str| fs::read_to_string(p).ok().map(|s| s.trim().to_string());
     if read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref() == Some("1") {
-        return check(
-            "user namespaces",
-            Level::Fail,
-            "AppArmor blocks unprivileged user namespaces (Ubuntu 23.10+); install the profile from README.md",
-        );
+        return if probe_ok {
+            check("user namespaces", Level::Ok, "restricted by AppArmor, allowed for agent by its profile")
+        } else {
+            check(
+                "user namespaces",
+                Level::Fail,
+                "AppArmor blocks unprivileged user namespaces (Ubuntu 23.10+); install the profile from README.md",
+            )
+        };
     }
     if read("/proc/sys/kernel/unprivileged_userns_clone").as_deref() == Some("0") {
         return check("user namespaces", Level::Fail, "disabled: sysctl kernel.unprivileged_userns_clone=1");
@@ -130,6 +137,15 @@ fn sandbox(root: &Path) -> Check {
         11 => check(name, Level::Fail, "can't mount overlayfs in a user namespace (kernel 5.11+, store on ext4/xfs/btrfs)"),
         12 => check(name, Level::Fail, "overlay mounted but writes fail"),
         _ => check(name, Level::Fail, format!("probe failed (code {code})")),
+    }
+}
+
+fn seccomp() -> Check {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    if status.lines().any(|l| l.starts_with("Seccomp:")) {
+        check("seccomp", Level::Ok, "available")
+    } else {
+        check("seccomp", Level::Warn, "not available: sandboxes run without a syscall filter")
     }
 }
 

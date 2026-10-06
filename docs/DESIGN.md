@@ -18,7 +18,7 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Principle | Meaning | Mechanism | Status |
 |---|---|---|---|
 | Agents have their own identity | Each task is its own principal, not "runs as you" | user namespaces, per-task ids, cgroups | ◐ namespaces |
-| Explicit grants, no inherited access | The agent gets *this folder* and *this API with these scopes*, nothing else | mount namespaces, Landlock, seccomp | ◐ fs done |
+| Explicit grants, no inherited access | The agent gets *this folder* and *this API with these scopes*, nothing else | mount namespaces, Landlock, seccomp | ● filesystem + syscalls; per-host network |
 | Local changes are reversible | A task ends as a diff you merge or throw away | overlayfs upper dirs, read-only base | ● |
 | Network is an allowlist | No direct network, not even DNS; an egress proxy outside the sandbox lets through allowed hosts only and journals every connection | private netns + unix-socket proxy | ● |
 | External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | egress proxy + effects broker | ○ Phase 1 |
@@ -85,7 +85,7 @@ supervisor (host)       validates grants, writes the journal, survives Ctrl-C
 - reach the network under `--net none`,
 - alter the record of what it did.
 
-**Out of scope for now.** Kernel exploits (the microVM tier addresses those). Exfiltration under `--net host`, or to an allowed host (an allowlist limits destinations, not content). Abuse of secrets you pass explicitly. Terminal injection on old kernels (seccomp, Phase 1). A malicious *user* rewriting the journal.
+**Out of scope for now.** Kernel exploits (the microVM tier addresses those). Exfiltration under `--net host`, or to an allowed host (an allowlist limits destinations, not content). Abuse of secrets you pass explicitly. A malicious *user* rewriting the journal.
 
 ## Roadmap
 
@@ -129,7 +129,7 @@ It's verified at three levels:
 2. **Egress proxy.** ✅ Done without veth or root: the sandbox has only loopback, and a forwarder inside relays to the proxy through a unix socket. Next: presets (`--allow @pypi`), upstream corporate proxies.
 3. **Credential broker.** Secrets live in the broker. The agent gets placeholder tokens, and the proxy swaps them in on the wire for the allowed host only.
 4. **Effects outbox.** `git push`, mail and API writes are held as pending effects next to the file diff. `agent commit` releases them, or policy auto-releases low-risk ones.
-5. **seccomp profile.** Block TIOCSTI, ptrace of non-children, bpf, keyctl, mount APIs and other unneeded syscalls.
+5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
 6. **cgroups.** CPU, memory and pid limits through a systemd transient scope. Token/$ budgets through the model gateway.
 7. **agentd + API.** Long-running daemon. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
 8. **MCP gateway.** System services exposed as typed tools, governed by the same policy.

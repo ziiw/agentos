@@ -82,6 +82,8 @@ pub struct Spec {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Report {
     pub landlock: String,
+    #[serde(default)]
+    pub seccomp: String,
     pub proc: String,
     pub devpts: bool,
     pub cwd: String,
@@ -202,6 +204,13 @@ fn sandbox_init(spec: &Spec, warnings: Vec<String>, report_tx: OwnedFd, stdout: 
     };
     report.cwd = cwd.display().to_string();
     report.landlock = apply_landlock(spec);
+    report.seccomp = match apply_seccomp() {
+        Ok(()) => "enforced".into(),
+        Err(e) => {
+            report.warnings.push(format!("seccomp filter not applied: {e:#}"));
+            format!("error: {e:#}")
+        }
+    };
 
     let mut proxy_env = Vec::new();
     if spec.proxy.is_some() {
@@ -455,6 +464,85 @@ fn blank_out(target: &Path) -> Result<()> {
     } else {
         bind_ro(Path::new("/dev/null"), target)?;
     }
+    Ok(())
+}
+
+/// Syscalls an agent has no business making: kernel interfaces with a long
+/// record of exploits (bpf, io_uring, keyrings, userfaultfd, perf) and ways
+/// to rearrange its own sandbox (new namespaces, mounts, modules).
+const DENIED_SYSCALLS: &[libc::c_long] = &[
+    libc::SYS_add_key,
+    libc::SYS_request_key,
+    libc::SYS_keyctl,
+    libc::SYS_bpf,
+    libc::SYS_perf_event_open,
+    libc::SYS_userfaultfd,
+    libc::SYS_io_uring_setup,
+    libc::SYS_io_uring_enter,
+    libc::SYS_io_uring_register,
+    libc::SYS_unshare,
+    libc::SYS_setns,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_pivot_root,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_fspick,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_mount_setattr,
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+    libc::SYS_kexec_load,
+    libc::SYS_kexec_file_load,
+    libc::SYS_reboot,
+    libc::SYS_swapon,
+    libc::SYS_swapoff,
+    libc::SYS_acct,
+    libc::SYS_open_by_handle_at,
+];
+
+/// clone(2) flags that create namespaces (NEWNS … NEWNET, NEWTIME).
+const NAMESPACE_FLAGS: &[u64] = &[0x0002_0000, 0x0200_0000, 0x0400_0000, 0x0800_0000, 0x1000_0000, 0x2000_0000, 0x4000_0000, 0x80];
+/// ioctls that push input into a terminal: a sandboxed process sharing your
+/// tty could otherwise type commands into your shell.
+const TIOCSTI: u64 = 0x5412;
+const TIOCLINUX: u64 = 0x541C;
+
+fn apply_seccomp() -> Result<()> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, TargetArch};
+    use std::collections::BTreeMap;
+
+    let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let rule = |arg: u8, len, op, value| -> Result<SeccompRule> {
+        Ok(SeccompRule::new(vec![SeccompCondition::new(arg, len, op, value)?])?)
+    };
+    let mut deny: BTreeMap<i64, Vec<SeccompRule>> = DENIED_SYSCALLS.iter().map(|&s| (s as i64, Vec::new())).collect();
+    // Plain fork and thread creation stay allowed; namespace flags don't.
+    deny.insert(
+        libc::SYS_clone as i64,
+        NAMESPACE_FLAGS.iter().map(|&f| rule(0, SeccompCmpArgLen::Qword, SeccompCmpOp::MaskedEq(f), f)).collect::<Result<_>>()?,
+    );
+    deny.insert(
+        libc::SYS_ioctl as i64,
+        [TIOCSTI, TIOCLINUX].iter().map(|&req| rule(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, req)).collect::<Result<_>>()?,
+    );
+    let deny: BpfProgram =
+        SeccompFilter::new(deny, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32), arch)?.try_into()?;
+    // clone3 passes its flags in memory, out of a filter's reach. ENOSYS makes
+    // libc fall back to clone(2), which is filtered above.
+    let clone3: BpfProgram = SeccompFilter::new(
+        BTreeMap::from([(libc::SYS_clone3 as i64, Vec::new())]),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )?
+    .try_into()?;
+    prctl::set_no_new_privs()?;
+    seccompiler::apply_filter(&clone3)?;
+    seccompiler::apply_filter(&deny)?;
     Ok(())
 }
 
