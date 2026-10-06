@@ -1,7 +1,8 @@
-use agentos::approvals::{self, Asker};
+use agentos::approvals::{self, Asker, Kind, Request};
 use agentos::broker::{self, Broker, Secret};
 use agentos::changes::{self, Summary};
 use agentos::config;
+use agentos::control::{self, Call, PathRules, PathVerdict, Reply};
 use agentos::doctor::{self, Level};
 use agentos::gateway::{self, Budget, Endpoint, Meter, Price};
 use agentos::journal::{Integrity, Journal};
@@ -166,6 +167,9 @@ enum Command {
         /// The file (default: the nearest .agentos.toml from here)
         path: Option<PathBuf>,
     },
+    /// MCP server for agents, run inside their sandbox
+    #[command(hide = true)]
+    Mcp,
 }
 
 #[derive(Args)]
@@ -361,6 +365,11 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(cli: Cli) -> Result<i32> {
+    // Inside a sandbox: no task store there, just the control socket.
+    if let Command::Mcp = cli.command {
+        agentos::mcp::serve_stdio(Path::new(control::SOCKET))?;
+        return Ok(0);
+    }
     let store = Store::open()?;
     match cli.command {
         Command::Do(args) => cmd_do(&store, args),
@@ -380,6 +389,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
         Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
+        Command::Mcp => unreachable!(),
     }
 }
 
@@ -862,6 +872,11 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         eprintln!("  {}", err.dim(format!("limits: {}", l.describe())));
         journal.append("task.limits", json!({ "limits": l, "scope": limits::scope_name() }))?;
     }
+    // The agent's line to agentos (`agent mcp` inside, see control.rs).
+    let control_socket = task.dir.join("control.sock");
+    let mut control_listener = Some(control::bind(&control_socket)?);
+    run_mounts.push(RunMount { src: control_socket.clone(), name: "control.sock".into(), writable: true });
+    run_mounts.push(RunMount { src: std::env::current_exe()?, name: "agent".into(), writable: false });
     // The proxy's socket must exist before the sandbox mounts it, but its
     // threads may only start once the sandbox has been forked.
     let (proxy_socket, mut proxy_listener) = if task.meta.net == Net::Proxy {
@@ -925,6 +940,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         cwd: cwd.clone(),
         env,
         argv: plan.argv,
+        staging: task.dir.join("attach"),
     };
 
     let (stdout_rx, stdout_tx) = match plan.output {
@@ -937,7 +953,10 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     let mut setup_error = None;
     let mut outcome = None;
     let mut proxy_handle = None;
-    let result = sandbox::run(&spec, stdout_tx, |report| {
+    // Grow while the task runs, when the agent asks and you agree.
+    let grants = Arc::new(Mutex::new(task.meta.grants.clone()));
+    let live_allow = Arc::new(std::sync::RwLock::new(allowlist));
+    let result = sandbox::run(&spec, stdout_tx, |report, attacher| {
         let kind = if report.error.is_some() { "sandbox.failed" } else { "sandbox.ready" };
         if let Err(e) = journal.append(kind, json!(report)) {
             eprintln!("{} journal: {e:#}", err.yellow("agent: warning:"));
@@ -946,10 +965,43 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             eprintln!("{} {w}", err.yellow("agent: warning:"));
         }
         setup_error = report.error.clone();
+        let asker = (ask != Ask::Never)
+            .then(|| {
+                let project = approvals::project_root(&cwd, &home_dir().ok()?);
+                Asker::open(store.root(), &project, ask == Ask::TerminalAndConsole, task.id(), &render::title(&task))
+            })
+            .flatten()
+            .map(Arc::new);
         if let Some(listener) = proxy_listener.take() {
-            let approver = (ask != Ask::Never).then(|| approver(store, &cwd, ask, &task, journal.clone(), expected_denials.clone(), err)).flatten();
+            let approver = asker.clone().map(|a| approver(a, journal.clone(), expected_denials.clone(), err));
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
-            proxy_handle = Some(proxy::serve(listener, allowlist, broker, approver, sink));
+            proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, approver, sink));
+        }
+        if let (Some(listener), Ok(home)) = (control_listener.take(), home_dir()) {
+            let control = Control {
+                task_id: task.id().to_string(),
+                store_root: store.root().to_path_buf(),
+                // An agent that could change these would widen its next task.
+                private: vec![store.root().to_path_buf(), config::user_config_path(&home), agents_dir(&home)],
+                hidden: task.meta.hidden.clone(),
+                home,
+                cwd: cwd.clone(),
+                grants: grants.clone(),
+                allow: (task.meta.net == Net::Proxy).then(|| live_allow.clone()),
+                net: task.meta.net,
+                asker: asker.clone(),
+                no_asker: match ask {
+                    Ask::Never => "this task runs without questions (--no-ask)",
+                    _ => "there's no terminal to ask at and agentd isn't running",
+                },
+                attacher,
+                landlock: report.landlock.contains("enforced"),
+                journal: journal.clone(),
+                meter: meter.clone(),
+                outbox: outbox.is_some(),
+                err,
+            };
+            control::serve(listener, Arc::new(move |call| control.handle(call)));
         }
         if let Some(limit) = plan.timeout {
             thread::spawn(move || {
@@ -973,6 +1025,10 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     }
     if let Some(path) = &proxy_socket {
         let _ = fs::remove_file(path);
+    }
+    let _ = fs::remove_file(&control_socket);
+    if let Ok(g) = grants.lock() {
+        task.meta.grants = g.clone();
     }
 
     outbox::seal(&task.dir)?;
@@ -1037,28 +1093,221 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 
 /// Asks at the terminal about hosts outside the allowlist, if there's a
 /// terminal to ask at.
-fn approver(
-    store: &Store,
-    cwd: &Path,
-    ask: Ask,
-    task: &Task,
-    journal: Journal,
-    expected: Vec<(String, String)>,
-    err: Paint,
-) -> Option<proxy::Approver> {
-    let home = home_dir().ok()?;
-    let project = approvals::project_root(cwd, &home);
-    let asker = Asker::open(store.root(), &project, ask == Ask::TerminalAndConsole, task.id(), &render::title(task))?;
-    Some(Arc::new(move |host: &str, port: u16| {
+fn approver(asker: Arc<Asker>, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Approver {
+    Arc::new(move |host: &str, port: u16| {
         if expected.iter().any(|(h, _)| h == host) {
             return false;
         }
-        let (decision, asked) = asker.ask(host, port, |s| err.cyan(s));
+        let (decision, asked) = asker.ask(&Request::host(host, port), |s| err.cyan(s));
         if asked {
             let _ = journal.append("net.approval", json!({ "host": host, "port": port, "decision": decision.label() }));
         }
         decision.allows()
-    }))
+    })
+}
+
+/// Answers what the agent asks agentos from inside its sandbox (through
+/// `agent mcp`): what it has, and more when you agree.
+struct Control {
+    task_id: String,
+    store_root: PathBuf,
+    home: PathBuf,
+    cwd: PathBuf,
+    /// The task store, your config and agent definitions: never offered.
+    private: Vec<PathBuf>,
+    hidden: Vec<PathBuf>,
+    grants: Arc<Mutex<Vec<Grant>>>,
+    /// The proxy's allowlist, when the task has one.
+    allow: Option<proxy::LiveAllowlist>,
+    net: Net,
+    asker: Option<Arc<Asker>>,
+    /// Why nobody can be asked, when there's no asker.
+    no_asker: &'static str,
+    attacher: Arc<sandbox::Attacher>,
+    landlock: bool,
+    journal: Journal,
+    meter: Option<Arc<Meter>>,
+    outbox: bool,
+    err: Paint,
+}
+
+impl Control {
+    fn handle(&self, call: Call) -> Reply {
+        match call {
+            Call::Info => Reply::answer(self.info()),
+            Call::Network { host, port, reason } => self.network(&host, port.unwrap_or(443), &reason),
+            Call::Path { path, write, reason } => self.path(&path, write, &reason),
+        }
+    }
+
+    fn info(&self) -> String {
+        let mut out = vec![format!("This is agentos task {}.", self.task_id)];
+        let grants = self.grants.lock().map(|g| g.clone()).unwrap_or_default();
+        let list = |access: Access| grants.iter().filter(|g| g.access == access).map(|g| g.path.display().to_string()).collect::<Vec<_>>().join(", ");
+        let (rw, ro) = (list(Access::Rw), list(Access::Ro));
+        if !rw.is_empty() {
+            out.push(format!("You can read and change: {rw}. Your changes are held for the user's review, not applied directly."));
+        }
+        if !ro.is_empty() {
+            out.push(format!("You can read: {ro}."));
+        }
+        out.push(format!("System folders (/usr, /etc, …) are read-only. The rest of {} is hidden, apart from your own home.", self.home.display()));
+        out.push(match (&self.allow, self.net) {
+            (Some(allow), _) => {
+                let hosts = allow.read().map(|a| a.describe()).unwrap_or_default();
+                let others = if self.asker.is_some() { "the user is asked about others when you connect" } else { "others are refused" };
+                format!("Network: HTTPS only, through the proxy in $HTTPS_PROXY, to {hosts}; {others}.")
+            }
+            (None, Net::Host) => "Network: unrestricted.".to_string(),
+            (None, _) => "Network: none in this task.".to_string(),
+        });
+        if self.outbox {
+            out.push("git push works, but your pushes are held until the user reviews them.".into());
+        }
+        if let Some(m) = &self.meter {
+            let t = m.totals();
+            out.push(match m.budget() {
+                Some(b) => format!("Budget for model calls: {} used.", t.against(b)),
+                None => format!("Model calls so far: {}.", t.describe()),
+            });
+        }
+        out.push(if self.asker.is_some() {
+            "Need more? request_path_access or request_network_access, with a reason: the user decides.".to_string()
+        } else {
+            format!("Nobody can approve requests for more in this task: {}.", self.no_asker)
+        });
+        out.join("\n")
+    }
+
+    /// Asks you, and journals the request and your answer.
+    fn ask(&self, kind: Kind, target: &str, reason: &str) -> std::result::Result<approvals::Decision, Reply> {
+        let Some(asker) = &self.asker else {
+            return Err(Reply::answer(format!("Not granted: nobody can approve requests in this task ({}). Tell the user what you need instead.", self.no_asker)));
+        };
+        let reason = approvals::sanitize(reason, 300);
+        let req = Request { kind, target: approvals::sanitize(target, 200), reason: Some(reason.clone()) };
+        let (decision, _) = asker.ask(&req, |s| self.err.cyan(s));
+        let kind = match kind {
+            Kind::Host => "host",
+            Kind::Read => "read",
+            Kind::Write => "write",
+        };
+        let _ = self.journal.append("agent.request", json!({ "kind": kind, "target": req.target, "reason": reason, "decision": decision.label() }));
+        match decision {
+            d if d.allows() => Ok(d),
+            approvals::Decision::Timeout => Err(Reply::answer("No answer from the user in time. You can ask again later, or carry on without it.")),
+            _ => Err(Reply::answer("Denied: the user said no. Carry on without it, and don't try to get it another way.")),
+        }
+    }
+
+    fn network(&self, host: &str, port: u16, reason: &str) -> Reply {
+        let Some(allow) = &self.allow else {
+            return Reply::answer(match self.net {
+                Net::Host => "The network isn't restricted in this task: just connect.",
+                _ => "This task has no network at all. The user can rerun it with --allow HOST.",
+            });
+        };
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() || host.contains(['*', '/', ':', ' ', '@']) {
+            return Reply::error(format!("{host:?} isn't a host name; give one like pypi.org, and the port separately"));
+        }
+        let entry = approvals::entry(&host, port);
+        if let Err(e) = Allowlist::parse(&[entry.clone()]) {
+            return Reply::error(format!("{e:#}"));
+        }
+        if allow.read().is_ok_and(|a| a.allows(&host, port)) {
+            return Reply::answer(format!("{entry} is already allowed: connect to it over HTTPS (through $HTTPS_PROXY)."));
+        }
+        match self.ask(Kind::Host, &entry, reason) {
+            Ok(decision) => {
+                if let Ok(mut a) = allow.write() {
+                    let _ = a.add(&entry);
+                }
+                let always = if decision == approvals::Decision::Always { ", and for later tasks in this project" } else { "" };
+                Reply::answer(format!("Granted: you can reach {entry} now{always}."))
+            }
+            Err(reply) => reply,
+        }
+    }
+
+    fn path(&self, asked: &str, write: bool, reason: &str) -> Reply {
+        let named = match control::resolve(asked, &self.home, &self.cwd) {
+            Ok(p) => p,
+            Err(e) => return Reply::error(format!("{e:#}")),
+        };
+        let grants = self.grants.lock().map(|g| g.clone()).unwrap_or_default();
+        let rules = PathRules { home: &self.home, private: &self.private, hidden: &self.hidden, grants: &grants, landlock: self.landlock };
+        // Off limits by name (whether or not it exists), then for what it
+        // really is, symlinks resolved.
+        let (path, verdict) = match control::forbidden(&named, &rules) {
+            Some(why) => (named, Err(why)),
+            None => match fs::canonicalize(&named) {
+                Ok(path) => {
+                    let verdict = control::check_path(&path, write, &rules);
+                    (path, verdict)
+                }
+                Err(_) => return Reply::error(format!("{} doesn't exist", named.display())),
+            },
+        };
+        let shown = display_path(&path);
+        match verdict {
+            Err(why) => {
+                let kind = if write { "write" } else { "read" };
+                let _ = self.journal.append("agent.request", json!({ "kind": kind, "target": shown, "reason": approvals::sanitize(reason, 300), "decision": "impossible", "why": why }));
+                return Reply::answer(format!("Not possible: {why}."));
+            }
+            Ok(PathVerdict::AlreadyWritable) => return Reply::answer(format!("You can already read and change {}.", path.display())),
+            Ok(PathVerdict::AlreadyReadable) if !write => return Reply::answer(format!("You can already read {}.", path.display())),
+            Ok(_) => {}
+        }
+        if let Err(reply) = self.ask(if write { Kind::Write } else { Kind::Read }, &shown, reason) {
+            return reply;
+        }
+        match self.grant(&path, write) {
+            Ok(()) if write => Reply::answer(format!(
+                "Granted: you can now read and change {} (at that path). Your changes there are held for the user's review, like the rest.",
+                path.display()
+            )),
+            Ok(()) => Reply::answer(format!("Granted: you can now read {} (at that path).", path.display())),
+            Err(e) => {
+                let _ = self.journal.append("grant.failed", json!({ "path": path, "error": format!("{e:#}") }));
+                say(format!("{} couldn't add {shown} to the sandbox: {e:#}", self.err.yellow("agent: warning:")));
+                Reply::error(format!("The user agreed, but agentos couldn't add {}: {e:#}", path.display()))
+            }
+        }
+    }
+
+    /// Mounts `path` into the running sandbox and records the grant (with a
+    /// layer of its own when writable, so its changes are held like the rest).
+    fn grant(&self, path: &Path, write: bool) -> Result<()> {
+        let store = Store::open_at(&self.store_root)?;
+        let mut task = store.load(&self.task_id)?;
+        let mut grants = self.grants.lock().map_err(|_| anyhow::anyhow!("grants lock poisoned"))?;
+        let layer = write.then(|| grants.iter().filter_map(|g| g.layer).max().map_or(0, |n| n + 1));
+        let kind = match layer {
+            Some(n) => {
+                fs::create_dir_all(task.layer_upper(n))?;
+                fs::create_dir_all(task.layer_work(n))?;
+                Mount::Overlay { upper: task.layer_upper(n), work: task.layer_work(n) }
+            }
+            None => Mount::ReadOnly,
+        };
+        if let Err(e) = self.attacher.attach(&GrantMount { path: path.to_path_buf(), kind }) {
+            if let Some(n) = layer {
+                let _ = fs::remove_dir_all(task.layer_upper(n).parent().unwrap_or(Path::new("/nonexistent")));
+            }
+            return Err(e);
+        }
+        let access = if write { Access::Rw } else { Access::Ro };
+        grants.push(Grant { path: path.to_path_buf(), access, layer });
+        // On disk at once: `agent diff` must see the new layer even if this
+        // process dies before the task ends.
+        task.meta.grants = grants.clone();
+        task.save()?;
+        self.journal.append("grant.added", json!({ "path": path, "access": access, "layer": layer }))?;
+        say(format!("{} {} {}", self.err.cyan("agent ▸"), if write { "now read-write:" } else { "now readable:" }, display_path(path)));
+        Ok(())
+    }
 }
 
 fn cmd_approvals(store: &Store, revoke: Option<String>) -> Result<i32> {

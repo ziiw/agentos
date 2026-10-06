@@ -176,6 +176,29 @@ agent do --bg --memory 4G --cpus 2 --pids 1024 "run the full test suite and fix 
 
 The kernel enforces them (cgroup v2). The task runs inside a transient systemd scope that carries the limits (`systemd-run --user --scope`). That needs a systemd user session: a normal login has one, the agentos distro does, a container usually doesn't. `agent doctor` tells you. Asking for limits where they can't be enforced is an error, not a silent no-op. Defaults for every task can go in your config (`[limits]`). A task that runs out of memory gets killed by the kernel, and the journal says so.
 
+## The agent can ask
+
+An agent that needs more than it was given asks you, instead of failing or working around the sandbox:
+
+```console
+agent ▸ the agent asks to change ~/code/shared-lib (held for your review)
+  its reason: “the failing test is caused by a bug in parse() there”
+  [y] this task · [N] deny (or answer in agentd) › y
+agent ▸ now read-write: ~/code/shared-lib
+```
+
+Every sandbox has agentos's own MCP server, and Claude gets it automatically, along with a word about where it runs. Its tools:
+
+- `sandbox_info`: what the agent has (folders, hosts, budget, held pushes);
+- `request_path_access`: a folder or file, to read or to change, with a reason;
+- `request_network_access`: a host, with a reason.
+
+You're asked at the terminal or in the console, with the agent's reason. Say yes and it's there at once, at its own path: agentos mounts it into the running sandbox. A folder you make writable is transactional like the rest: its changes are held, `agent diff` shows them and `agent commit` applies them.
+
+Some things are never offered, and the agent is told so without bothering you: your credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.claude`, …), your whole home, agentos's own task store and config, and anything hidden from the task. With Landlock, a folder outside your home can only be added read-only, since its write rules are fixed when a task starts. Every request, its reason and your answer are in the journal.
+
+Other agents can use the same server: point their MCP configuration at `/run/agentos/agent`, with the argument `mcp`.
+
 ## Budgets
 
 ```bash
@@ -282,6 +305,8 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
 - **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
 - **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work. With a budget, that includes model APIs.
+- **The agent writes its own reasons.** An agent steered by something it read can write a convincing one. Judge the request, not the prose.
+- **A folder added mid-task stays until the task ends.**
 - **Budgets meter what they can read.** A Chat Completions stream without `stream_options.include_usage` reports no usage, so it isn't counted (you get a warning). The batch APIs are billed later and aren't metered. US-only inference (`inference_geo`, 1.1×) is priced at the standard rate.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
 - **The syscall filter is a denylist** (seccomp): it blocks typing into your terminal (TIOCSTI), new namespaces, mounts, kernel modules, bpf, io_uring, keyrings and userfaultfd. Kernel bugs reachable through the remaining syscalls are out of scope until the microVM tier.
@@ -307,6 +332,8 @@ src/profiles.rs  agent profiles (Claude Code) and their output
 src/proxy.rs     egress proxy and allowlist
 src/broker.rs    credential broker (per-task CA, HTTP/1.1 relay)
 src/gateway.rs   model gateway: usage metering, prices, budgets
+src/control.rs   the agent's requests from inside (control socket), and what may be granted
+src/mcp.rs       `agent mcp`: agentos's MCP server for agents
 src/main.rs      CLI          src/render.rs   output
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run

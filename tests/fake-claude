@@ -22,6 +22,16 @@ echo $((runs + 1)) > "$state/runs"
   else echo "login: real"; fi
 } > "$state/observations"
 
+# Like Claude Code given --mcp-config: start the agentos MCP server and use it.
+if printf '%s\n' "$@" | grep -q '"command":"/run/agentos/agent"'; then
+  printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake-claude","version":"1"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sandbox_info","arguments":{}}}' \
+    | /run/agentos/agent mcp > "$state/mcp" 2>&1
+fi
+
 # Like real Claude Code with a claude.ai login: reach for the MCP connector proxy.
 command -v curl >/dev/null && curl -s -m 5 -o /dev/null https://mcp-proxy.anthropic.com/ 2>/dev/null
 echo "plain line from the agent"

@@ -28,6 +28,7 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; }
   .ask { border-color: var(--warn); }
   .ask .what { font-size: 16px; margin: 2px 0 6px; overflow-wrap: anywhere; }
+  .ask .reason { color: var(--muted); font-style: italic; margin: 0 0 6px; overflow-wrap: anywhere; }
   .meta { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   button { font: inherit; font-size: 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
@@ -107,12 +108,20 @@
     if (!asks.length) { $("asks").innerHTML = ""; return; }
     $("asks").innerHTML = `<h2>Waiting for you</h2>` + asks.map((q) => {
       const project = q.project.split("/").filter(Boolean).pop() || q.project;
+      const kind = q.kind || "host";
+      const what = kind === "read" ? "The agent asks to read"
+        : kind === "write" ? "The agent asks to change"
+        : q.reason ? "The agent asks to reach" : "The agent wants to reach";
+      const held = kind === "write" ? `<div class="meta">Its changes there are held for your review, like the rest.</div>` : "";
+      const why = q.reason ? `<div class="reason">\u201c${esc(q.reason)}\u201d</div>` : "";
+      const always = kind === "host" ? `<button data-q="${q.id}" data-d="always">Always in ${esc(project)}</button>` : "";
       return `<div class="card ask">
         <div class="meta">${esc(q.title)} · ${ago(q.asked_ms)}</div>
-        <div class="what">The agent wants to reach <strong>${esc(q.target)}</strong></div>
+        <div class="what">${what} <strong>${esc(q.target)}</strong></div>
+        ${why}${held}
         <div class="row">
           <button class="primary" data-q="${q.id}" data-d="once">Allow for this task</button>
-          <button data-q="${q.id}" data-d="always">Always in ${esc(project)}</button>
+          ${always}
           <button class="danger" data-q="${q.id}" data-d="deny">Deny</button>
         </div></div>`;
     }).join("");

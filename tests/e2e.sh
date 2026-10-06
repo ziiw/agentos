@@ -20,7 +20,10 @@ check() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 skip() { printf '  \033[33m-\033[0m skipped: %s\n' "$1"; skipped=$((skipped + 1)); }
 
-cleanup() { chmod -R u+rwx "$WORK" 2>/dev/null; rm -rf "$WORK" "$HOME/.e2e-secret"; }
+# Folders an agent asks for mid-task live under $HOME: with Landlock,
+# that's where write access can still be added once a task runs.
+ASKED="$HOME/.agentos-e2e-asked.$$"
+cleanup() { chmod -R u+rwx "$WORK" 2>/dev/null; rm -rf "$WORK" "$HOME/.e2e-secret" "$ASKED"; }
 trap cleanup EXIT
 
 reset_proj() {
@@ -275,6 +278,81 @@ check "...applies the change" grep -qx from-agent console.txt
 kill $SERVE_PID 2>/dev/null
 wait $SERVE_PID 2>/dev/null
 
+section "agents ask for more, mid-task (agentos MCP server)"
+reset_proj
+cd "$PROJ"
+mkdir -p "$ASKED/docs" "$ASKED/lib" "$ASKED/nope" "$WORK/outside"
+echo "the docs" > "$ASKED/docs/README"
+echo "lib v1" > "$ASKED/lib/lib.txt"
+echo "outside" > "$WORK/outside/file"
+PORT=$((20000 + RANDOM % 10000))
+"$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve2.log" 2>&1 &
+SERVE_PID=$!
+for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
+TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
+CONSOLE="http://127.0.0.1:$PORT"
+# You, in the console: yes to everything except "nope".
+( for _ in $(seq 600); do
+    q="$(api "$CONSOLE/api/approvals")"
+    id="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$q")"
+    if [ -n "$id" ]; then
+      printf '%s\n' "$q" >> "$WORK/questions"
+      d=once; grep -q nope <<<"$q" && d=deny
+      api -X POST -d "{\"decision\":\"$d\"}" "$CONSOLE/api/approvals/$id" >/dev/null
+    fi
+    sleep 0.1
+  done ) &
+ANSWERER=$!
+cat > asks.sh <<SH
+mcp() { printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"\$1\",\"arguments\":\$2}}" | /run/agentos/agent mcp | tail -1; echo; }
+echo "before: \$(cat $ASKED/docs/README 2>&1)"
+mcp request_path_access '{"path":"$ASKED/docs","access":"read","reason":"I need the API docs"}'
+echo "after: \$(cat $ASKED/docs/README 2>&1)"
+touch $ASKED/docs/new 2>/dev/null && echo "docs: writable" || echo "docs: read-only"
+mcp request_path_access '{"path":"$ASKED/lib","access":"write","reason":"the bug is in lib"}'
+echo "lib v2" > $ASKED/lib/lib.txt && echo "wrote: \$(cat $ASKED/lib/lib.txt)"
+mcp request_path_access '{"path":"$ASKED/nope","access":"read","reason":"just curious"}'
+echo "nope: \$(ls $ASKED/nope 2>&1)"
+mcp request_path_access '{"path":"~/.ssh","access":"read","reason":"to push"}'
+mcp request_path_access '{"path":"$WORK/outside","access":"read","reason":"outside your home"}'
+echo "outside: \$(cat $WORK/outside/file 2>&1)"
+mcp request_path_access '{"path":"$WORK/outside","access":"write","reason":"and change it"}'
+mcp request_network_access '{"host":"example.org","reason":"fetch the spec"}'
+curl -sS -m 20 -o /dev/null -w 'example.org: HTTP%{http_code}\n' https://example.org
+mcp sandbox_info '{}'
+SH
+out="$("$AGENT" run --ask --allow example.com -- sh asks.sh 2>&1 </dev/null)"
+events="$(latest_task_dir)/events.jsonl"
+check "a folder the task didn't have is invisible" grep -q 'before: .*No such file' <<<"$out"
+check "you're asked in the console, with the agent's reason" grep -q '"kind":"read".*"reason":"I need the API docs"' "$WORK/questions"
+check "once you agree, it appears at its own path" grep -q 'after: the docs' <<<"$out"
+check "...read-only" grep -q 'docs: read-only' <<<"$out"
+check "a writable folder, added mid-task" grep -q 'wrote: lib v2' <<<"$out"
+check "...is transactional: your copy is untouched" test "$(cat "$ASKED/lib/lib.txt")" = "lib v1"
+check "...and its change is held for review" grep -Eq '^  M  .*lib/lib.txt' <<<"$("$AGENT" diff --stat)"
+check "what you deny stays invisible" grep -q 'nope: .*No such file' <<<"$out"
+check "...and the agent is told" grep -q 'Denied: the user said no' <<<"$out"
+check "credentials are refused without asking you" grep -q 'Not possible: .*holds credentials' <<<"$out"
+check "...and the question never reached you" lacks '.ssh' "$(cat "$WORK/questions")"
+check "folders outside your home can be added read-only" grep -q 'outside: outside' <<<"$out"
+if grep -q '"landlock":"enforced' "$events" || grep -q '"landlock":"partially' "$events"; then
+  check "...but with Landlock, not writable mid-task (with how to rerun)" grep -q 'Not possible: .*rerun the task with --rw' <<<"$out"
+else
+  check "...and without Landlock, writable too" grep -q 'Granted: you can now read and change .*outside' <<<"$out"
+fi
+check "a host, granted mid-task, is reachable at once" grep -q 'example.org: HTTP200' <<<"$out"
+check "sandbox_info describes the sandbox" grep -q 'This is agentos task' <<<"$out"
+check "requests and answers are journaled" grep -q '"kind":"agent.request".*"decision":"once"' "$events"
+check "...and the grants" test "$(grep -c '"kind":"grant.added"' "$events")" -ge 3
+check "...in a chain that verifies" grep -q 'chain intact' <<<"$("$AGENT" log)"
+"$AGENT" commit >/dev/null 2>&1
+check "commit applies changes in a folder added mid-task" test "$(cat "$ASKED/lib/lib.txt")" = "lib v2"
+kill $ANSWERER 2>/dev/null; wait $ANSWERER 2>/dev/null
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+out="$("$AGENT" run --ask -- sh -c "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"request_path_access\",\"arguments\":{\"path\":\"$ASKED/docs\",\"access\":\"read\",\"reason\":\"x\"}}}' | /run/agentos/agent mcp" 2>&1 </dev/null)"
+check "with nobody to ask, the agent is told so" grep -q 'nobody can approve' <<<"$out"
+rm -f asks.sh
+
 section "background tasks"
 reset_proj
 cd "$PROJ"
@@ -391,6 +469,10 @@ check "agent do succeeds" test $status -eq 0
 check "agent got the task" grep -qx 'add a test for greet' "$AGENT_STATE/last-argv"
 check "agent runs headless (-p)" grep -qx -- '-p' "$AGENT_STATE/last-argv"
 check "agent's own permission prompts are off" grep -qx -- '--dangerously-skip-permissions' "$AGENT_STATE/last-argv"
+check "agent gets agentos's MCP server" grep -q '"command":"/run/agentos/agent"' "$AGENT_STATE/last-argv"
+check "...which lists its tools" grep -q '"name":"request_path_access"' "$AGENT_STATE/mcp"
+check "...and answers from the sandbox" grep -q 'This is agentos task' "$AGENT_STATE/mcp"
+check "agent is told it's in a sandbox" grep -q 'You are running inside an agentos sandbox' "$AGENT_STATE/last-argv"
 check "progress shows tool calls" grep -Eq '⏺ Write test_greet.py' <<<"$out"
 check "final answer is printed" grep -q 'Added test_greet.py' <<<"$out"
 check "cost and turns are reported" grep -q '\$0.04 · 3 turns' <<<"$out"

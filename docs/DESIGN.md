@@ -18,7 +18,7 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Principle | Meaning | Mechanism | Status |
 |---|---|---|---|
 | Agents have their own identity | Each task is its own principal, not "runs as you" | user namespaces, per-task ids, cgroups | ◐ namespaces |
-| Explicit grants, no inherited access | The agent gets *this folder* and *this API with these scopes*, nothing else | mount namespaces, Landlock, seccomp | ● filesystem + syscalls; per-host network |
+| Explicit grants, no inherited access | The agent gets *this folder* and *this API with these scopes*, nothing else | mount namespaces, Landlock, seccomp | ● filesystem + syscalls; per-host network; grants grow mid-task when the agent asks and you agree (M16) |
 | Local changes are reversible | A task ends as a diff you merge or throw away | overlayfs upper dirs, read-only base | ● |
 | Network is an allowlist | No direct network, not even DNS; an egress proxy outside the sandbox lets through allowed hosts only and journals every connection | private netns + unix-socket proxy | ● |
 | External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | per-remote bare repos + your git; egress proxy for HTTP later | ◐ git pushes (M8) |
@@ -26,7 +26,7 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Taint tracking | Once a session reads untrusted input, its risky actions need approval | policy engine (Cedar) | ○ Phase 1 |
 | Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, every model call with its measured cost |
 | Tokens are a budgeted resource | $/token/time budgets per task | model gateway | ● per-task $ or token budgets, metered on the wire (M15); time via --timeout |
-| Interfaces built for agents | System services exposed as typed tools | MCP gateway, D-Bus bridge, AT-SPI | ○ Phase 1 |
+| Interfaces built for agents | System services exposed as typed tools | MCP gateway, D-Bus bridge, AT-SPI | ◐ agentos's own MCP server in every sandbox: sandbox_info, request_path_access, request_network_access (M16) |
 | Agents can live for days | Sleep, wake on events, survive reboots | systemd units, CRIU | ○ Phase 3 |
 
 ● done ◐ partial ○ planned
@@ -132,6 +132,7 @@ It's verified at three levels:
 | M13: resource limits: --memory/--cpus/--pids via transient systemd scopes (cgroup v2); OOM kills journaled | ✅ enforced and tested on Ubuntu CI (x86_64, arm64) and in the booted distro |
 | M14: agents as config files: any agent CLI via `agents/NAME.toml` (commands, allowlist, brokered secrets, output); `agent agents`; default agent | ✅ CI green (stand-in agents); Codex/Gemini/Aider examples untested |
 | M15: model gateway: every model call metered from the provider's own usage (Anthropic Messages, OpenAI Responses/Chat Completions, custom endpoints), priced, journaled; per-task $ or token budgets, refused in the API's own format once used up | ✅ CI green (stand-in API); real Claude: in scripts/acceptance.sh |
+| M16: agents ask: an MCP server in every sandbox (`agent mcp`, over a control socket) to see the sandbox and request folders or hosts with a reason; you answer at the terminal or in the console; granted folders are mounted into the running sandbox (open_tree + setns + move_mount from the namespace parent, which keeps a host view), writable ones as new overlay layers | ✅ CI green; real Claude Code connects to the server; asking for itself: in scripts/acceptance.sh |
 | M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and passes the whole e2e suite (179/179, Landlock and limits enforced) |
 
 ### Phase 1 backlog, in order
@@ -143,8 +144,8 @@ It's verified at three levels:
 5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
 6. **cgroups.** ✅ CPU, memory and pid limits through a systemd transient scope (M13).
    **Model gateway.** ✅ (M15) Model calls go through the broker's TLS termination (for credentialed hosts, and for model APIs when there's a budget), so the gateway reads the usage the provider reports in each response, JSON or streamed, without trusting the agent. Calls are priced (built-in Claude list prices, `[prices]` for the rest; an unknown model counts at the highest rate), journaled, and counted against the task's budget. Once it's used up, model calls get a 400 in the API's own error format, which agents don't retry; one that keeps calling is stopped after 5 refusals. Next: budgets across tasks (per day, per project), the Gemini API, and refusing the batch APIs under a budget (they're billed later and not metered).
-7. **agentd + API.** ✅ `agent serve` (M10): token-protected web console and JSON API; approvals reach you away from the terminal, with optional push notifications. Next: run tasks *from* agentd, accounts for teams. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
-8. **MCP gateway.** System services exposed as typed tools, governed by the same policy.
+7. **agentd + API.** ✅ `agent serve` (M10): token-protected web console and JSON API; approvals reach you away from the terminal, with optional push notifications. ✅ Agents request folders and hosts mid-task, with a reason, and you answer at the terminal or in the console (M16). Next: run tasks *from* agentd, accounts for teams, policy in Cedar (auto-answers), and removing a grant mid-task.
+8. **MCP gateway.** System services exposed as typed tools, governed by the same policy. ✅ The first server: agentos itself (M16). Next: proxying the agent's other MCP servers through agentos, so their calls are journaled and approved like the rest.
 
 ## Open decisions
 

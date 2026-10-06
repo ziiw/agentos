@@ -202,12 +202,30 @@ fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, hom
     })
 }
 
+/// Appended to Claude's system prompt: what an agentos sandbox is, and
+/// that asking beats working around it.
+const BRIEFING: &str = "You are running inside an agentos sandbox. You see only the folders you were granted; \
+your file changes and git pushes are held for the user to review rather than applied directly, and the network \
+is an allowlist. If you need a folder or a host you don't have, don't work around the restriction: ask for it \
+with the agentos tools (request_path_access, request_network_access) and a one-sentence reason, and the user \
+decides. sandbox_info tells you what you have.";
+
 fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile> {
     let bin = find_on_path("claude").context(
         "Claude Code isn't installed (no `claude` on your PATH). Install it with:\n  curl -fsSL https://claude.ai/install.sh | bash",
     )?;
     let bin = fs::canonicalize(&bin)?;
-    let mut argv = vec![bin.display().to_string(), "--dangerously-skip-permissions".to_string()];
+    // agentos's own tools, and a word about where it is. --mcp-config takes
+    // several values, so an option must follow it, never the task.
+    let mcp = serde_json::json!({ "mcpServers": { "agentos": { "type": "stdio", "command": crate::control::BINARY, "args": ["mcp"] } } });
+    let mut argv = vec![
+        bin.display().to_string(),
+        "--mcp-config".to_string(),
+        mcp.to_string(),
+        "--append-system-prompt".to_string(),
+        BRIEFING.to_string(),
+        "--dangerously-skip-permissions".to_string(),
+    ];
     let output = match task {
         Some(t) if !interactive => {
             argv.extend(["-p", t, "--output-format", "stream-json", "--verbose"].map(String::from));
@@ -228,6 +246,8 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
             // destinations make the network easier to lock down.
             ("DISABLE_AUTOUPDATER".into(), "1".into()),
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()),
+            // A request waits for your answer (up to 2 minutes).
+            ("MCP_TOOL_TIMEOUT".into(), "180000".into()),
         ],
         pass_env: vec!["ANTHROPIC_BASE_URL".into(), "ANTHROPIC_MODEL".into()],
         // The agent gets placeholders; the proxy adds the real values on the wire.

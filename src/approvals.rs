@@ -1,5 +1,7 @@
 //! Live approvals: when an agent reaches for a host that isn't allowed, ask
 //! the human at the terminal instead of failing, while the connection waits.
+//! Agents can also ask on purpose, with a reason, for a host or for access
+//! to a folder (see `control.rs`).
 //!
 //! "Always" answers are remembered per project in the task store, which no
 //! sandbox can see, and applied to later tasks like an allowlist from your
@@ -127,15 +129,66 @@ pub fn agentd(store_root: &Path) -> Option<Agentd> {
     Some(d)
 }
 
+/// What you're asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// Reaching a host (`target` is `host` or `host:port`).
+    Host,
+    /// Reading a path.
+    Read,
+    /// Changing a path (held for review, like everything else).
+    Write,
+}
+
+/// One question: what, and the agent's reason when it asked on purpose.
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub kind: Kind,
+    pub target: String,
+    pub reason: Option<String>,
+}
+
+impl Request {
+    /// A connection the agent attempted.
+    pub fn host(host: &str, port: u16) -> Request {
+        Request { kind: Kind::Host, target: entry(host, port), reason: None }
+    }
+
+    fn key(&self) -> String {
+        format!("{:?}:{}", self.kind, self.target)
+    }
+}
+
+/// Text from the agent, made safe to show you: no control characters (a
+/// terminal would obey escape sequences), and not too long.
+pub fn sanitize(text: &str, max: usize) -> String {
+    let clean: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    match clean.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &clean[..i]),
+        None => clean,
+    }
+}
+
 /// A question waiting for an answer in agentd's console.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Question {
     pub id: String,
     pub task: String,
     pub title: String,
+    #[serde(default = "host_kind")]
+    pub kind: Kind,
     pub target: String,
+    /// The agent's own words, when it asked on purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub project: PathBuf,
     pub asked_ms: u64,
+}
+
+fn host_kind() -> Kind {
+    Kind::Host
 }
 
 fn queue(store_root: &Path, which: &str) -> PathBuf {
@@ -173,9 +226,9 @@ fn parse_decision(text: &str) -> Decision {
     }
 }
 
-/// Asks about hosts outside the allowlist: at the terminal, in agentd's
-/// console, or both (the first answer wins). One question at a time; answers
-/// last for the task.
+/// Asks about hosts outside the allowlist, and what agents ask for: at the
+/// terminal, in agentd's console, or both (the first answer wins). One
+/// question at a time; answers last for the task.
 pub struct Asker {
     tty: Option<Mutex<File>>,
     web: bool,
@@ -208,11 +261,13 @@ impl Asker {
         })
     }
 
-    /// Whether the agent may reach `host:port`, and whether you were asked
-    /// just now (rather than answered earlier in this task). Blocks until answered.
-    pub fn ask(&self, host: &str, port: u16, paint: impl Fn(&str) -> String) -> (Decision, bool) {
-        let key = entry(host, port);
-        let cached = || self.answers.lock().ok().and_then(|a| a.get(&key).copied());
+    /// Your answer to `req`, and whether you were asked just now (rather
+    /// than answered earlier in this task). Blocks until answered. "Always"
+    /// only exists for hosts.
+    pub fn ask(&self, req: &Request, paint: impl Fn(&str) -> String) -> (Decision, bool) {
+        let key = req.key();
+        // Nobody answered last time: an agent asking again gets asked again.
+        let cached = || self.answers.lock().ok().and_then(|a| a.get(&key).copied()).filter(|d| *d != Decision::Timeout);
         if let Some(d) = cached() {
             return (d, false);
         }
@@ -231,7 +286,9 @@ impl Asker {
                 id: id.clone(),
                 task: self.task.clone(),
                 title: self.title.clone(),
-                target: key.clone(),
+                kind: req.kind,
+                target: req.target.clone(),
+                reason: req.reason.clone(),
                 project: self.project.clone(),
                 asked_ms: crate::util::now_ms(),
             };
@@ -240,13 +297,19 @@ impl Asker {
         }
         if let Some(t) = tty.as_mut() {
             let elsewhere = if self.web { " (or answer in agentd)" } else { "" };
+            let what = match (req.kind, &req.reason) {
+                (Kind::Host, None) => format!("the agent wants to reach {}", req.target),
+                (Kind::Host, Some(_)) => format!("the agent asks to reach {}", req.target),
+                (Kind::Read, _) => format!("the agent asks to read {}", req.target),
+                (Kind::Write, _) => format!("the agent asks to change {} (held for your review)", req.target),
+            };
+            let why = req.reason.as_deref().map(|r| format!("\n  its reason: \u{201c}{r}\u{201d}")).unwrap_or_default();
+            let options = match req.kind {
+                Kind::Host => format!("[y] this task · [a] always, in {} · [N] deny", display_path(&self.project)),
+                _ => "[y] this task · [N] deny".to_string(),
+            };
             // One write, so it can't interleave with the agent's own output.
-            let question = format!(
-                "\n{} the agent wants to reach {} · [y] this task · [a] always, in {} · [N] deny{elsewhere} › ",
-                paint("agent ▸"),
-                key,
-                display_path(&self.project)
-            );
+            let question = format!("\n{} {what}{why}\n  {options}{elsewhere} › ", paint("agent ▸"));
             let _ = t.write_all(question.as_bytes());
             let _ = t.flush();
         }
@@ -275,6 +338,8 @@ impl Asker {
         };
         let _ = fs::remove_file(&pending);
         let _ = fs::remove_file(&answer_file);
+        // "Always" is for hosts; a path is granted for this task only.
+        let decision = if decision == Decision::Always && req.kind != Kind::Host { Decision::Once } else { decision };
 
         if let Some(t) = tty.as_mut() {
             if decision == Decision::Timeout {
@@ -282,7 +347,7 @@ impl Asker {
             }
         }
         if decision == Decision::Always {
-            if let Err(e) = remember(&self.store_root, &self.project, &key) {
+            if let Err(e) = remember(&self.store_root, &self.project, &req.target) {
                 if let Some(t) = tty.as_mut() {
                     let _ = writeln!(t, "(couldn't remember it: {e:#}; allowed for this task)");
                 }
@@ -337,6 +402,13 @@ mod tests {
         assert!(revoke(store, a, "pypi.org").unwrap());
         assert!(!revoke(store, a, "pypi.org").unwrap());
         assert_eq!(remembered(store, a).unwrap(), vec!["internal.dev:8443"]);
+    }
+
+    #[test]
+    fn agent_text_is_made_safe_to_show() {
+        assert_eq!(sanitize("need\x1b[2Jthe\ndocs\r\t please", 100), "need [2Jthe docs please");
+        assert_eq!(sanitize("abcdef", 3), "abc…");
+        assert_eq!(Request::host("pypi.org", 443).key(), "Host:pypi.org");
     }
 
     #[test]

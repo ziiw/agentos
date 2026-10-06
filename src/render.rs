@@ -613,6 +613,26 @@ fn describe(p: Paint, e: &Event) -> String {
             }
         }
         "agent.tool" => format!("{} {}", s(&d["name"]), truncate(&s(&d["target"]), 80)),
+        "agent.request" => {
+            let what = match d["kind"].as_str() {
+                Some("read") => format!("read {}", s(&d["target"])),
+                Some("write") => format!("change {}", s(&d["target"])),
+                _ => format!("reach {}", s(&d["target"])),
+            };
+            let answer = match d["decision"].as_str().unwrap_or_default() {
+                "once" => p.green("you allowed it"),
+                "always" => p.green("you allowed it, always, for this project"),
+                "timeout" => p.yellow("no answer, not granted"),
+                "impossible" => p.yellow(format!("not possible: {}", truncate(&s(&d["why"]), 80))),
+                _ => p.yellow("you denied it"),
+            };
+            format!("{} asked to {what} · \u{201c}{}\u{201d} · {answer}", p.cyan("?"), truncate(&s(&d["reason"]), 80))
+        }
+        "grant.added" => {
+            let access = if d["access"].as_str() == Some("rw") { "read-write" } else { "read-only" };
+            format!("{} {} {access}, while the task ran", p.green("+"), display_path(Path::new(&s(&d["path"]))))
+        }
+        "grant.failed" => p.red(format!("couldn't add {}: {}", display_path(Path::new(&s(&d["path"]))), truncate(&s(&d["error"]), 80))),
         "agent.result" => {
             let mut parts = vec![if d["is_error"].as_bool() == Some(true) { p.red("error") } else { "ok".into() }];
             if let Some(n) = d["turns"].as_u64() {

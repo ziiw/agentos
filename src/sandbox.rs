@@ -2,8 +2,10 @@
 //!
 //! ```text
 //! supervisor (agent run)      stays on the host, writes the journal
-//!  └─ A  new user/mount/pid/ipc/uts(/net) namespaces, uid/gid maps
-//!      └─ B  pid 1: assembles the root, pivots, applies Landlock, reaps
+//!  └─ A  new user/mount/pid/ipc/uts(/net) namespaces, uid/gid maps; keeps
+//!     │  a view of the host's mounts to attach grants added mid-task
+//!      └─ B  pid 1: own mount namespace; assembles the root, pivots,
+//!         │  applies Landlock, reaps
 //!          ├─ F  (with --allow) relays 127.0.0.1 to the egress proxy socket
 //!          └─ C  execs the agent command
 //! ```
@@ -32,6 +34,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::thread;
 use std::os::unix::ffi::OsStrExt;
@@ -55,6 +58,46 @@ pub struct GrantMount {
     /// Canonical host path, mounted at the same path inside the sandbox.
     pub path: PathBuf,
     pub kind: Mount,
+}
+
+/// A grant to add to a running sandbox, as sent to process A.
+#[derive(Serialize, Deserialize)]
+struct AttachRequest {
+    path: PathBuf,
+    /// `(upper, work)` for a writable, transactional grant.
+    overlay: Option<(PathBuf, PathBuf)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttachReply {
+    error: Option<String>,
+}
+
+/// Adds grants to the sandbox while it runs (the agent asked, you agreed).
+pub struct Attacher {
+    chan: std::sync::Mutex<std::io::BufReader<UnixStream>>,
+}
+
+impl Attacher {
+    /// Mounts `g` at its path inside the running sandbox. Blocks until done.
+    pub fn attach(&self, g: &GrantMount) -> Result<()> {
+        use std::io::BufRead;
+        let overlay = match &g.kind {
+            Mount::Overlay { upper, work } => Some((upper.clone(), work.clone())),
+            Mount::ReadOnly => None,
+        };
+        let mut req = serde_json::to_string(&AttachRequest { path: g.path.clone(), overlay })?;
+        req.push('\n');
+        let mut chan = self.chan.lock().map_err(|_| anyhow::anyhow!("attach channel poisoned"))?;
+        chan.get_mut().write_all(req.as_bytes()).context("the sandbox is gone")?;
+        let mut line = String::new();
+        chan.read_line(&mut line).context("the sandbox is gone")?;
+        let reply: AttachReply = serde_json::from_str(line.trim()).context("the sandbox is gone")?;
+        match reply.error {
+            Some(e) => bail!("{e}"),
+            None => Ok(()),
+        }
+    }
 }
 
 pub struct RunMount {
@@ -86,6 +129,9 @@ pub struct Spec {
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     pub argv: Vec<String>,
+    /// Empty host directory where grants added mid-task are assembled
+    /// before they move into the sandbox.
+    pub staging: PathBuf,
 }
 
 /// What the sandbox actually achieved, sent back to the supervisor for the journal.
@@ -157,8 +203,9 @@ pub fn is_system_path(path: &Path) -> bool {
 
 /// Runs `spec.argv` in the sandbox, with its stdout redirected to `stdout`
 /// if given. `on_ready` is called once setup has finished (or failed), while
-/// the agent runs; the call returns the agent's exit status.
-pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report)) -> Result<i32> {
+/// the agent runs, with a handle to add grants; the call returns the agent's
+/// exit status.
+pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report, Arc<Attacher>)) -> Result<i32> {
     if spec.argv.is_empty() {
         bail!("no command to run");
     }
@@ -167,6 +214,9 @@ pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report))
         bail!("refusing to run an agent as root; agentos sandboxes are built on unprivileged user namespaces");
     }
     let (report_rx, report_tx) = pipe2(OFlag::O_CLOEXEC)?;
+    // Requests to attach grants: supervisor ⇄ A. Close-on-exec, and B drops
+    // its copy at once, so nothing in the sandbox holds it.
+    let (attach_ours, attach_theirs) = UnixStream::pair()?;
 
     // Ctrl-C belongs to the agent; the supervisor must survive it to record the outcome.
     let prev_int = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn)? };
@@ -180,20 +230,23 @@ pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report))
     let result = match unsafe { fork() }? {
         ForkResult::Child => {
             drop(report_rx);
-            let code = namespace_parent(spec, uid, gid, report_tx, stdout);
+            drop(attach_ours);
+            let code = namespace_parent(spec, uid, gid, report_tx, stdout, attach_theirs.into());
             unsafe { libc::_exit(code) }
         }
         ForkResult::Parent { child } => {
             SANDBOX_PID.store(child.as_raw(), Ordering::SeqCst);
             drop(report_tx);
             drop(stdout);
+            drop(attach_theirs);
+            let attacher = Arc::new(Attacher { chan: std::sync::Mutex::new(std::io::BufReader::new(attach_ours)) });
             let mut raw = String::new();
             let _ = fs::File::from(report_rx).read_to_string(&mut raw);
             let report = serde_json::from_str(raw.trim()).unwrap_or_else(|_| Report {
                 error: Some("sandbox exited before finishing setup".into()),
                 ..Default::default()
             });
-            on_ready(&report);
+            on_ready(&report, attacher);
             let code = wait_for(child);
             SANDBOX_PID.store(0, Ordering::SeqCst);
             code
@@ -221,7 +274,7 @@ pub fn enter_user_namespace(flags: CloneFlags, uid: Uid, gid: Gid) -> Result<()>
 }
 
 /// Process A: creates the namespaces, then forks pid 1 of the new pid namespace.
-fn namespace_parent(spec: &Spec, uid: Uid, gid: Gid, report_tx: OwnedFd, stdout: Option<OwnedFd>) -> i32 {
+fn namespace_parent(spec: &Spec, uid: Uid, gid: Gid, report_tx: OwnedFd, stdout: Option<OwnedFd>, attach: OwnedFd) -> i32 {
     let _ = prctl::set_pdeathsig(Signal::SIGKILL);
     let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS;
     if spec.isolate_net {
@@ -239,18 +292,209 @@ fn namespace_parent(spec: &Spec, uid: Uid, gid: Gid, report_tx: OwnedFd, stdout:
             warnings.push(format!("loopback: {e:#}"));
         }
     }
+    // Our own mount namespace stays a view of the host's, so grants added
+    // mid-task can be assembled here; B makes the sandbox's from a copy.
+    let own_ns = match fs::File::open("/proc/self/ns/mnt") {
+        Ok(f) => f,
+        Err(e) => return send_failure(&report_tx, anyhow::Error::from(e).context("open own mount namespace")),
+    };
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
+            drop(attach);
+            drop(own_ns);
             let code = sandbox_init(spec, warnings, report_tx, stdout);
             unsafe { libc::_exit(code) }
         }
         Ok(ForkResult::Parent { child }) => {
             drop(report_tx);
             drop(stdout);
-            wait_for(child).unwrap_or(125)
+            serve_attach(attach, child, &own_ns, &spec.staging)
         }
         Err(e) => send_failure(&report_tx, e.into()),
     }
+}
+
+/// Process A, while the sandbox runs: attaches grants on request, until B
+/// (pid 1 inside) exits. Returns B's exit status.
+fn serve_attach(chan: OwnedFd, b: Pid, own_ns: &fs::File, staging: &Path) -> i32 {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::io::BufRead;
+    use std::os::fd::{AsFd, FromRawFd};
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, b.as_raw(), 0) };
+    if pidfd < 0 {
+        // No pidfds (Linux < 5.3): no attaching either.
+        return wait_for(b).unwrap_or(125);
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+    let mut chan = Some(std::io::BufReader::new(UnixStream::from(chan)));
+    loop {
+        let mut fds = vec![PollFd::new(pidfd.as_fd(), PollFlags::POLLIN)];
+        if let Some(c) = &chan {
+            fds.push(PollFd::new(c.get_ref().as_fd(), PollFlags::POLLIN));
+        }
+        match poll(&mut fds, PollTimeout::NONE) {
+            Err(Errno::EINTR) => continue,
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        let b_done = fds[0].revents().is_some_and(|r| !r.is_empty());
+        let request = fds.get(1).and_then(|f| f.revents()).is_some_and(|r| !r.is_empty());
+        if b_done {
+            break;
+        }
+        if request {
+            let Some(c) = chan.as_mut() else { continue };
+            let mut line = String::new();
+            match c.read_line(&mut line) {
+                Ok(0) | Err(_) => chan = None, // the supervisor let go
+                Ok(_) => {
+                    let result = serde_json::from_str::<AttachRequest>(line.trim())
+                        .map_err(anyhow::Error::from)
+                        .and_then(|req| attach(&req, b, own_ns, staging));
+                    let reply = AttachReply { error: result.err().map(|e| format!("{e:#}")) };
+                    let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                    out.push('\n');
+                    if c.get_mut().write_all(out.as_bytes()).is_err() {
+                        chan = None;
+                    }
+                }
+            }
+        }
+    }
+    wait_for(b).unwrap_or(125)
+}
+
+const OPEN_TREE_CLONE: libc::c_uint = 1;
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x04;
+const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x40;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// Mounts a grant into the running sandbox: assembled here, in A's view of
+/// the host, as a detached mount (open_tree), then moved into the sandbox's
+/// mount namespace (setns + move_mount), the way systemd mounts into a
+/// running service.
+fn attach(req: &AttachRequest, b: Pid, own_ns: &fs::File, staging: &Path) -> Result<()> {
+    use nix::sched::setns;
+    use std::os::fd::FromRawFd;
+    let is_dir = req.path.is_dir();
+    fs::create_dir_all(staging)?;
+    let point = if is_dir { staging.to_path_buf() } else { staging.join("file") };
+    let g = GrantMount {
+        path: req.path.clone(),
+        kind: match &req.overlay {
+            Some((upper, work)) => Mount::Overlay { upper: upper.clone(), work: work.clone() },
+            None => Mount::ReadOnly,
+        },
+    };
+    mount_grant(&g, &point)?;
+    let c = CString::new(point.as_os_str().as_bytes())?;
+    let tree = unsafe {
+        libc::syscall(libc::SYS_open_tree, libc::AT_FDCWD, c.as_ptr(), OPEN_TREE_CLONE | AT_RECURSIVE | libc::O_CLOEXEC as libc::c_uint)
+    };
+    let tree_err = std::io::Error::last_os_error();
+    let _ = umount2(&point, MntFlags::MNT_DETACH);
+    if tree < 0 {
+        return Err(tree_err).context("open_tree (Linux 5.2+)");
+    }
+    let tree = unsafe { OwnedFd::from_raw_fd(tree as i32) };
+
+    let sandbox_ns = fs::File::open(format!("/proc/{b}/ns/mnt")).context("the sandbox's mount namespace")?;
+    setns(&sandbox_ns, CloneFlags::CLONE_NEWNS).context("enter the sandbox's mount namespace")?;
+    let placed = mount_point(&req.path, is_dir).and_then(|target| {
+        let empty = CString::default();
+        let rc = unsafe {
+            libc::syscall(libc::SYS_move_mount, tree.as_raw_fd(), empty.as_ptr(), target.as_raw_fd(), empty.as_ptr(), MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH)
+        };
+        if rc < 0 { Err(std::io::Error::last_os_error()).context("move_mount") } else { Ok(()) }
+    });
+    // Back to our own view, whatever happened: the next request needs it.
+    if let Err(e) = setns(own_ns, CloneFlags::CLONE_NEWNS) {
+        eprintln!("agent: sandbox: can't return to the host view ({e}); no more grants can be added");
+        unsafe { libc::_exit(125) };
+    }
+    placed
+}
+
+/// Inside the sandbox: an O_PATH handle on `path`, creating what's missing
+/// (as directories, and the last component as a file when `!is_dir`).
+/// Symlinks aren't followed, so the agent can't redirect the mount.
+fn mount_point(path: &Path, is_dir: bool) -> Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let open = |dir: &OwnedFd, name: &CString, want_dir: bool| -> std::io::Result<OwnedFd> {
+        let mut flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if want_dir {
+            flags |= libc::O_DIRECTORY;
+        }
+        let how = OpenHow { flags: flags as u64, mode: 0, resolve: RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH };
+        let fd = unsafe { libc::syscall(libc::SYS_openat2, dir.as_raw_fd(), name.as_ptr(), &how as *const OpenHow, size_of::<OpenHow>()) };
+        if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) }) }
+    };
+    let create = |dir: &OwnedFd, name: &CString, want_dir: bool| -> std::io::Result<()> {
+        let rc = if want_dir {
+            unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) }
+        } else {
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o644) };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+            fd.min(0)
+        };
+        if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    };
+    let root_c = CString::new("/")?;
+    let root = unsafe { libc::open(root_c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if root < 0 {
+        return Err(std::io::Error::last_os_error()).context("open the sandbox root");
+    }
+    let mut cur = unsafe { OwnedFd::from_raw_fd(root) };
+    let names: Vec<CString> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(CString::new(n.as_bytes())),
+            _ => None,
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    // The root is a read-only tmpfs: writable just long enough for new
+    // mount points (e.g. /srv when /srv/data is granted).
+    let mut root_rw = false;
+    let result = (|| -> Result<OwnedFd> {
+        for (i, name) in names.iter().enumerate() {
+            let want_dir = i + 1 < names.len() || is_dir;
+            cur = match open(&cur, name, want_dir) {
+                Ok(fd) => fd,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    match create(&cur, name, want_dir) {
+                        Err(e) if e.raw_os_error() == Some(libc::EROFS) && !root_rw => {
+                            mount(None::<&str>, "/", None::<&str>, MsFlags::MS_REMOUNT, None::<&str>).context("make the root writable")?;
+                            root_rw = true;
+                            create(&cur, name, want_dir)
+                        }
+                        other => other,
+                    }
+                    .with_context(|| format!("create the mount point {}", path.display()))?;
+                    open(&cur, name, want_dir)?
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) || e.raw_os_error() == Some(libc::EXDEV) => {
+                    bail!("{} goes through a symlink inside the sandbox", path.display())
+                }
+                Err(e) => return Err(e).with_context(|| format!("{} inside the sandbox", path.display())),
+            };
+        }
+        Ok(cur)
+    })();
+    if root_rw {
+        let _ = mount(None::<&str>, "/", None::<&str>, MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY, None::<&str>);
+    }
+    result
 }
 
 /// Process B (pid 1): builds the root, applies Landlock, runs the agent and
@@ -258,6 +502,9 @@ fn namespace_parent(spec: &Spec, uid: Uid, gid: Gid, report_tx: OwnedFd, stdout:
 fn sandbox_init(spec: &Spec, warnings: Vec<String>, report_tx: OwnedFd, stdout: Option<OwnedFd>) -> i32 {
     let _ = prctl::set_pdeathsig(Signal::SIGKILL);
     let mut report = Report { warnings, ..Default::default() };
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWNS) {
+        return send_failure_with(&report_tx, report, anyhow::Error::from(e).context("own mount namespace"));
+    }
     if let Err(e) = build_root(spec, &mut report) {
         return send_failure_with(&report_tx, report, e);
     }

@@ -89,6 +89,25 @@ impl Allowlist {
         Ok(Allowlist { rules })
     }
 
+    /// The entries: "api.anthropic.com, *.example.com, internal.dev:8443".
+    pub fn describe(&self) -> String {
+        let entries: Vec<String> = self
+            .rules
+            .iter()
+            .map(|r| {
+                let host = if r.wildcard { format!("*.{}", r.host) } else { r.host.clone() };
+                if r.port == 443 { host } else { format!("{host}:{}", r.port) }
+            })
+            .collect();
+        if entries.is_empty() { "no hosts".into() } else { entries.join(", ") }
+    }
+
+    /// Adds an entry (as for `parse`) to a live allowlist.
+    pub fn add(&mut self, entry: &str) -> Result<()> {
+        self.rules.extend(Allowlist::parse(&[entry.to_string()])?.rules);
+        Ok(())
+    }
+
     pub fn allows(&self, host: &str, port: u16) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         self.rules.iter().any(|r| {
@@ -149,12 +168,15 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))
 }
 
+/// An allowlist that grows while the task runs (hosts you approve when the
+/// agent asks).
+pub type LiveAllowlist = Arc<std::sync::RwLock<Allowlist>>;
+
 /// Serves connections on background threads, reporting each one to `sink`.
 /// Hosts the `broker` holds credentials for are relayed through it.
 /// Threads must only be started after the sandbox has been forked.
-pub fn serve(listener: UnixListener, allow: Allowlist, broker: Option<Arc<Broker>>, approver: Option<Approver>, sink: Sink) -> Handle {
+pub fn serve(listener: UnixListener, allow: LiveAllowlist, broker: Option<Arc<Broker>>, approver: Option<Approver>, sink: Sink) -> Handle {
     let active = Arc::new(AtomicUsize::new(0));
-    let allow = Arc::new(allow);
     let counter = active.clone();
     thread::spawn(move || {
         for client in listener.incoming().flatten() {
@@ -171,7 +193,7 @@ pub fn serve(listener: UnixListener, allow: Allowlist, broker: Option<Arc<Broker
     Handle { active }
 }
 
-fn handle(mut client: UnixStream, allow: &Allowlist, broker: Option<&Broker>, approver: Option<&Approver>) -> Option<NetEvent> {
+fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>, approver: Option<&Approver>) -> Option<NetEvent> {
     let start = Instant::now();
     let head = read_head(&mut client).ok()?;
     let mut words = head.lines().next().unwrap_or_default().split_whitespace();
@@ -204,7 +226,8 @@ fn handle(mut client: UnixStream, allow: &Allowlist, broker: Option<&Broker>, ap
         return refuse("400 Bad Request", "malformed CONNECT target", event);
     };
     (event.host, event.port) = (host.clone(), port);
-    if !allow.allows(&host, port) {
+    let listed = allow.read().is_ok_and(|a| a.allows(&host, port));
+    if !listed {
         // The agent's connection waits while you're asked.
         if !approver.is_some_and(|approve| approve(&host, port)) {
             return refuse("403 Forbidden", "not in the allowlist", event);
@@ -381,6 +404,13 @@ mod tests {
         assert!(p.allows("files.pythonhosted.org", 443) && p.allows("api.github.com", 443));
         assert!(!p.allows("example.com", 443));
         assert!(Allowlist::parse(&["@nope".into()]).is_err());
+
+        let mut live = list(&["api.anthropic.com"]);
+        live.add("pypi.org").unwrap();
+        live.add("*.example.com:8443").unwrap();
+        assert!(live.allows("pypi.org", 443) && live.allows("api.anthropic.com", 443));
+        assert_eq!(live.describe(), "api.anthropic.com, pypi.org, *.example.com:8443");
+        assert!(live.add("not a host").is_err());
     }
 
     #[test]

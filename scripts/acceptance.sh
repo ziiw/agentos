@@ -113,6 +113,18 @@ if agent log --json | grep -q '"kind":"model.refused"'; then pass "the next mode
 if agent ls | sed -n 2p | grep -q 'over budget'; then pass "agent ls shows the task over budget"; else fail "agent ls shows the task over budget"; fi
 agent rollback >/dev/null
 
+step "7. The agent asks for a folder it doesn't have"
+NOTES="$APP.notes"
+WORD="pelican-$RANDOM"
+rm -rf "$NOTES" && mkdir -p "$NOTES" && echo "The magic word is $WORD." > "$NOTES/word.txt"
+echo "  Claude will ask to read $NOTES: answer y when agentos asks."
+out="$(agent do "Read $NOTES/word.txt and reply with only the magic word in it. This sandbox doesn't show that folder yet: ask for it." 2>&1 | tee /dev/stderr)"
+if agent log --json | grep -q '"kind":"agent.request"'; then pass "Claude asked, through agentos's MCP server"; else fail "Claude asked, through agentos's MCP server"; fi
+if agent log --json | grep -q '"kind":"grant.added"'; then pass "the folder was added to the running sandbox"; else fail "the folder was added to the running sandbox"; fi
+if grep -q "$WORD" <<<"$out"; then pass "...and Claude could read it"; else fail "...and Claude could read it"; fi
+agent rollback >/dev/null
+rm -rf "$NOTES"
+
 echo
 if [ $failed -eq 0 ]; then
   printf '\033[1;32mACCEPTED\033[0m: the golden path works end to end.\n'
