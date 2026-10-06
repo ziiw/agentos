@@ -93,7 +93,7 @@ supervisor (host)       validates grants, writes the journal, survives Ctrl-C
 |---|---|---|
 | **0. Transactions** ✅ | Sandbox, overlay transactions, diff/commit/rollback, journal, doctor | An agent's risky change, reviewed and half rolled back |
 | **1. The layer** | `agentd` + the items below, shipped as .deb/.rpm "agent layer for Linux" | Outside developers use it daily |
-| **2. The distro** | bootc image with agentd built in, microVM tier, cloud images, headless agent host | Teams run agent fleets on it |
+| **2. The distro** ◐ | bootc image with agentos and agentd built in (M11) ✅; next: microVM tier, cloud images, published updates | Teams run agent fleets on it |
 | **3. Desktop** | Wayland session with a separate display per agent (watch, take over), local model service | Early adopters use it as their daily machine |
 | **4. Ecosystem** | Agent packages that declare the permissions they need, registry, remote attestation | Other developers build on it |
 
@@ -128,6 +128,7 @@ It's verified at three levels:
 | M8: git push outbox: pushes held per remote, replayed from your own git on commit | ✅ CI green |
 | M9: login brokering: OAuth tokens sealed in a vault; placeholders in the sandbox; token endpoint rewritten both ways | ✅ CI green; real Claude verified with fake tokens (API + refresh paths) |
 | M10: agentd console: tasks, diffs, commit/push/rollback and approvals in a browser; first answer wins; push notifications | ✅ automated + checked in a browser |
+| M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ see CI |
 
 ### Phase 1 backlog, in order
 

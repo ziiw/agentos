@@ -3,6 +3,7 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -43,3 +44,63 @@ jobs:
 
       - name: End-to-end tests
         run: REQUIRE_LANDLOCK=1 bash tests/e2e.sh
+
+  image:
+    # The distribution: build the bootc image and run the whole e2e suite
+    # inside it, on a real kernel.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the agentos image
+        run: docker build -f image/Containerfile --build-arg AGENTOS_REV="$(git rev-parse --short HEAD)" -t agentos:ci .
+
+      - name: End-to-end tests inside the image
+        run: |
+          # Inside a privileged container agent runs unconfined, so lift
+          # Ubuntu's userns restriction for this job (the host install uses
+          # the AppArmor profile instead).
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          mkdir -p /tmp/e2e && chmod 1777 /tmp/e2e
+          docker run --rm --privileged -v "$PWD:/src:ro" -v /tmp/e2e:/e2e agentos:ci bash -c '
+            cat /usr/lib/os-release | grep PRETTY_NAME
+            agent --version
+            useradd -m tester
+            su - tester -c "E2E_DIR=/e2e bash /src/tests/e2e.sh"'
+
+  disk:
+    # A bootable disk image (qcow2) for a VM or cloud, on demand: Actions →
+    # ci → Run workflow. Takes a while and makes a ~2 GB artifact.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image into podman's storage
+        run: sudo podman build -f image/Containerfile --build-arg AGENTOS_REV="$(git rev-parse --short HEAD)" -t localhost/agentos:latest .
+
+      - name: Make a qcow2 disk with bootc-image-builder
+        env:
+          # Optional repository secret: your SSH public key, to log in as `agent`.
+          SSH_KEY: ${{ secrets.AGENTOS_SSH_KEY }}
+        run: |
+          mkdir -p output
+          if [ -n "$SSH_KEY" ]; then
+            printf '[[customizations.user]]\nname = "agent"\nkey = "%s"\ngroups = ["wheel"]\n' "$SSH_KEY" > image/disk.toml
+          fi
+          sudo podman run --rm --privileged --pull=newer \
+            --security-opt label=type:unconfined_t \
+            -v ./image/disk.toml:/config.toml:ro \
+            -v ./output:/output \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type qcow2 --rootfs xfs \
+            localhost/agentos:latest
+          sudo chown -R "$(id -u)" output
+          ls -la output/qcow2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentos-qcow2
+          path: output/qcow2/disk.qcow2
+          retention-days: 7

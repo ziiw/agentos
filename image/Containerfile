@@ -1,0 +1,30 @@
+# agentos: a Linux distribution for running AI agents as transactions.
+#
+# Fedora bootc with the agent runtime built in: the OS itself is this
+# container image, updated atomically (`bootc upgrade`) and rolled back the
+# same way (`bootc rollback`).
+#
+#   podman build -f image/Containerfile -t localhost/agentos .
+#
+# Turn it into a bootable disk, or move an existing bootc machine onto it:
+# see image/README.md.
+
+FROM docker.io/library/rust:1.94-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+# Set by CI to the commit being built (there's no .git in the build context).
+ARG AGENTOS_REV=unknown
+ENV AGENTOS_REV=${AGENTOS_REV}
+RUN cargo build --release --locked
+
+FROM quay.io/fedora/fedora-bootc:42
+
+# What agents (and agentos itself) reach for: git for the outbox, curl,
+# python3, and util-linux for unshare/script.
+RUN dnf -y install git-core curl python3 util-linux && dnf clean all
+
+COPY --from=build /src/target/release/agent /usr/bin/agent
+COPY image/rootfs/ /
+
+RUN bootc container lint

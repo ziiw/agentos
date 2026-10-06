@@ -34,6 +34,10 @@ This is Phase 0 of an agent-native OS. See [docs/DESIGN.md](docs/DESIGN.md) for 
 
 ## Install
 
+**As a whole OS:** [image/](image/README.md) is agentos as a Linux distribution. It's a Fedora bootc image with the runtime built in, atomic updates and rollbacks, bootable as a VM or on hardware. CI builds it and runs the end-to-end suite inside it.
+
+**On an existing Linux machine:**
+
 Linux, kernel 5.11+, Rust 1.85+:
 
 ```bash

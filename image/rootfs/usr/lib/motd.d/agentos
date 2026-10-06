@@ -1,0 +1,11 @@
+
+agentos: agents run here as transactions. Nothing they do is final until you commit it.
+
+  agent doctor                    check this machine
+  agent do "add a test for greet" give a task to an agent, in the current folder
+  agent diff / commit / rollback  review what it did, keep it or drop it
+  agent serve                     web console (or: systemctl --user enable --now agentd)
+
+Claude Code isn't preinstalled:  curl -fsSL https://claude.ai/install.sh | bash
+The OS updates atomically:       sudo bootc upgrade   (and sudo bootc rollback)
+

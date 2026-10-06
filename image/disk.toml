@@ -1,0 +1,10 @@
+# bootc-image-builder settings for agentos disk images.
+#
+# A disk you can't log into isn't much use: add a user with your SSH key, e.g.
+#
+#   [[customizations.user]]
+#   name = "agent"
+#   key = "ssh-ed25519 AAAA… you@laptop"
+#   groups = ["wheel"]
+#
+# (CI writes this block from the AGENTOS_SSH_KEY repository secret, if set.)

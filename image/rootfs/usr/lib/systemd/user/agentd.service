@@ -1,0 +1,10 @@
+[Unit]
+Description=agentd: web console for agent tasks and approvals
+Documentation=https://github.com/ziiw/agentos
+
+[Service]
+ExecStart=/usr/bin/agent serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

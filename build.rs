@@ -3,6 +3,11 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=AGENTOS_REV");
+    if let Some(rev) = std::env::var("AGENTOS_REV").ok().filter(|r| !r.is_empty() && r != "unknown") {
+        println!("cargo:rustc-env=AGENTOS_REV={rev}");
+        return;
+    }
     let rev = Command::new("git")
         .args(["-c", "safe.directory=*", "rev-parse", "--short", "HEAD"])
         .output()
