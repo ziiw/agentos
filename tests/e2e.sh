@@ -3,6 +3,7 @@
 # namespaces and must run as a normal user; on macOS use `scripts/dev.sh test`.
 set -uo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 AGENT="${AGENT:-agent}"
 WORK="$(mktemp -d "${E2E_DIR:-/tmp}/agentos-e2e.XXXXXX")"
 export AGENTOS_HOME="$WORK/store"
@@ -180,7 +181,7 @@ check "commit --all includes them" test -f build/out
 
 section "agent do (with a stand-in for Claude Code)"
 mkdir -p "$WORK/tools/claude-code"
-cp "$(dirname "$0")/fake-claude" "$WORK/tools/claude-code/claude"
+cp "$HERE/fake-claude" "$WORK/tools/claude-code/claude"
 chmod +x "$WORK/tools/claude-code/claude"
 export PATH="$WORK/tools/claude-code:$PATH"
 AGENT_STATE="$AGENTOS_HOME/homes/claude/.claude"
