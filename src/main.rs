@@ -3,6 +3,7 @@ use agentos::broker::{self, Broker, Secret};
 use agentos::changes::{self, Summary};
 use agentos::config;
 use agentos::doctor::{self, Level};
+use agentos::gateway::{self, Budget, Endpoint, Meter, Price};
 use agentos::journal::{Integrity, Journal};
 use agentos::limits::{self, Limits};
 use agentos::outbox;
@@ -223,6 +224,10 @@ struct Mode {
     /// Limit on processes and threads
     #[arg(long, value_name = "N")]
     pids: Option<u32>,
+    /// Budget for model calls: dollars (2usd, $2) or tokens (500k, 2M).
+    /// Measured on the wire; once it's used up, model calls are refused.
+    #[arg(long, value_name = "AMOUNT")]
+    budget: Option<Budget>,
 }
 
 impl Mode {
@@ -336,6 +341,12 @@ struct Plan {
     /// Fail rather than run without the current directory.
     needs_cwd: bool,
     timeout: Option<Duration>,
+    /// For model calls, enforced by the gateway.
+    budget: Option<Budget>,
+    /// Your prices for models agentos doesn't know.
+    prices: Vec<(String, Price)>,
+    /// Model APIs the agent calls beyond the well-known ones.
+    models: Vec<Endpoint>,
 }
 
 fn main() -> ExitCode {
@@ -377,10 +388,17 @@ fn home_dir() -> Result<PathBuf> {
     Ok(fs::canonicalize(&home).unwrap_or(home))
 }
 
+/// What the config files add to a task beyond its grants.
+struct Applied {
+    allow: Vec<String>,
+    /// Those whose variable is set in your environment.
+    secrets: Vec<Secret>,
+    budget: Option<Budget>,
+    prices: Vec<(String, Price)>,
+}
+
 /// Merges your config and a trusted project config into this task's grants.
-/// Returns the hosts they allow and the secrets they broker (those set in
-/// your environment).
-fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<(Vec<String>, Vec<Secret>)> {
+fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Applied> {
     let (cwd, home) = (std::env::current_dir()?, home_dir()?);
     let mut settings = config::load(store.root(), &cwd, &home)?;
     for note in &settings.notes {
@@ -396,7 +414,22 @@ fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<(Vec<String>, V
             secrets.push(Secret::parse(&format!("{name}={target}"))?);
         }
     }
-    Ok((settings.allow, secrets))
+    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices })
+}
+
+/// The task's budget: --budget, else your config's. The gateway enforces it
+/// in the egress proxy, so a task without the proxy has none.
+fn task_budget(flag: Option<Budget>, configured: Option<Budget>, net: Net) -> Result<Option<Budget>> {
+    match (flag, configured, net) {
+        (Some(_), _, Net::Host) => bail!("--budget is enforced in the egress proxy, which --net host bypasses"),
+        (None, Some(b), Net::Host) => {
+            eprintln!("{} the budget in your config ({b}) isn't enforced with --net host", Paint::stderr().yellow("agent: warning:"));
+            Ok(None)
+        }
+        // No network, no model calls.
+        (_, _, Net::None) => Ok(None),
+        (flag, configured, _) => Ok(flag.or(configured)),
+    }
 }
 
 fn cmd_trust(store: &Store, path: Option<PathBuf>) -> Result<i32> {
@@ -530,8 +563,10 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         Some(t) => format!("{}: {t}", profile.name),
         None => format!("{} (interactive)", profile.name),
     };
-    let (config_allow, config_secrets) = apply_config(store, &mut args.grants)?;
+    let applied = apply_config(store, &mut args.grants)?;
+    let (config_allow, config_secrets) = (applied.allow, applied.secrets);
     let net = args.net.unwrap_or(profile.net);
+    let budget = task_budget(args.mode.budget, applied.budget, net)?;
     if net != Net::Proxy && !args.grants.allow.is_empty() {
         bail!("--allow only applies to the agent's default, proxied network; drop --net {net}");
     }
@@ -581,6 +616,9 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             expected_denials: profile.expected_denials,
             needs_cwd: true,
             timeout: args.mode.timeout,
+            budget,
+            prices: applied.prices,
+            models: profile.models,
         },
     )
 }
@@ -591,7 +629,8 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     }
     args.mode.apply_limits(store)?;
     let argv = args.command;
-    let (config_allow, config_secrets) = apply_config(store, &mut args.grants)?;
+    let applied = apply_config(store, &mut args.grants)?;
+    let (config_allow, config_secrets) = (applied.allow, applied.secrets);
     let mut secrets = parse_secrets(&args.grants.secret)?;
     let ask = args.grants.ask;
     let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask;
@@ -601,6 +640,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
         None if asked || !config_allow.is_empty() => Net::Proxy,
         None => Net::None,
     };
+    let budget = task_budget(args.mode.budget, applied.budget, net)?;
     let mut allow = Vec::new();
     if net == Net::Proxy {
         allow.extend(config_allow);
@@ -630,6 +670,9 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             ask: if ask { Ask::TerminalAndConsole } else { Ask::Never },
             needs_cwd: false,
             timeout: args.mode.timeout,
+            budget,
+            prices: applied.prices,
+            models: Vec::new(),
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {
@@ -708,6 +751,20 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
     }
     let allowlist = Allowlist::parse(&allow)?;
+    // The model gateway meters calls on the hosts the broker relays. With a
+    // budget, it relays the model APIs this task can reach even when it has
+    // no credential to add for them.
+    let budget = if plan.net == Net::Proxy { plan.budget } else { None };
+    let mut endpoints = gateway::builtin_endpoints();
+    endpoints.extend(plan.models);
+    let mut intercept: Vec<String> = Vec::new();
+    if budget.is_some() {
+        for e in &endpoints {
+            if allowlist.allows(&e.host, 443) && !intercept.contains(&e.host) {
+                intercept.push(e.host.clone());
+            }
+        }
+    }
     let hidden = plan
         .grants
         .hide
@@ -717,7 +774,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 
     let mut env = build_env(&plan.grants.env, &home)?;
     let brokered_env = plan.secrets.iter().map(|s| (s.env.clone(), s.placeholder.clone()));
-    let brokering = !plan.secrets.is_empty() || plan.login.as_ref().is_some_and(|l| l.brokered);
+    let brokering = !plan.secrets.is_empty() || plan.login.as_ref().is_some_and(|l| l.brokered) || !intercept.is_empty();
     let ca_env = brokering
         .then(|| {
             // Node and Bun add to their roots; curl, Python, git and OpenSSL
@@ -752,6 +809,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         ask: plan.ask != Ask::Never && plan.net == Net::Proxy,
         secrets: plan.secrets.iter().map(|s| s.env.clone()).collect(),
         env: env_names,
+        budget,
     })?;
     env.push(("AGENTOS_TASK".into(), task.id().to_string()));
     // A background task (agent … --bg) keeps what it prints with the task.
@@ -777,6 +835,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             "ask": task.meta.ask,
             "secrets": plan.secrets.iter().map(|s| json!({ "env": s.env, "host": s.host, "header": s.header })).collect::<Vec<_>>(),
             "env": task.meta.env,
+            "budget": budget,
         }),
     )?;
 
@@ -818,11 +877,21 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     // The CA's private key never leaves this process; only its certificate
     // is written out for the sandbox to trust.
     let login = plan.login;
+    let meter = brokering.then(|| Arc::new(Meter::new(endpoints, plan.prices, budget, meter_observer(journal.clone(), err, budget))));
+    if let (Some(b), Some(m)) = (budget, &meter) {
+        let relayed: Vec<&str> = plan.secrets.iter().map(|s| s.host.as_str())
+            .chain(login.iter().filter(|l| l.brokered).flat_map(|l| l.hosts.iter().map(String::as_str)))
+            .chain(intercept.iter().map(String::as_str))
+            .collect();
+        if !m.hosts().iter().any(|h| relayed.contains(&h.as_str())) {
+            eprintln!("{} the budget ({b}) has nothing to count: this task can't reach a model API agentos knows (see `models` in README: Agents)", err.yellow("agent: warning:"));
+        }
+    }
     let broker = if !brokering {
         None
     } else {
         let vault = login.as_ref().filter(|l| l.brokered).map(|l| (l.vault.clone(), l.hosts.clone()));
-        let broker = Broker::new(plan.secrets, vault)?;
+        let broker = Broker::new(plan.secrets, vault, meter.clone().map(|m| (m, intercept)))?;
         let (ca, bundle) = (task.dir.join("ca.pem"), task.dir.join("ca-bundle.pem"));
         fs::write(&ca, broker.ca_pem())?;
         fs::write(&bundle, broker::ca_bundle(broker.ca_pem()))?;
@@ -934,10 +1003,22 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         let (reason, text) = match why {
             sandbox::Stop::Timeout => ("timeout", format!("stopped after {} (--timeout)", util::duration(ended - task.meta.started_at_ms))),
             sandbox::Stop::Stopped => ("stopped", "stopped".to_string()),
+            sandbox::Stop::Budget => ("budget", "stopped: it kept calling the model after its budget was used up".to_string()),
         };
         journal.append("task.stopped", json!({ "reason": reason }))?;
         task.meta.stop = Some(reason.to_string());
         eprintln!("{} task {} {text}; what it did so far is held for review", err.yellow("agent ▸"), task.id());
+    }
+    if let Some(m) = &meter {
+        let totals = m.totals();
+        if totals.calls + totals.unmetered + totals.refused > 0 {
+            journal.append("model.usage", json!({ "totals": totals, "budget": budget }))?;
+            task.meta.usage = Some(totals);
+        }
+        if m.exhausted() && task.meta.stop.is_none() {
+            task.meta.stop = Some("budget".into());
+            eprintln!("{} task {} went over its budget; what it did so far is held for review", err.yellow("agent ▸"), task.id());
+        }
     }
     task.meta.status = if setup_error.is_some() { Status::Failed } else { Status::Exited };
     task.meta.exit_code = Some(exit_code);
@@ -1042,6 +1123,43 @@ fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(String, 
             say(format!("{} {target}: {why}{hint}", err.yellow("agent: blocked")));
         } else if let Some(reason) = &event.reason {
             say(format!("{} {}:{}: {reason}", err.yellow("agent: warning:"), event.host, event.port));
+        }
+    })
+}
+
+/// Journals every model call the gateway meters, and says so, live, when
+/// the budget is nearly or entirely used up.
+fn meter_observer(journal: Journal, err: Paint, budget: Option<Budget>) -> gateway::Observer {
+    // An agent that keeps calling after being refused is stopped.
+    const REFUSALS_BEFORE_STOP: u64 = 5;
+    let warned = Mutex::new(HashSet::new());
+    Arc::new(move |event: gateway::Event| match event {
+        gateway::Event::Call(call, totals) => {
+            let mut data = json!(call);
+            data["total"] = json!({ "tokens": totals.usage.tokens(), "cost_usd": totals.cost_usd });
+            let _ = journal.append("model.call", data);
+        }
+        gateway::Event::Unmetered { host, why } => {
+            let _ = journal.append("model.unmetered", json!({ "host": host, "why": why }));
+            if warned.lock().is_ok_and(|mut seen| seen.insert(host.to_string())) {
+                say(format!("{} a model call to {host} couldn't be measured ({why}): it isn't counted", err.yellow("agent: warning:")));
+            }
+        }
+        gateway::Event::Nearly(totals) => {
+            let _ = journal.append("budget.nearly", json!({ "totals": totals }));
+            let used = budget.map(|b| totals.against(b)).unwrap_or_default();
+            say(format!("{} 80% of the budget used ({used})", err.cyan("agent ▸")));
+        }
+        gateway::Event::Exhausted(totals) => {
+            let _ = journal.append("budget.exhausted", json!({ "totals": totals }));
+            let used = budget.map(|b| totals.against(b)).unwrap_or_default();
+            say(format!("{} budget used up ({used}): model calls are refused from now on", err.yellow("agent ▸")));
+        }
+        gateway::Event::Refused(totals) => {
+            let _ = journal.append("model.refused", json!({ "refused": totals.refused }));
+            if totals.refused >= REFUSALS_BEFORE_STOP {
+                sandbox::stop(sandbox::Stop::Budget);
+            }
         }
     })
 }

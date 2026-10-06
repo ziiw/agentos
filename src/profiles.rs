@@ -4,6 +4,7 @@
 //! An agent runs with its own permission prompts switched off: agentos holds
 //! every change for review, so the agent doesn't need to ask.
 
+use crate::gateway::{Api, Endpoint};
 use crate::sandbox::is_system_path;
 use crate::store::Net;
 use anyhow::{Context, Result, bail};
@@ -39,6 +40,8 @@ pub struct Profile {
     /// Refusals are journaled, and explained once instead of warned about.
     pub expected_denials: Vec<(String, String)>,
     pub output: Output,
+    /// Model APIs it calls beyond the well-known ones, metered by the gateway.
+    pub models: Vec<Endpoint>,
 }
 
 /// `task: None` opens an interactive session. Agents other than the
@@ -103,6 +106,13 @@ pub fn available(agents_dir: &Path) -> Vec<Available> {
 /// [env]                                              # set in the sandbox
 /// SOME_SETTING = "1"
 /// ```
+///
+/// Model APIs beyond api.anthropic.com and api.openai.com are metered (and
+/// count against budgets) once listed, before the first `[section]`:
+///
+/// ```toml
+/// models = [{ url = "https://openrouter.ai/api/v1/chat/completions", api = "openai" }]
+/// ```
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentFile {
@@ -119,12 +129,27 @@ struct AgentFile {
     env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pass_env: Vec<String>,
+    #[serde(default)]
+    models: Vec<ModelEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelEntry {
+    url: String,
+    api: Api,
 }
 
 fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile> {
     let text = fs::read_to_string(file)?;
     let def: AgentFile = toml::from_str(&text).with_context(|| format!("{}: invalid agent definition", file.display()))?;
     crate::proxy::Allowlist::parse(&def.allow).with_context(|| format!("{}: allow", file.display()))?;
+    let models = def
+        .models
+        .iter()
+        .map(|m| Endpoint::parse(&m.url, m.api))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("{}: models", file.display()))?;
     let headless = task.is_some() && !interactive;
     let template = if headless {
         def.run.clone()
@@ -173,6 +198,7 @@ fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, hom
         login: None,
         expected_denials: Vec::new(),
         output,
+        models,
     })
 }
 
@@ -219,6 +245,12 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
         // Anything else shows up as "blocked" in the output and the journal.
         allow: ["api.anthropic.com", "console.anthropic.com", "platform.claude.com", "claude.ai"].map(String::from).to_vec(),
         output,
+        // Pointed at another gateway: its Messages API is metered too.
+        models: std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .and_then(|base| Endpoint::parse(&format!("{}/v1/messages", base.trim_end_matches('/')), Api::Anthropic).ok())
+            .into_iter()
+            .collect(),
     })
 }
 

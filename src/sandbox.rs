@@ -108,7 +108,8 @@ pub struct Report {
 /// The sandbox's namespace parent (process A), while it runs: killing it
 /// takes down everything inside, since pid 1 dies with it.
 static SANDBOX_PID: AtomicI32 = AtomicI32::new(0);
-/// Why the sandbox was cut short: 0 not, 1 stopped (signal), 2 timed out.
+/// Why the sandbox was cut short: 0 not, 1 stopped (signal), 2 timed out,
+/// 3 over budget.
 static STOPPED: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +117,8 @@ pub enum Stop {
     /// `agent stop`, SIGTERM or a closed terminal.
     Stopped,
     Timeout,
+    /// Kept calling the model after its budget was used up.
+    Budget,
 }
 
 /// Ends the running sandbox, if any. Safe from a signal handler.
@@ -124,7 +127,12 @@ pub fn stop(why: Stop) {
     if pid <= 0 {
         return;
     }
-    let _ = STOPPED.compare_exchange(0, if why == Stop::Timeout { 2 } else { 1 }, Ordering::SeqCst, Ordering::SeqCst);
+    let code = match why {
+        Stop::Stopped => 1,
+        Stop::Timeout => 2,
+        Stop::Budget => 3,
+    };
+    let _ = STOPPED.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
     unsafe { libc::kill(pid, libc::SIGKILL) };
 }
 
@@ -133,6 +141,7 @@ pub fn stopped() -> Option<Stop> {
     match STOPPED.load(Ordering::SeqCst) {
         1 => Some(Stop::Stopped),
         2 => Some(Stop::Timeout),
+        3 => Some(Stop::Budget),
         _ => None,
     }
 }

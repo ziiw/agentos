@@ -57,6 +57,26 @@ else
   pass "your real folder is untouched until you commit"
 fi
 if agent log --json | grep -q '"kind":"agent.tool"'; then pass "tool calls were journaled"; else fail "tool calls were journaled"; fi
+# What the gateway measured on the wire, next to what Claude says it spent.
+costs="$(agent log --json | python3 -c '
+import json, sys
+gw = cl = None
+for line in sys.stdin:
+    e = json.loads(line)
+    if e["kind"] == "model.usage": gw = e["data"]["totals"]["cost_usd"]
+    if e["kind"] == "agent.result": cl = e["data"].get("cost_usd")
+print(gw if gw is not None else "", cl if cl is not None else "")')"
+read -r gateway claude <<<"$costs"
+if [ -n "$gateway" ]; then
+  pass "the gateway measured the agent's model calls (\$$gateway)"
+  if [ -n "$claude" ] && python3 -c "import sys; g, c = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if c > 0 and 0.7 <= g / c <= 1.3 else 1)" "$gateway" "$claude"; then
+    pass "...within 30% of what Claude reports (\$$claude)"
+  else
+    fail "...within 30% of what Claude reports (\$${claude:-none}): the price table may be off"
+  fi
+else
+  fail "the gateway measured the agent's model calls"
+fi
 
 if git --git-dir="$REMOTE" rev-parse -q --verify refs/heads/test-greet >/dev/null; then
   fail "the agent's push is held, not sent"
@@ -82,6 +102,16 @@ fi
 step "5. Audit"
 agent log | tail -12
 if agent log >/dev/null; then pass "journal chain intact"; else fail "journal chain intact"; fi
+
+step "6. A budget stops a task"
+# Claude's first call alone (its system prompt) costs more than a cent, so
+# the call after it is refused. Costs one or two model calls.
+out="$(agent do --budget 0.01usd "Count from 1 to 5, running a separate echo command for each number." 2>&1)"
+echo "$out" | tail -6
+if grep -q 'budget used up' <<<"$out"; then pass "you're told when the budget is used up"; else fail "you're told when the budget is used up"; fi
+if agent log --json | grep -q '"kind":"model.refused"'; then pass "the next model call was refused, not sent"; else fail "the next model call was refused, not sent"; fi
+if agent ls | sed -n 2p | grep -q 'over budget'; then pass "agent ls shows the task over budget"; else fail "agent ls shows the task over budget"; fi
+agent rollback >/dev/null
 
 echo
 if [ $failed -eq 0 ]; then

@@ -9,6 +9,7 @@
 //! ```
 
 use crate::changes::Layer;
+use crate::gateway::{Budget, Totals};
 use crate::journal::Journal;
 use crate::util::{self, now_ms};
 use anyhow::{Context, Result, bail};
@@ -115,9 +116,15 @@ pub struct TaskMeta {
     pub ended_at_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub supervisor_pid: Option<u32>,
-    /// Cut short: "stopped" (agent stop, a signal) or "timeout".
+    /// Cut short: "stopped" (agent stop, a signal), "timeout", or "budget"
+    /// (it ran out of budget for model calls).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+    /// Model calls, as measured by the gateway (set when the task ends).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Totals>,
 }
 
 pub struct NewTask {
@@ -132,6 +139,7 @@ pub struct NewTask {
     pub ask: bool,
     pub secrets: Vec<String>,
     pub env: Vec<String>,
+    pub budget: Option<Budget>,
 }
 
 pub struct Task {
@@ -186,6 +194,7 @@ impl Task {
         match self.meta.status {
             Status::Running if !self.is_live() => "crashed".into(),
             Status::Exited if self.meta.stop.as_deref() == Some("timeout") => "timed out".into(),
+            Status::Exited if self.meta.stop.as_deref() == Some("budget") => "over budget".into(),
             Status::Exited if self.meta.stop.is_some() => "stopped".into(),
             Status::Exited => format!("exited {}", self.meta.exit_code.unwrap_or(-1)),
             s => format!("{s:?}").to_lowercase(),
@@ -309,6 +318,8 @@ impl Store {
                 exit_code: None,
                 supervisor_pid: Some(std::process::id()),
                 stop: None,
+                budget: new.budget,
+                usage: None,
             },
             dir,
         };

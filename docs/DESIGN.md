@@ -24,8 +24,8 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | per-remote bare repos + your git; egress proxy for HTTP later | ◐ git pushes (M8) |
 | Secrets never reach the model | The agent sees placeholders; real credentials are added at the proxy | credential broker, vault, keystore/TPM | ● API keys and OAuth logins brokered; keys from the environment, not yet the OS keychain |
 | Taint tracking | Once a session reads untrusted input, its risky actions need approval | policy engine (Cedar) | ○ Phase 1 |
-| Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, cost |
-| Tokens are a budgeted resource | $/token/time budgets per task | model gateway | ○ Phase 1 |
+| Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, every model call with its measured cost |
+| Tokens are a budgeted resource | $/token/time budgets per task | model gateway | ● per-task $ or token budgets, metered on the wire (M15); time via --timeout |
 | Interfaces built for agents | System services exposed as typed tools | MCP gateway, D-Bus bridge, AT-SPI | ○ Phase 1 |
 | Agents can live for days | Sleep, wake on events, survive reboots | systemd units, CRIU | ○ Phase 3 |
 
@@ -131,16 +131,18 @@ It's verified at three levels:
 | M12: background tasks: --bg, logs/wait/stop, --timeout; agentd shows live progress and notifies on completion | ✅ CI green |
 | M13: resource limits: --memory/--cpus/--pids via transient systemd scopes (cgroup v2); OOM kills journaled | ✅ enforced and tested on Ubuntu CI (x86_64, arm64) and in the booted distro |
 | M14: agents as config files: any agent CLI via `agents/NAME.toml` (commands, allowlist, brokered secrets, output); `agent agents`; default agent | ✅ CI green (stand-in agents); Codex/Gemini/Aider examples untested |
+| M15: model gateway: every model call metered from the provider's own usage (Anthropic Messages, OpenAI Responses/Chat Completions, custom endpoints), priced, journaled; per-task $ or token budgets, refused in the API's own format once used up | ✅ CI green (stand-in API); real Claude: in scripts/acceptance.sh |
 | M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and passes the whole e2e suite (179/179, Landlock and limits enforced) |
 
 ### Phase 1 backlog, in order
 
-1. **Profiles and configuration.** Claude Code is built in (`src/profiles.rs`). ✅ Config files: `~/.config/agentos/config.toml` and trust-on-review `.agentos.toml` (M6). ✅ Agents as files (M14). Next: verified recipes for Codex, Gemini CLI and Aider, token budgets.
+1. **Profiles and configuration.** Claude Code is built in (`src/profiles.rs`). ✅ Config files: `~/.config/agentos/config.toml` and trust-on-review `.agentos.toml` (M6). ✅ Agents as files (M14). ✅ Token and dollar budgets (M15). Next: verified recipes for Codex, Gemini CLI and Aider.
 2. **Egress proxy.** ✅ Done without veth or root: the sandbox has only loopback, and a forwarder inside relays to the proxy through a unix socket. Next: presets (`--allow @pypi`), upstream corporate proxies.
 3. **Credential broker.** ✅ Per-task CA, TLS termination for brokered hosts only, placeholder → real value in one header. ✅ OAuth logins (M9): tokens sealed in a vault, the token endpoint rewritten both ways so even `/login` in the sandbox yields placeholders. Next: keys from the OS keychain instead of the environment.
 4. **Effects outbox.** ✅ `git push` (M8): each remote gets a bare outbox repo in the task, git in the sandbox pushes there (`GIT_CONFIG_*`), `agent commit` replays from your own git. Next: HTTP writes to APIs, policy auto-release.
 5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
-6. **cgroups.** ✅ CPU, memory and pid limits through a systemd transient scope (M13). Next: token/$ budgets through the model gateway.
+6. **cgroups.** ✅ CPU, memory and pid limits through a systemd transient scope (M13).
+   **Model gateway.** ✅ (M15) Model calls go through the broker's TLS termination (for credentialed hosts, and for model APIs when there's a budget), so the gateway reads the usage the provider reports in each response, JSON or streamed, without trusting the agent. Calls are priced (built-in Claude list prices, `[prices]` for the rest; an unknown model counts at the highest rate), journaled, and counted against the task's budget. Once it's used up, model calls get a 400 in the API's own error format, which agents don't retry; one that keeps calling is stopped after 5 refusals. Next: budgets across tasks (per day, per project), the Gemini API, and refusing the batch APIs under a budget (they're billed later and not metered).
 7. **agentd + API.** ✅ `agent serve` (M10): token-protected web console and JSON API; approvals reach you away from the terminal, with optional push notifications. Next: run tasks *from* agentd, accounts for teams. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
 8. **MCP gateway.** System services exposed as typed tools, governed by the same policy.
 

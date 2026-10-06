@@ -9,6 +9,7 @@
 use crate::render::{self, Paint};
 use agentos::approvals::{self, Agentd, Decision};
 use agentos::changes::{self, Summary};
+use agentos::gateway;
 use agentos::outbox;
 use agentos::store::{Store, Task};
 use agentos::util;
@@ -127,20 +128,31 @@ fn task_json(t: &Task) -> Value {
     let open = t.is_open();
     let summary = if open { changes::scan(&t.layers()).ok().map(|c| Summary::of(&c)) } else { None };
     let pushes = if open { outbox::pending(&t.dir).map(|p| p.len()).unwrap_or(0) } else { 0 };
+    let live = t.is_live();
+    let events = if live { t.journal().read().unwrap_or_default() } else { Vec::new() };
     // What a running task is up to: its latest tool call or connection.
-    let doing = t.is_live().then(|| {
-        t.journal().read().ok()?.iter().rev().find_map(|e| match e.kind.as_str() {
-            "agent.tool" => Some(format!("{} {}", e.data["name"].as_str()?, e.data["target"].as_str().unwrap_or(""))),
-            "net.connect" => Some(format!("connected to {}", e.data["host"].as_str()?)),
-            _ => None,
-        })
+    let doing = events.iter().rev().find_map(|e| match e.kind.as_str() {
+        "agent.tool" => Some(format!("{} {}", e.data["name"].as_str()?, e.data["target"].as_str().unwrap_or(""))),
+        "net.connect" => Some(format!("connected to {}", e.data["host"].as_str()?)),
+        _ => None,
     });
+    // Spent on model calls: running totals while live, the final count after.
+    let (cost, tokens) = match &t.meta.usage {
+        Some(u) if u.calls > 0 => (Some(u.cost_usd), Some(u.usage.tokens())),
+        _ => match events.iter().rev().find(|e| e.kind == "model.call") {
+            Some(e) => (e.data["total"]["cost_usd"].as_f64(), e.data["total"]["tokens"].as_u64()),
+            None => (None, None),
+        },
+    };
     json!({
         "id": t.id(),
         "title": render::title(t),
         "status": t.status_label(),
-        "live": t.is_live(),
-        "doing": doing.flatten(),
+        "live": live,
+        "doing": doing,
+        "cost": cost.map(gateway::usd),
+        "tokens": tokens.map(gateway::tokens),
+        "budget": t.meta.budget.map(|b| b.to_string()),
         "open": open,
         "started_ms": t.meta.started_at_ms,
         "changes": summary,

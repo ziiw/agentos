@@ -1,6 +1,7 @@
 //! Human-readable output for the CLI.
 
 use agentos::changes::{self, Change, Entry, Kind, Summary};
+use agentos::gateway::{self, Budget, Totals, Usage};
 use agentos::journal::Event;
 use agentos::outbox::Push;
 use agentos::profiles::AgentEvent;
@@ -126,6 +127,9 @@ pub fn banner(p: Paint, task: &Task, outbox: bool, login_sealed: bool) -> String
     if login_sealed {
         parts.push(format!("{} sealed", p.dim("login")));
     }
+    if let Some(b) = task.meta.budget {
+        parts.push(format!("{} {b}", p.dim("budget")));
+    }
     format!("{} {}", p.cyan("agent ▸"), parts.join("  "))
 }
 
@@ -143,8 +147,12 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
     let id = task.id();
     let took = util::duration(task.meta.ended_at_ms.unwrap_or(0).saturating_sub(task.meta.started_at_ms));
     let mut head = format!("{} task {} exited {} in {took}", p.cyan("agent ▸"), p.bold(id), task.meta.exit_code.unwrap_or(-1));
+    // Measured by the gateway when it could; else what the agent says.
+    if let Some(u) = task.meta.usage.as_ref().filter(|u| u.calls > 0) {
+        let _ = write!(head, " · {}", u.describe());
+    }
     if let Some(AgentEvent::Done { turns, cost_usd, .. }) = outcome {
-        if let Some(cost) = cost_usd {
+        if let (Some(cost), None) = (cost_usd, task.meta.usage.as_ref().filter(|u| u.calls > 0)) {
             let _ = write!(head, " · ${cost:.2}");
         }
         if let Some(n) = turns {
@@ -179,7 +187,7 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
 
 pub fn task_table(p: Paint, tasks: &[Task]) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "{}", p.dim(format!("{:<10}{:<12}{:<10}{:<14}{}", "ID", "STATUS", "STARTED", "CHANGES", "COMMAND")));
+    let _ = writeln!(out, "{}", p.dim(format!("{:<10}{:<13}{:<10}{:<14}{:<9}{}", "ID", "STATUS", "STARTED", "CHANGES", "COST", "COMMAND")));
     // Pad on the visible width; color codes would throw off {:<n}.
     let pad = |s: String, visible: usize, width: usize| format!("{s}{}", " ".repeat(width.saturating_sub(visible)));
     for t in tasks.iter().rev() {
@@ -195,13 +203,15 @@ pub fn task_table(p: Paint, tasks: &[Task]) -> String {
             changes.push_str(&p.cyan(extra));
         }
         let status = t.status_label();
+        let cost = t.meta.usage.as_ref().filter(|u| u.calls > 0).map(|u| gateway::usd(u.cost_usd)).unwrap_or_else(|| "-".into());
         let _ = writeln!(
             out,
-            "{:<10}{}{:<10}{}{}",
+            "{:<10}{}{:<10}{}{:<9}{}",
             t.id(),
-            pad(status_color(p, &status), status.len(), 12),
+            pad(status_color(p, &status), status.chars().count(), 13),
             util::ago(t.meta.started_at_ms),
             pad(changes, visible_changes, 14),
+            cost,
             truncate(&title(t), 60)
         );
     }
@@ -489,11 +499,15 @@ fn describe(p: Paint, e: &Event) -> String {
             if d["brokered"].as_bool() == Some(true) && d["reason"].is_string() {
                 format!("{} {target} · {}", p.red("✗"), s(&d["reason"]))
             } else if d["brokered"].as_bool() == Some(true) {
+                let n = d["requests"].as_u64().unwrap_or(0);
+                let mut requests = format!("{n} request{}", if n == 1 { "" } else { "s" });
+                // Relayed only to meter model calls: no credential to add.
+                if let Some(injected) = d["injected"].as_u64().filter(|i| *i > 0) {
+                    let _ = write!(requests, ", credential added to {injected}");
+                }
                 format!(
-                    "{} {target} · {} requests, credential added to {} · ↑{} ↓{} · {}",
+                    "{} {target} · {requests} · ↑{} ↓{} · {}",
                     p.green("✓"),
-                    d["requests"],
-                    d["injected"],
                     bytes(d["bytes_out"].as_u64().unwrap_or(0)),
                     bytes(d["bytes_in"].as_u64().unwrap_or(0)),
                     util::duration(d["ms"].as_u64().unwrap_or(0))
@@ -522,8 +536,50 @@ fn describe(p: Paint, e: &Event) -> String {
         "task.oom" => p.red(format!("out of memory: the kernel killed {} process(es)", d["kills"])),
         "task.stopped" => match d["reason"].as_str() {
             Some("timeout") => p.yellow("timed out (--timeout)"),
+            Some("budget") => p.yellow("stopped: kept calling the model over budget"),
             _ => p.yellow("stopped"),
         },
+        "model.call" => {
+            let u: Usage = serde_json::from_value(d["usage"].clone()).unwrap_or_default();
+            let mut parts = vec![s(&d["model"])];
+            let mut input = format!("{} in", gateway::tokens(u.input + u.cache_write + u.cache_write_1h));
+            if u.cache_read > 0 {
+                let _ = write!(input, " +{} cached", gateway::tokens(u.cache_read));
+            }
+            parts.push(input);
+            parts.push(format!("{} out", gateway::tokens(u.output)));
+            if d["fast"].as_bool() == Some(true) {
+                parts.push("fast".into());
+            }
+            let cost = gateway::usd(d["cost_usd"].as_f64().unwrap_or(0.0));
+            parts.push(if d["assumed_price"].as_bool() == Some(true) { format!("≤ {cost} (unknown price)") } else { cost });
+            parts.push(format!("total {}", gateway::usd(d["total"]["cost_usd"].as_f64().unwrap_or(0.0))));
+            if d["partial"].as_bool() == Some(true) {
+                parts.push(p.yellow("cut short"));
+            }
+            parts.join(" · ")
+        }
+        "model.usage" => {
+            let t: Totals = serde_json::from_value(d["totals"].clone()).unwrap_or_default();
+            let mut parts = vec![format!("{} model call{}", t.calls, if t.calls == 1 { "" } else { "s" }), t.describe()];
+            if let Ok(b) = serde_json::from_value::<Budget>(d["budget"].clone()) {
+                parts.push(format!("budget {b}"));
+            }
+            if t.refused > 0 {
+                parts.push(p.yellow(format!("{} refused", t.refused)));
+            }
+            if t.unmetered > 0 {
+                parts.push(p.yellow(format!("{} not measured", t.unmetered)));
+            }
+            parts.join(" · ")
+        }
+        "model.unmetered" => p.yellow(format!("{}: {}", s(&d["host"]), s(&d["why"]))),
+        "model.refused" => p.yellow("over budget: refused, not sent"),
+        "budget.nearly" | "budget.exhausted" => {
+            let t: Totals = serde_json::from_value(d["totals"].clone()).unwrap_or_default();
+            let what = if e.kind == "budget.nearly" { p.yellow("80% used") } else { p.red("used up: model calls refused from now on") };
+            format!("{what} · {}", t.describe())
+        }
         "outbox.ready" => {
             let remotes: Vec<String> = d["remotes"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
             format!("git pushes to {} are held", remotes.join(", "))

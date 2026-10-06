@@ -41,7 +41,7 @@
   .badge.running { color: var(--accent); border-color: var(--accent); }
   .badge.committed { color: var(--ok); border-color: var(--ok); }
   .badge.crashed, .badge.failed { color: var(--bad); border-color: var(--bad); }
-  .badge.exited, .badge.stopped, .badge.timed { color: var(--warn); border-color: var(--warn); }
+  .badge.exited, .badge.stopped, .badge.timed, .badge.over { color: var(--warn); border-color: var(--warn); }
   .counts { font-family: var(--mono); font-size: 12px; }
   .a { color: var(--ok); } .m { color: var(--warn); } .d { color: var(--bad); } .p { color: var(--accent); }
   pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
@@ -126,13 +126,22 @@
     return parts.length ? `<span class="counts">${parts.join(" ")}</span>` : "";
   }
 
+  // "$0.42", or against the budget: "$0.42 of $2.00", "120k of 1M tokens".
+  function spend(t) {
+    if (!t.cost && !t.budget) return "";
+    const inTokens = (t.budget || "").endsWith("tokens");
+    const used = inTokens ? (t.tokens || "0") : (t.cost || "$0");
+    const of = t.budget ? ` of ${esc(t.budget)}` : "";
+    return `<span class="counts">${esc(used)}${of}</span>`;
+  }
+
   function renderTasks(tasks) {
     if (!tasks.length) { $("tasks").innerHTML = `<p class="empty">No tasks yet. Start one with <code>agent do "…"</code>.</p>`; return; }
     $("tasks").innerHTML = tasks.map((t) => {
       const status = t.status.split(" ")[0];
       return `<div class="card task" data-id="${t.id}">
         <div class="title">${esc(t.title)}</div>
-        <div class="meta"><span class="badge ${esc(status)}">${esc(t.status)}</span><span>${t.id}</span><span>${ago(t.started_ms)}</span>${counts(t)}</div>
+        <div class="meta"><span class="badge ${esc(status)}">${esc(t.status)}</span><span>${t.id}</span><span>${ago(t.started_ms)}</span>${counts(t)}${spend(t)}</div>
         ${t.doing ? `<div class="meta doing">⏺ ${esc(t.doing)}</div>` : ""}
         ${openTask === t.id ? `<div id="detail"><p class="empty">Loading…</p></div>` : ""}
       </div>`;

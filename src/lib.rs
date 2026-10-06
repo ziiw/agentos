@@ -10,6 +10,7 @@ pub mod broker;
 pub mod changes;
 pub mod config;
 pub mod doctor;
+pub mod gateway;
 pub mod journal;
 pub mod limits;
 pub mod outbox;

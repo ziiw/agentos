@@ -12,7 +12,7 @@ agent ▸ task 7c1e04a2  claude: add a test for greet  rw ~/app  ro ~/.local/sha
   ⏺ Bash python3 -m pytest -q
 
 Added test_greet.py with two tests for greet().
-agent ▸ task 7c1e04a2 exited 0 in 38.4s · $0.04 · 6 turns · 1 change held for review (+1 ~0 -0)
+agent ▸ task 7c1e04a2 exited 0 in 38.4s · 61.2k tokens · $0.04 · 6 turns · 1 change held for review (+1 ~0 -0)
         agent diff     7c1e04a2  review
         agent commit   7c1e04a2  apply to your files
         agent rollback 7c1e04a2  discard
@@ -26,7 +26,7 @@ Every agent task is a *transaction*:
 
 - the agent sees **only what you grant**: by default the current folder. No `~/.ssh`, no other projects, no environment secrets. Network access is an **allowlist**: Claude reaches Anthropic's API and nothing else, and every connection is logged.
 - its writes land in an **overlay, not your files**: when it finishes you `diff`, then `commit` or `rollback`, all of it or per path. That's why the agent runs with its own permission prompts off: nothing it does is final until you say so.
-- everything, including each tool call and what it cost, is recorded in a **hash-chained journal** the agent can't reach.
+- everything, including each tool call and each model call with what it cost, is recorded in a **hash-chained journal** the agent can't reach. Give a task a **budget** (`--budget 2usd`) and it can't spend more.
 
 No root, no daemon, no containers to build: plain Linux kernel features (user namespaces, overlayfs, Landlock). `agent run -- CMD` does the same for any command.
 
@@ -176,6 +176,22 @@ agent do --bg --memory 4G --cpus 2 --pids 1024 "run the full test suite and fix 
 
 The kernel enforces them (cgroup v2). The task runs inside a transient systemd scope that carries the limits (`systemd-run --user --scope`). That needs a systemd user session: a normal login has one, the agentos distro does, a container usually doesn't. `agent doctor` tells you. Asking for limits where they can't be enforced is an error, not a silent no-op. Defaults for every task can go in your config (`[limits]`). A task that runs out of memory gets killed by the kernel, and the journal says so.
 
+## Budgets
+
+```bash
+agent do --budget 2usd "migrate the tests to pytest"
+agent do --budget 1M "summarize the codebase"        # tokens
+```
+
+The gateway in the egress proxy reads the token counts the provider puts in each response, so the agent can't under-report them. Every model call is in the journal with its model, tokens and price. The task's total is in the exit summary, in `agent ls`, and live in the console.
+
+At 80% of the budget you get a heads-up. Once it's used up, further model calls are answered with an error in the API's own format instead of reaching the provider: the agent stops on it, and its work so far is held for review like any other task. An agent that keeps calling anyway is stopped. The call that crosses the budget completes, since its cost is only known once it's done, so a task can end slightly over.
+
+- **Dollars are at list prices.** Claude's are built in, including cache reads and writes, fast mode and web searches. With a claude.ai login, that's what the same calls would cost on the API: a measure of use, not your bill. For other models, add prices to your config (`[prices]`). Until you do, an unknown model counts at the highest Claude rate, so the budget errs on the safe side and the total shows as an upper bound (`≤ $1.20`).
+- **Tokens count everything the model processed**: input, output, cache reads and writes.
+- **Metered APIs:** Anthropic's Messages API, OpenAI's Responses and Chat Completions, and whatever an agent file lists under `models`. Calls are measured whenever the broker relays them, as with Claude's login or a brokered key, even without a budget.
+- A default for every task goes in your config: `[limits] budget = "5usd"`.
+
 ## agentd: the console
 
 ```bash
@@ -205,9 +221,13 @@ GITHUB_TOKEN = "api.github.com"       # header defaults to authorization (Bearer
 [limits]                              # defaults for every task
 memory = "8G"
 cpus = 4
+budget = "5usd"                       # model calls: dollars, or tokens ("2M")
+
+[prices]                              # your file only; USD per million tokens
+"gpt-*" = { input = 1.25, output = 10 }   # example figures: use your provider's
 ```
 
-- **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`; they're brokered whenever the variable is set in your environment and the task uses the allowlist network.
+- **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]` and `[prices]`; they're brokered whenever the variable is set in your environment and the task uses the allowlist network.
 - **`.agentos.toml` in a project** (the current directory or a parent, below `$HOME`) can allow hosts, and hide or grant read-only paths *inside the project*. It comes with the repo, so agentos ignores it until you've read it and run `agent trust`, and again after any change. That includes a change an agent made and you committed: `agent diff` flags it. Without this, an agent could widen its own permissions for the next run, and a cloned repo could send your tokens anywhere.
 
 With an allowlist from either file, `agent run` uses the proxied network instead of none.
@@ -251,6 +271,8 @@ allow = ["api.openai.com"]                 # hosts it needs
 OPENAI_API_KEY = "api.openai.com"
 ```
 
+An agent calling a model API other than Anthropic's or OpenAI's can list it before the first `[section]`, so its calls are metered and count against budgets: `models = [{ url = "https://openrouter.ai/api/v1/chat/completions", api = "openai" }]` (`api` is `anthropic` or `openai`; a trailing `*` in the URL matches any path under it).
+
 `agent do --agent codex "…"` runs it like Claude: same sandbox, transactions, outbox, allowlist and broker, and its own persistent home. `agent agents` lists what you have, and `agent = "codex"` in your config makes it the default. [examples/agents/](examples/agents) has starting points for Codex, Gemini CLI and Aider. They're untested sketches, so check their flags.
 
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
@@ -259,7 +281,8 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 
 - **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
 - **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
-- **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work.
+- **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work. With a budget, that includes model APIs.
+- **Budgets meter what they can read.** A Chat Completions stream without `stream_options.include_usage` reports no usage, so it isn't counted (you get a warning). The batch APIs are billed later and aren't metered. US-only inference (`inference_geo`, 1.1×) is priced at the standard rate.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
 - **The syscall filter is a denylist** (seccomp): it blocks typing into your terminal (TIOCSTI), new namespaces, mounts, kernel modules, bpf, io_uring, keyrings and userfaultfd. Kernel bugs reachable through the remaining syscalls are out of scope until the microVM tier.
 - **Only your own uid is mapped.** Files in a writable grant owned by another user (e.g. root-owned build output) can be read but not modified.
@@ -282,6 +305,8 @@ src/store.rs     on-disk task store
 src/doctor.rs    environment checks
 src/profiles.rs  agent profiles (Claude Code) and their output
 src/proxy.rs     egress proxy and allowlist
+src/broker.rs    credential broker (per-task CA, HTTP/1.1 relay)
+src/gateway.rs   model gateway: usage metering, prices, budgets
 src/main.rs      CLI          src/render.rs   output
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run

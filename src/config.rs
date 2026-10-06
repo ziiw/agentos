@@ -25,8 +25,13 @@
 //! memory = "8G"
 //! cpus = 4
 //! pids = 4096
+//! budget = "5usd"                         # model calls, per task: dollars or tokens (2M)
+//!
+//! [prices]                                # your file only; USD per million tokens, for
+//! "gpt-*" = { input = 1.25, output = 10 }  # models agentos doesn't know (example figures)
 //! ```
 
+use crate::gateway::{Budget, Price};
 use crate::util::hex;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -50,7 +55,22 @@ struct ConfigFile {
     #[serde(default)]
     secrets: BTreeMap<String, String>,
     #[serde(default)]
-    limits: crate::limits::Limits,
+    limits: LimitsSection,
+    #[serde(default)]
+    prices: BTreeMap<String, Price>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsSection {
+    #[serde(default)]
+    memory: Option<String>,
+    #[serde(default)]
+    cpus: Option<f32>,
+    #[serde(default)]
+    pids: Option<u32>,
+    #[serde(default)]
+    budget: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -82,6 +102,10 @@ pub struct Settings {
     pub notes: Vec<String>,
     /// Default resource limits (a project's override yours).
     pub limits: crate::limits::Limits,
+    /// Default budget for model calls (a project's overrides yours).
+    pub budget: Option<Budget>,
+    /// Your prices for models agentos doesn't know: (model or `prefix*`, price).
+    pub prices: Vec<(String, Price)>,
     /// Default agent for `agent do` (a project's overrides yours).
     pub agent: Option<String>,
 }
@@ -174,13 +198,28 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
     if file.agent.is_some() {
         s.agent = file.agent.clone();
     }
-    file.limits.validate().with_context(|| format!("{shown}: [limits]"))?;
-    s.limits = file.limits.or(&s.limits);
+    let LimitsSection { memory, cpus, pids, budget } = file.limits;
+    let limits = crate::limits::Limits { memory, cpus, pids };
+    limits.validate().with_context(|| format!("{shown}: [limits]"))?;
+    s.limits = limits.or(&s.limits);
+    if let Some(b) = budget {
+        s.budget = Some(b.parse().map_err(|e| anyhow::anyhow!("{shown}: [limits] budget = {e}"))?);
+    }
 
     if project.is_some() && !file.secrets.is_empty() {
         bail!("{shown}: [secrets] only belongs in your own config, never in a project's");
     }
     s.secrets.extend(file.secrets);
+    // A project pricing its models at zero would switch your budgets off.
+    if project.is_some() && !file.prices.is_empty() {
+        bail!("{shown}: [prices] only belongs in your own config, never in a project's");
+    }
+    for (model, price) in file.prices {
+        if !(price.input >= 0.0 && price.output >= 0.0) {
+            bail!("{shown}: [prices] {model}: prices are USD per million tokens, 0 or more");
+        }
+        s.prices.push((model, price));
+    }
     Ok(())
 }
 
@@ -277,7 +316,12 @@ mod tests {
         let e = env();
         let cfg = e.project.join(PROJECT_FILE);
         fs::create_dir_all(e.home.join(".ssh")).unwrap();
-        for bad in ["[files]\nro = [\"~/.ssh\"]\n", "[files]\nro = [\"../../.ssh\"]\n", "[secrets]\nGITHUB_TOKEN = \"evil.example\"\n"] {
+        for bad in [
+            "[files]\nro = [\"~/.ssh\"]\n",
+            "[files]\nro = [\"../../.ssh\"]\n",
+            "[secrets]\nGITHUB_TOKEN = \"evil.example\"\n",
+            "[prices]\n\"claude-opus-5-5\" = { input = 0, output = 0 }\n",
+        ] {
             fs::write(&cfg, bad).unwrap();
             trust(&e.store, &cfg).unwrap();
             assert!(settings(&e).is_err(), "should refuse: {bad}");
@@ -299,5 +343,27 @@ mod tests {
         assert_eq!(s.allow, vec!["api.github.com"]);
         assert_eq!(s.secrets, vec![("GITHUB_TOKEN".to_string(), "api.github.com".to_string())]);
         assert!(fs::write(&user, "[network]\nallow = [\"not a host\"]\n").is_ok() && settings(&e).is_err());
+    }
+
+    #[test]
+    fn budgets_and_prices() {
+        let e = env();
+        let cfg = e.project.join(PROJECT_FILE);
+        fs::write(&cfg, "[limits]\nbudget = \"2usd\"\nmemory = \"4G\"\n").unwrap();
+        trust(&e.store, &cfg).unwrap();
+        let s = settings(&e).unwrap();
+        assert_eq!((s.budget, s.limits.memory.as_deref()), (Some(Budget::Usd(2.0)), Some("4G")));
+
+        let file: ConfigFile = toml::from_str("[prices]\n\"gpt-5*\" = { input = 1.25, output = 10 }\n").unwrap();
+        let mut s = Settings::default();
+        apply(&mut s, file, Path::new("config.toml"), None, &e.home).unwrap();
+        assert_eq!(s.prices[0].0, "gpt-5*");
+        assert_eq!(crate::gateway::price("gpt-5-mini", &s.prices).map(|p| p.output), Some(10.0));
+
+        for bad in ["[limits]\nbudget = \"lots\"\n", "[limits]\nmemroy = \"4G\"\n", "[prices]\nx = { input = -1, output = 1 }\n"] {
+            let parsed = toml::from_str::<ConfigFile>(bad);
+            let applied = parsed.map_err(anyhow::Error::from).and_then(|f| apply(&mut Settings::default(), f, Path::new("c"), None, &e.home));
+            assert!(applied.is_err(), "should refuse: {bad}");
+        }
     }
 }

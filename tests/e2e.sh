@@ -482,6 +482,65 @@ check "an unknown agent is refused, with what's available" grep -q "unknown agen
 echo 'agent = "echo"' > "$CFG"
 check "the default agent comes from your config" grep -q 'echo-agent got' <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do just do it 2>&1)"
 
+section "budgets (the model gateway)"
+# A stand-in model API: httpbin's /base64/… answers with whatever body the
+# URL carries, so the "provider" reports exactly the usage we choose.
+FAKE_API=""
+for h in httpbin.org httpbingo.org; do
+  if [ "$(curl -sS -m 15 "https://$h/base64/b2s=" 2>/dev/null)" = ok ]; then FAKE_API="$h"; break; fi
+done
+if [ -z "$FAKE_API" ]; then
+  skip "budgets need httpbin.org or httpbingo.org, and neither answered"
+else
+  reset_proj
+  cd "$PROJ"
+  b64url() { base64 | tr -d '\n' | tr '+/' '-_'; }
+  # $0.30 a call on Sonnet 5.5 ($2 in, $10 out per million): 100k in, 10k out.
+  JSON_CALL="https://$FAKE_API/base64/$(printf '%s' '{"type":"message","model":"claude-sonnet-5-5","usage":{"input_tokens":100000,"output_tokens":10000}}' | b64url)"
+  SSE_CALL="https://$FAKE_API/base64/$(printf 'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-5-5","usage":{"input_tokens":100000,"output_tokens":1}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":10000}}\n\n' | b64url)"
+  mkdir -p "$WORK/tools/model-agent"
+  # Two calls, then one too many, then a retry loop that shouldn't get far.
+  cat > "$WORK/tools/model-agent/model-agent" <<SH
+#!/bin/sh
+call() { curl -sS -m 20 "\$1"; echo; }
+call "$JSON_CALL"
+call "$SSE_CALL"
+call "$JSON_CALL"
+for i in 1 2 3 4 5 6 7 8; do call "$JSON_CALL" >/dev/null; sleep 0.2; done
+echo still-running
+SH
+  chmod +x "$WORK/tools/model-agent/model-agent"
+  cat > "$WORK/cfg/agents/metered.toml" <<TOML
+run = ["model-agent"]
+allow = ["$FAKE_API"]
+models = [{ url = "https://$FAKE_API/base64/*", api = "anthropic" }]
+TOML
+  export PATH="$WORK/tools/model-agent:$PATH"
+  : > "$CFG"
+  out="$(AGENTOS_CONFIG="$CFG" "$AGENT" do --agent metered --budget 0.5usd spend it 2>&1)"
+  events="$(latest_task_dir)/events.jsonl"
+  check "the budget is shown when the task starts" grep -q 'budget \$0.50' <<<"$out"
+  check "model calls are metered from the provider's own usage (JSON and streamed)" test "$(grep -c '"kind":"model.call"' "$events")" = 2
+  check "the agent is told, live, when the budget is used up" grep -q 'budget used up (\$0.60 of \$0.50)' <<<"$out"
+  check "the next call is answered with the API's own error, not sent" grep -q '"type":"invalid_request_error"' <<<"$out"
+  check "an agent that keeps calling is stopped" grep -q '"reason":"budget"' "$events"
+  check "...before it gets further" bash -c '! grep -q still-running <<<"$1"' _ "$out"
+  check "the exit summary has the measured spend" grep -q '220k tokens · \$0.60' <<<"$out"
+  check "agent ls shows it over budget, with its cost" grep -Eq 'over budget .*\$0\.60' <<<"$("$AGENT" ls)"
+  check "agent log shows each call" grep -q 'claude-sonnet-5-5 · 100k in · 10k out · \$0.30 · total \$0.60' <<<"$("$AGENT" log)"
+  check "...and its chain, costs included, verifies" grep -q 'chain intact' <<<"$("$AGENT" log)"
+
+  # Within budget: from your config, a warning at 80%, and the task runs to the end.
+  printf '[limits]\nbudget = "4usd"\n' > "$CFG"
+  out="$(AGENTOS_CONFIG="$CFG" "$AGENT" do --agent metered spend less 2>&1)"
+  check "a budget from your config applies" grep -q 'budget \$4.00' <<<"$out"
+  check "80% of it gets a heads-up" grep -q '80% of the budget used' <<<"$out"
+  check "a task within its budget runs to the end" grep -q still-running <<<"$out"
+  check "...and is journaled with its totals" grep -q '"kind":"model.usage"' "$(latest_task_dir)/events.jsonl"
+  check "--budget with --net host is refused" bash -c '"$@" 2>&1 | grep -q "net host bypasses"' _ "$AGENT" run --net host --budget 1usd -- true
+  : > "$CFG"
+fi
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7

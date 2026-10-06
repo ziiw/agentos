@@ -9,7 +9,10 @@
 //! Only that header, only on that host: a placeholder pasted into a request
 //! body, or sent to any other host, stays a placeholder. Otherwise an agent
 //! could get the real key echoed back, or put it in front of the model.
+//!
+//! Model API calls relayed here are also metered (see `gateway`).
 
+use crate::gateway::{Meter, Reader};
 use crate::vault::Vault;
 use anyhow::{Context, Result, bail};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
@@ -20,6 +23,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// A credential the proxy adds on the agent's behalf.
 #[derive(Clone)]
@@ -79,13 +83,17 @@ pub struct Broker {
     secrets: Vec<Secret>,
     /// An agent's sealed login, and the hosts it's used with.
     vault: Option<(Arc<Vault>, Vec<String>)>,
+    /// Meters model calls on the hosts relayed here.
+    meter: Option<Arc<Meter>>,
     servers: HashMap<String, Arc<ServerConfig>>,
     client: Arc<ClientConfig>,
     ca_pem: String,
 }
 
 impl Broker {
-    pub fn new(secrets: Vec<Secret>, vault: Option<(Arc<Vault>, Vec<String>)>) -> Result<Broker> {
+    /// `meter`: the task's model gateway, and the hosts to relay for it even
+    /// without a credential to add (model APIs, when there's a budget).
+    pub fn new(secrets: Vec<Secret>, vault: Option<(Arc<Vault>, Vec<String>)>, meter: Option<(Arc<Meter>, Vec<String>)>) -> Result<Broker> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let ca_key = KeyPair::generate()?;
         let mut ca = CertificateParams::new(Vec::<String>::new())?;
@@ -96,7 +104,8 @@ impl Broker {
 
         let mut servers = HashMap::new();
         let vault_hosts = vault.iter().flat_map(|(_, hosts)| hosts.iter().cloned());
-        for host in secrets.iter().map(|s| s.host.clone()).chain(vault_hosts) {
+        let metered_hosts = meter.iter().flat_map(|(_, hosts)| hosts.iter().cloned());
+        for host in secrets.iter().map(|s| s.host.clone()).chain(vault_hosts).chain(metered_hosts) {
             if servers.contains_key(&host) {
                 continue;
             }
@@ -122,7 +131,8 @@ impl Broker {
             .with_no_client_auth();
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-        Ok(Broker { secrets, vault, servers, client: Arc::new(client), ca_pem: ca_cert.pem() })
+        let meter = meter.map(|(m, _)| m);
+        Ok(Broker { secrets, vault, meter, servers, client: Arc::new(client), ca_pem: ca_cert.pem() })
     }
 
     /// The CA certificate (public) the sandbox must trust.
@@ -143,7 +153,7 @@ impl Broker {
         let remote = StreamOwned::new(ClientConnection::new(self.client.clone(), name)?, upstream);
         let secrets: Vec<&Secret> = self.secrets.iter().filter(|s| s.host == host).collect();
         let vault = self.vault.as_ref().filter(|(_, hosts)| hosts.iter().any(|h| h == host)).map(|(v, _)| v.as_ref());
-        relay_http(agent, remote, &secrets, vault)
+        relay_http(agent, remote, host, &secrets, vault, self.meter.as_deref())
     }
 }
 
@@ -228,8 +238,26 @@ fn copy_exact(r: &mut impl Read, w: &mut impl Write, n: u64) -> io::Result<u64> 
     Ok(copied)
 }
 
-/// Copies a chunked body, flushing per chunk so streamed responses stay live.
-fn copy_chunked(r: &mut impl BufRead, w: &mut impl Write) -> io::Result<u64> {
+/// Writes through to `w`, showing the bytes to `seen` on their way.
+struct Tee<'a, W: Write> {
+    w: &'a mut W,
+    seen: &'a mut dyn FnMut(&[u8]),
+}
+
+impl<W: Write> Write for Tee<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.w.write(buf)?;
+        (self.seen)(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
+/// Copies a chunked body, flushing per chunk so streamed responses stay
+/// live. `seen` gets the payload, without the chunk framing.
+fn copy_chunked(r: &mut impl BufRead, w: &mut impl Write, seen: &mut dyn FnMut(&[u8])) -> io::Result<u64> {
     let mut total = 0;
     loop {
         let mut line = String::new();
@@ -249,17 +277,19 @@ fn copy_chunked(r: &mut impl BufRead, w: &mut impl Write) -> io::Result<u64> {
             w.flush()?;
             return Ok(total);
         }
-        total += copy_exact(r, w, size + 2)?;
+        total += copy_exact(r, &mut Tee { w: &mut *w, seen: &mut *seen }, size)?;
+        total += copy_exact(r, w, 2)?;
         w.flush()?;
     }
 }
 
-fn copy_body(body: Body, r: &mut impl BufRead, w: &mut impl Write) -> io::Result<u64> {
+/// Copies a body; `seen` gets its payload as it passes.
+fn copy_body(body: Body, r: &mut impl BufRead, w: &mut impl Write, seen: &mut dyn FnMut(&[u8])) -> io::Result<u64> {
     let n = match body {
         Body::None => 0,
-        Body::Length(n) => copy_exact(r, w, n)?,
-        Body::Chunked => copy_chunked(r, w)?,
-        Body::UntilClose => io::copy(r, w)?,
+        Body::Length(n) => copy_exact(r, &mut Tee { w: &mut *w, seen }, n)?,
+        Body::Chunked => copy_chunked(r, w, seen)?,
+        Body::UntilClose => io::copy(r, &mut Tee { w: &mut *w, seen })?,
     };
     w.flush()?;
     Ok(n)
@@ -334,9 +364,16 @@ fn response_body(method: &str, status: u16, h: &Head) -> Body {
 }
 
 /// HTTP/1.1, one exchange at a time: parse each request head (to inject
-/// credentials) and frame bodies so the next head can be found; stream the
-/// responses back as they arrive.
-fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[&Secret], vault: Option<&Vault>) -> Result<(u64, u64, u64, u64)> {
+/// credentials and spot model calls) and frame bodies so the next head can
+/// be found; stream the responses back as they arrive.
+fn relay_http<A: Read + Write, B: Read + Write>(
+    agent: A,
+    remote: B,
+    host: &str,
+    secrets: &[&Secret],
+    vault: Option<&Vault>,
+    meter: Option<&Meter>,
+) -> Result<(u64, u64, u64, u64)> {
     let mut agent = BufReader::new(agent);
     let mut remote = BufReader::new(remote);
     let (mut up, mut down, mut requests, mut injected) = (0, 0, 0, 0);
@@ -364,12 +401,31 @@ fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[
                 agent.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                 agent.get_mut().flush()?;
             }
+            let mut close = req.has_token("connection", "close");
+            let model = meter.and_then(|m| m.endpoint(host, &path).map(|api| (m, api)));
+            if let Some((m, api)) = model {
+                if m.exhausted() {
+                    // Over budget: answered here, never sent.
+                    up += raw.len() as u64 + copy_body(request_body(&req), &mut agent, &mut io::sink(), &mut |_| {})?;
+                    let (status, reason, body) = m.refuse(api);
+                    let resp = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    agent.get_mut().write_all(resp.as_bytes())?;
+                    agent.get_mut().flush()?;
+                    (down, requests) = (down + resp.len() as u64, requests + 1);
+                    if close {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                // Plain responses, so the usage in them can be read.
+                req.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("accept-encoding"));
+            }
+            let started = Instant::now();
             let head = req.serialize();
             remote.get_mut().write_all(head.as_bytes())?;
-            up += head.len() as u64 + copy_body(request_body(&req), &mut agent, remote.get_mut())?;
+            up += head.len() as u64 + copy_body(request_body(&req), &mut agent, remote.get_mut(), &mut |_| {})?;
             requests += 1;
 
-            let mut close = req.has_token("connection", "close");
             loop {
                 let Some(raw) = read_head(&mut remote)? else { return Ok(()) };
                 let resp = Head::parse(&raw);
@@ -377,8 +433,18 @@ fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[
                 agent.get_mut().write_all(raw.as_bytes())?;
                 let body = response_body(&method, status, &resp);
                 close |= matches!(body, Body::UntilClose) || resp.has_token("connection", "close") || status == 101;
-                down += raw.len() as u64 + copy_body(body, &mut remote, agent.get_mut())?;
-                if !(100..200).contains(&status) || status == 101 {
+                let interim = (100..200).contains(&status) && status != 101;
+                let copied = match model {
+                    Some((m, api)) if !interim => {
+                        let mut reader = Reader::new(api, resp.get("content-type"), resp.get("content-encoding"));
+                        let copied = copy_body(body, &mut remote, agent.get_mut(), &mut |b| reader.feed(b));
+                        m.record(host, &path, status, reader, started.elapsed(), copied.is_err());
+                        copied?
+                    }
+                    _ => copy_body(body, &mut remote, agent.get_mut(), &mut |_| {})?,
+                };
+                down += raw.len() as u64 + copied;
+                if !interim {
                     break;
                 }
             }
@@ -486,7 +552,7 @@ mod tests {
         let s = secret();
         let mut agent = pipe(requests);
         let mut remote = pipe(responses);
-        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s], None).unwrap();
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, "api.example.com", &[&s], None, None).unwrap();
         (String::from_utf8(remote.output).unwrap(), String::from_utf8(agent.output).unwrap(), n, injected)
     }
 
@@ -518,7 +584,7 @@ mod tests {
         let resps = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye";
         let mut agent = pipe(reqs);
         let mut remote = pipe(resps);
-        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s], None).unwrap();
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, "api.example.com", &[&s], None, None).unwrap();
         let sent = String::from_utf8(remote.output).unwrap();
         assert_eq!(sent.matches("Authorization: Bearer real-key\r\n").count(), 2);
         assert_eq!((n, injected), (2, 2));
@@ -545,7 +611,7 @@ mod tests {
         let resps = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{token}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", token.len());
         let mut agent = pipe(&reqs);
         let mut remote = pipe(&resps);
-        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[], Some(&vault)).unwrap();
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, "api.example.com", &[], Some(&vault), None).unwrap();
         assert_eq!((n, injected), (2, 2));
 
         let sent = String::from_utf8(remote.output).unwrap();
@@ -556,6 +622,34 @@ mod tests {
         let got = String::from_utf8(agent.output).unwrap();
         assert!(!got.contains("NEWACCESS") && !got.contains("NEWREFRESH"), "new tokens reach the agent sealed: {got}");
         assert!(got.contains("sk-ant-oat01-agentosplaceholder-") && got.ends_with("ok"));
+    }
+
+    #[test]
+    fn model_calls_are_metered_and_refused_over_budget() {
+        use crate::gateway::{Api, Budget, Endpoint};
+        let endpoint = Endpoint { host: "api.example.com".into(), path: "/v1/messages".into(), api: Api::Anthropic };
+        let meter = Meter::new(vec![endpoint], Vec::new(), Some(Budget::Tokens(100)), Arc::new(|_| {}));
+        let body = r#"{"model":"claude-haiku-4-5","messages":[]}"#;
+        let call = format!("POST /v1/messages?beta=true HTTP/1.1\r\nAccept-Encoding: gzip, br\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let reqs = format!("{call}GET /v1/models HTTP/1.1\r\n\r\n{call}");
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku-4-5\",\"usage\":{\"input_tokens\":120,\"output_tokens\":1}}}\n\n";
+        let delta = "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":30}}\n\n";
+        let stream = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{start}\r\n{:x}\r\n{delta}\r\n0\r\n\r\n", start.len(), delta.len());
+        let resps = format!("{stream}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{{}}");
+        let mut agent = pipe(&reqs);
+        let mut remote = pipe(&resps);
+        let (_, _, n, _) = relay_http(&mut agent, &mut remote, "api.example.com", &[], None, Some(&meter)).unwrap();
+        assert_eq!(n, 3);
+
+        let sent = String::from_utf8(remote.output).unwrap();
+        assert_eq!(sent.matches("POST /v1/messages").count(), 1, "the call over budget never goes out: {sent}");
+        assert!(!sent.to_ascii_lowercase().contains("accept-encoding"));
+        assert!(sent.contains("GET /v1/models"), "other requests pass");
+        let got = String::from_utf8(agent.output).unwrap();
+        assert!(got.contains("message_delta") && got.contains("HTTP/1.1 400 Bad Request"), "{got}");
+        assert!(got.contains("budget is used up (150 of 100 tokens)"), "{got}");
+        let t = meter.totals();
+        assert_eq!((t.calls, t.usage.input, t.usage.output, t.refused), (1, 120, 30, 1));
     }
 
     #[test]
