@@ -128,10 +128,10 @@ It's verified at three levels:
 | M8: git push outbox: pushes held per remote, replayed from your own git on commit | ✅ CI green |
 | M9: login brokering: OAuth tokens sealed in a vault; placeholders in the sandbox; token endpoint rewritten both ways | ✅ CI green; real Claude verified with fake tokens (API + refresh paths) |
 | M10: agentd console: tasks, diffs, commit/push/rollback and approvals in a browser; first answer wins; push notifications | ✅ CI green + checked in a browser |
-| M12: background tasks: --bg, logs/wait/stop, --timeout; agentd shows live progress and notifies on completion | ✅ automated |
-| M13: resource limits: --memory/--cpus/--pids via transient systemd scopes (cgroup v2); OOM kills journaled | ✅ automated; enforcement in the booted VM |
-| M14: agents as config files: any agent CLI via `agents/NAME.toml` (commands, allowlist, brokered secrets, output); `agent agents`; default agent | ✅ automated (stand-in agents); Codex/Gemini/Aider examples untested |
-| M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and runs doctor + run/diff/commit |
+| M12: background tasks: --bg, logs/wait/stop, --timeout; agentd shows live progress and notifies on completion | ✅ CI green |
+| M13: resource limits: --memory/--cpus/--pids via transient systemd scopes (cgroup v2); OOM kills journaled | ✅ enforced and tested on Ubuntu CI (x86_64, arm64) and in the booted distro |
+| M14: agents as config files: any agent CLI via `agents/NAME.toml` (commands, allowlist, brokered secrets, output); `agent agents`; default agent | ✅ CI green (stand-in agents); Codex/Gemini/Aider examples untested |
+| M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and passes the whole e2e suite (179/179, Landlock and limits enforced) |
 
 ### Phase 1 backlog, in order
 
