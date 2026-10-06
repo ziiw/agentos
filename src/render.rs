@@ -427,14 +427,15 @@ pub fn committed(p: Paint, task: &Task, applied: &[Change], remaining: usize) ->
     if git > 0 {
         let _ = writeln!(out, "  {}  .git  {}", p.cyan("G"), p.dim(format!("({git} files: the agent's git work)")));
     }
-    let n = applied.len();
-    let _ = write!(
-        out,
-        "{} committed {} from task {}",
-        p.green("✓"),
-        if n == 1 { "1 change".to_string() } else { format!("{n} changes") },
-        task.id()
-    );
+    let n = applied.len() - git;
+    let what = match (n, git) {
+        (0, _) => "the agent's git work".to_string(),
+        (1, 0) => "1 change".to_string(),
+        (n, 0) => format!("{n} changes"),
+        (1, _) => "1 change and the agent's git work".to_string(),
+        (n, _) => format!("{n} changes and the agent's git work"),
+    };
+    let _ = write!(out, "{} committed {what} from task {}", p.green("✓"), task.id());
     if remaining > 0 {
         let _ = write!(out, "; {remaining} still pending");
     }
@@ -514,6 +515,10 @@ fn describe(p: Paint, e: &Event) -> String {
         "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
         "login.sealed" => format!("{} tokens moved to the vault", d["tokens"]),
+        "task.stopped" => match d["reason"].as_str() {
+            Some("timeout") => p.yellow("timed out (--timeout)"),
+            _ => p.yellow("stopped"),
+        },
         "outbox.ready" => {
             let remotes: Vec<String> = d["remotes"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
             format!("git pushes to {} are held", remotes.join(", "))
@@ -567,9 +572,15 @@ fn describe(p: Paint, e: &Event) -> String {
             d["changes"]["deleted"]
         ),
         "commit" => {
-            let changes = d["changes"].as_array().cloned().unwrap_or_default();
+            let all = d["changes"].as_array().cloned().unwrap_or_default();
+            let in_git = |c: &Value| s(&c["path"]).contains("/.git/");
+            let git = all.iter().filter(|c| in_git(c)).count();
+            let changes: Vec<Value> = all.into_iter().filter(|c| !in_git(c)).collect();
             let first: Vec<String> = changes.iter().take(3).map(|c| display_path(Path::new(&s(&c["path"])))).collect();
-            let more = if changes.len() > 3 { format!(" +{} more", changes.len() - 3) } else { String::new() };
+            let mut more = if changes.len() > 3 { format!(" +{} more", changes.len() - 3) } else { String::new() };
+            if git > 0 {
+                more.push_str(&format!(" + .git ({git} files)"));
+            }
             let forced = if d["forced"].as_bool() == Some(true) { " (forced)" } else { "" };
             let n = if changes.len() == 1 { "1 change".to_string() } else { format!("{} changes", changes.len()) };
             format!("{n}: {}{more}{forced}", first.join(", "))

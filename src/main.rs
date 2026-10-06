@@ -18,7 +18,8 @@ use render::Paint;
 use serde_json::json;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::thread;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::collections::HashSet;
@@ -104,6 +105,24 @@ enum Command {
         task: Option<String>,
         paths: Vec<PathBuf>,
     },
+    /// Show what a task printed (background tasks)
+    Logs {
+        /// Task id or prefix (default: the latest task)
+        task: Option<String>,
+        /// Keep printing until the task ends
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Wait for a task to end; exits with its exit code
+    Wait {
+        /// Task id or prefix (default: the latest task)
+        task: Option<String>,
+    },
+    /// Stop a running task (its changes stay held for review)
+    Stop {
+        /// Task id or prefix (default: the latest task)
+        task: Option<String>,
+    },
     /// Show a task's audit journal and verify its hash chain
     Log {
         /// Task id or prefix (default: the latest task)
@@ -184,9 +203,22 @@ struct GrantArgs {
 }
 
 #[derive(Args)]
+struct Mode {
+    /// Run in the background and give the terminal back; follow with
+    /// `agent logs -f`, answer questions in agentd (`agent serve`)
+    #[arg(long)]
+    bg: bool,
+    /// Stop the task after this long (e.g. 90s, 30m, 2h)
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    timeout: Option<Duration>,
+}
+
+#[derive(Args)]
 struct RunArgs {
     #[command(flatten)]
     grants: GrantArgs,
+    #[command(flatten)]
+    mode: Mode,
     /// Network: none (loopback only, the default) or host. --allow, or an allow
     /// list in your config, gives an allowlist instead.
     #[arg(long)]
@@ -200,6 +232,8 @@ struct RunArgs {
 struct DoArgs {
     #[command(flatten)]
     grants: GrantArgs,
+    #[command(flatten)]
+    mode: Mode,
     /// Which agent
     #[arg(long, default_value = "claude")]
     agent: String,
@@ -259,6 +293,7 @@ struct Plan {
     ask: Ask,
     /// Fail rather than run without the current directory.
     needs_cwd: bool,
+    timeout: Option<Duration>,
 }
 
 fn main() -> ExitCode {
@@ -283,6 +318,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Push { task, force } => cmd_push(&store, task.as_deref(), force),
         Command::Rollback { task, paths } => cmd_rollback(&store, task.as_deref(), &paths),
         Command::Log { task, json } => cmd_log(&store, task.as_deref(), json),
+        Command::Logs { task, follow } => cmd_logs(&store, task.as_deref(), follow),
+        Command::Wait { task } => cmd_wait(&store, task.as_deref()),
+        Command::Stop { task } => cmd_stop(&store, task.as_deref()),
         Command::Doctor => cmd_doctor(&store),
         Command::Trust { path } => cmd_trust(&store, path),
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
@@ -407,6 +445,12 @@ fn parse_secrets(specs: &[String]) -> Result<Vec<Secret>> {
 
 fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     let task = (!args.task.is_empty()).then(|| args.task.join(" "));
+    if args.mode.bg {
+        if task.is_none() || args.interactive {
+            bail!("--bg runs a task headless: give it one, e.g. agent do --bg \"add a test for greet\"");
+        }
+        return launch_background(store);
+    }
     if task.is_none() && !std::io::stdin().is_terminal() {
         bail!("give the agent a task: agent do \"…\"");
     }
@@ -466,11 +510,15 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             output: profile.output,
             expected_denials: profile.expected_denials,
             needs_cwd: true,
+            timeout: args.mode.timeout,
         },
     )
 }
 
 fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
+    if args.mode.bg {
+        return launch_background(store);
+    }
     let argv = args.command;
     let (config_allow, config_secrets) = apply_config(store, &mut args.grants)?;
     let mut secrets = parse_secrets(&args.grants.secret)?;
@@ -510,6 +558,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             expected_denials: Vec::new(),
             ask: if ask { Ask::TerminalAndConsole } else { Ask::Never },
             needs_cwd: false,
+            timeout: args.mode.timeout,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {
@@ -634,6 +683,14 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         env: env_names,
     })?;
     env.push(("AGENTOS_TASK".into(), task.id().to_string()));
+    // A background task (agent … --bg) keeps what it prints with the task.
+    if std::env::var_os("AGENTOS_BACKGROUND").is_some() {
+        let log = fs::File::create(task.dir.join("output.log"))?;
+        unsafe {
+            libc::dup2(log.as_raw_fd(), 1);
+            libc::dup2(log.as_raw_fd(), 2);
+        }
+    }
     let journal = task.journal();
     journal.append(
         "task.created",
@@ -750,6 +807,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
             proxy_handle = Some(proxy::serve(listener, allowlist, broker, approver, sink));
         }
+        if let Some(limit) = plan.timeout {
+            thread::spawn(move || {
+                thread::sleep(limit);
+                sandbox::stop(sandbox::Stop::Timeout);
+            });
+        }
         if let Some(rx) = stdout_rx {
             outcome = follow_agent(rx, &journal, &cwd);
         }
@@ -787,6 +850,15 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     }
     let summary = Summary::of(&changes::scan(&task.layers())?);
     let ended = util::now_ms();
+    if let Some(why) = sandbox::stopped() {
+        let (reason, text) = match why {
+            sandbox::Stop::Timeout => ("timeout", format!("stopped after {} (--timeout)", util::duration(ended - task.meta.started_at_ms))),
+            sandbox::Stop::Stopped => ("stopped", "stopped".to_string()),
+        };
+        journal.append("task.stopped", json!({ "reason": reason }))?;
+        task.meta.stop = Some(reason.to_string());
+        eprintln!("{} task {} {text}; what it did so far is held for review", err.yellow("agent ▸"), task.id());
+    }
     task.meta.status = if setup_error.is_some() { Status::Failed } else { Status::Exited };
     task.meta.exit_code = Some(exit_code);
     task.meta.ended_at_ms = Some(ended);
@@ -999,6 +1071,113 @@ fn build_env(extra: &[String], home: &Path) -> Result<Vec<(String, String)>> {
         env.push((k, v));
     }
     Ok(env)
+}
+
+/// Re-runs this very command line detached (minus --bg), in a new session
+/// with no terminal: its output goes to the task, its questions to agentd.
+fn launch_background(store: &Store) -> Result<i32> {
+    use std::os::unix::process::CommandExt;
+    let id = store.new_id()?;
+    let mut args = Vec::new();
+    let mut in_command = false;
+    for arg in std::env::args_os().skip(1) {
+        if arg == "--" {
+            in_command = true;
+        }
+        if in_command || arg != "--bg" {
+            args.push(arg);
+        }
+    }
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(args)
+        .env("AGENTOS_NEW_TASK_ID", &id)
+        .env("AGENTOS_BACKGROUND", "1")
+        .env("AGENTOS_HOME", store.root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().context("start the background task")?;
+    for _ in 0..200 {
+        if store.load(&id).is_ok() {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!("the task didn't start ({status}); run it without --bg to see why");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let p = Paint::stderr();
+    eprintln!("{} task {} is running in the background", p.cyan("agent ▸"), p.bold(&id));
+    for (cmd, what) in [("logs", "follow it (-f)"), ("wait", "wait for it"), ("stop", "stop it")] {
+        eprintln!("        {}  {what}", p.bold(format!("agent {cmd:<4} {id}")));
+    }
+    if approvals::agentd(store.root()).is_none() {
+        eprintln!(
+            "  {}",
+            p.dim("nobody to ask about hosts outside the allowlist: they're refused (run `agent serve` to answer them)")
+        );
+    }
+    println!("{id}");
+    Ok(0)
+}
+
+fn cmd_logs(store: &Store, selector: Option<&str>, follow: bool) -> Result<i32> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let task = store.resolve(selector)?;
+    let path = task.dir.join("output.log");
+    let mut file = fs::File::open(&path).with_context(|| format!("task {} kept no output (only background tasks do)", task.id()))?;
+    let mut out = std::io::stdout();
+    let mut pos = 0u64;
+    loop {
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk = Vec::new();
+        file.read_to_end(&mut chunk)?;
+        pos += chunk.len() as u64;
+        out.write_all(&chunk)?;
+        out.flush()?;
+        if !follow {
+            return Ok(0);
+        }
+        let live = store.load(task.id()).map(|t| t.is_live()).unwrap_or(false);
+        if !live && chunk.is_empty() {
+            return Ok(0);
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+}
+
+fn cmd_wait(store: &Store, selector: Option<&str>) -> Result<i32> {
+    let id = store.resolve(selector)?.id().to_string();
+    loop {
+        let task = store.load(&id)?;
+        if !task.is_live() {
+            println!("task {id} {}", task.status_label());
+            return Ok(task.meta.exit_code.unwrap_or(0));
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+}
+
+fn cmd_stop(store: &Store, selector: Option<&str>) -> Result<i32> {
+    let task = store.resolve(selector)?;
+    let (true, Some(pid)) = (task.is_live(), task.meta.supervisor_pid) else {
+        bail!("task {} isn't running ({})", task.id(), task.status_label());
+    };
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM)?;
+    for _ in 0..100 {
+        if !store.load(task.id())?.is_live() {
+            println!("stopped task {}; its changes are held: agent diff {}", task.id(), task.id());
+            return Ok(0);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("task {} didn't stop within 10s", task.id())
 }
 
 fn cmd_ls(store: &Store) -> Result<i32> {

@@ -273,6 +273,30 @@ check "...applies the change" grep -qx from-agent console.txt
 kill $SERVE_PID 2>/dev/null
 wait $SERVE_PID 2>/dev/null
 
+section "background tasks"
+reset_proj
+cd "$PROJ"
+started=$(date +%s)
+id="$("$AGENT" run --bg -- sh -c 'echo started; sleep 2; echo bg > bg.txt; echo done' 2>/dev/null)"
+check "--bg gives the terminal back right away, with the task id" test -n "$id" -a "$(( $(date +%s) - started ))" -le 2
+check "the task shows as running" grep -Eq "^$id +running" <<<"$("$AGENT" ls)"
+check "agent wait waits for it (and returns its exit code)" "$AGENT" wait "$id"
+check "what it printed is kept" grep -q started <<<"$("$AGENT" logs "$id")"
+check "its change is held" grep -Eq '^  A  .*bg.txt' <<<"$("$AGENT" diff "$id" --stat)"
+check "...and your files are untouched" test ! -e bg.txt
+"$AGENT" rollback "$id" >/dev/null
+id="$("$AGENT" run --bg -- sh -c 'echo x > partial.txt; sleep 60' 2>/dev/null)"
+sleep 1
+check "agent stop stops it" "$AGENT" stop "$id"
+check "...it shows as stopped" grep -Eq "^$id +stopped" <<<"$("$AGENT" ls)"
+check "...what it did so far is held" grep -q partial.txt <<<"$("$AGENT" diff "$id" --stat)"
+check "...and the journal says why" grep -q '"kind":"task.stopped".*"reason":"stopped"' "$AGENTOS_HOME/tasks/$id/events.jsonl"
+"$AGENT" rollback "$id" >/dev/null
+started=$(date +%s)
+"$AGENT" run --timeout 2s -- sleep 30 >/dev/null 2>&1
+check "--timeout stops a task that runs too long" test "$(( $(date +%s) - started ))" -lt 10
+check "...and it shows as timed out" grep -q 'timed out' <<<"$("$AGENT" ls | sed -n 2p)"
+
 section "git push outbox"
 if command -v git >/dev/null; then
   # The remote is a bare repo outside the sandbox: the agent can't reach it,
@@ -401,6 +425,10 @@ check "agent vault unseal puts it back" grep -q e2e-real-access "$CREDS"
 check "...and stops sealing" grep -qx 'login: real' "$AGENT_STATE/observations"
 "$AGENT" vault seal >/dev/null
 check "agent vault seal resumes" lacks e2e-real-access "$(cat "$CREDS")"
+id="$("$AGENT" do --bg add a test in the background 2>/dev/null)"
+"$AGENT" wait "$id" >/dev/null
+check "agent do --bg runs the agent headless, output kept" grep -q 'Added test_greet.py' <<<"$("$AGENT" logs "$id")"
+check "agent logs -f returns once the task is over" "$AGENT" logs -f "$id"
 rm -rf "$HOME/.claude"
 
 section "exit codes and the audit journal"

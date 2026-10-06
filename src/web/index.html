@@ -41,7 +41,7 @@
   .badge.running { color: var(--accent); border-color: var(--accent); }
   .badge.committed { color: var(--ok); border-color: var(--ok); }
   .badge.crashed, .badge.failed { color: var(--bad); border-color: var(--bad); }
-  .badge.exited { color: var(--warn); border-color: var(--warn); }
+  .badge.exited, .badge.stopped, .badge.timed { color: var(--warn); border-color: var(--warn); }
   .counts { font-family: var(--mono); font-size: 12px; }
   .a { color: var(--ok); } .m { color: var(--warn); } .d { color: var(--bad); } .p { color: var(--accent); }
   pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
@@ -49,6 +49,7 @@
   pre .add { background: var(--add); display: block; } pre .del { background: var(--del); display: block; }
   pre .hunk { color: var(--accent); display: block; }
   .empty { color: var(--muted); font-size: 14px; }
+  .doing { font-family: var(--mono); font-size: 12px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
   .notice { background: var(--card); border: 1px solid var(--bad); border-radius: 12px; padding: 14px 16px; }
   .output { white-space: pre-wrap; }
 </style>
@@ -132,6 +133,7 @@
       return `<div class="card task" data-id="${t.id}">
         <div class="title">${esc(t.title)}</div>
         <div class="meta"><span class="badge ${esc(status)}">${esc(t.status)}</span><span>${t.id}</span><span>${ago(t.started_ms)}</span>${counts(t)}</div>
+        ${t.doing ? `<div class="meta doing">⏺ ${esc(t.doing)}</div>` : ""}
         ${openTask === t.id ? `<div id="detail"><p class="empty">Loading…</p></div>` : ""}
       </div>`;
     }).join("");

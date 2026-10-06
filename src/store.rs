@@ -115,6 +115,9 @@ pub struct TaskMeta {
     pub ended_at_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub supervisor_pid: Option<u32>,
+    /// Cut short: "stopped" (agent stop, a signal) or "timeout".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<String>,
 }
 
 pub struct NewTask {
@@ -182,6 +185,8 @@ impl Task {
     pub fn status_label(&self) -> String {
         match self.meta.status {
             Status::Running if !self.is_live() => "crashed".into(),
+            Status::Exited if self.meta.stop.as_deref() == Some("timeout") => "timed out".into(),
+            Status::Exited if self.meta.stop.is_some() => "stopped".into(),
             Status::Exited => format!("exited {}", self.meta.exit_code.unwrap_or(-1)),
             s => format!("{s:?}").to_lowercase(),
         }
@@ -264,12 +269,17 @@ impl Store {
     }
 
     pub fn create(&self, new: NewTask) -> Result<Task> {
+        // A background launch picks the id up front, to tell you right away.
+        let preset = std::env::var("AGENTOS_NEW_TASK_ID").ok().filter(|i| i.len() == 8 && i.chars().all(|c| c.is_ascii_hexdigit()));
         let (id, dir) = loop {
-            let id = util::random_hex(4)?;
+            let id = match &preset {
+                Some(id) => id.clone(),
+                None => util::random_hex(4)?,
+            };
             let dir = self.tasks_dir().join(&id);
             match fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => break (id, dir),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && preset.is_none() => continue,
                 Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
             }
         };
@@ -298,6 +308,7 @@ impl Store {
                 ended_at_ms: None,
                 exit_code: None,
                 supervisor_pid: Some(std::process::id()),
+                stop: None,
             },
             dir,
         };
@@ -308,6 +319,16 @@ impl Store {
         fs::create_dir_all(task.rootfs_dir())?;
         task.save()?;
         Ok(task)
+    }
+
+    /// A fresh task id nobody uses yet.
+    pub fn new_id(&self) -> Result<String> {
+        loop {
+            let id = util::random_hex(4)?;
+            if !self.tasks_dir().join(&id).exists() {
+                return Ok(id);
+            }
+        }
     }
 
     pub fn load(&self, id: &str) -> Result<Task> {

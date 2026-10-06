@@ -127,11 +127,20 @@ fn task_json(t: &Task) -> Value {
     let open = t.is_open();
     let summary = if open { changes::scan(&t.layers()).ok().map(|c| Summary::of(&c)) } else { None };
     let pushes = if open { outbox::pending(&t.dir).map(|p| p.len()).unwrap_or(0) } else { 0 };
+    // What a running task is up to: its latest tool call or connection.
+    let doing = t.is_live().then(|| {
+        t.journal().read().ok()?.iter().rev().find_map(|e| match e.kind.as_str() {
+            "agent.tool" => Some(format!("{} {}", e.data["name"].as_str()?, e.data["target"].as_str().unwrap_or(""))),
+            "net.connect" => Some(format!("connected to {}", e.data["host"].as_str()?)),
+            _ => None,
+        })
+    });
     json!({
         "id": t.id(),
         "title": render::title(t),
         "status": t.status_label(),
         "live": t.is_live(),
+        "doing": doing.flatten(),
         "open": open,
         "started_ms": t.meta.started_at_ms,
         "changes": summary,
@@ -179,18 +188,36 @@ fn decide(store: &Store, id: &str, body: &str) -> Result<Value> {
     Ok(json!({ "ok": true }))
 }
 
-/// Pings `url` (e.g. an ntfy.sh topic) once per new question, with curl.
+/// Pings `url` (e.g. an ntfy.sh topic) with curl: once per new question, and
+/// when a task you started finishes.
 fn notifier(root: PathBuf, url: String) {
-    let mut seen = HashSet::new();
+    let send = |title: &str, message: &str| {
+        let sent = Command::new("curl").args(["-fsS", "-m", "10", "-H", &format!("Title: {title}"), "-d", message, &url]).output();
+        if !sent.is_ok_and(|o| o.status.success()) {
+            eprintln!("agentd: couldn't notify {url}");
+        }
+    };
+    let mut asked = HashSet::new();
+    let mut running: HashSet<String> = HashSet::new();
     loop {
         for q in approvals::questions(&root) {
-            if seen.insert(q.id.clone()) {
-                let message = format!("{} wants to reach {}", q.title, q.target);
-                let sent = Command::new("curl")
-                    .args(["-fsS", "-m", "10", "-H", "Title: agentos: an agent is asking", "-d", &message, &url])
-                    .output();
-                if !sent.is_ok_and(|o| o.status.success()) {
-                    eprintln!("agentd: couldn't notify {url}");
+            if asked.insert(q.id.clone()) {
+                send("agentos: an agent is asking", &format!("{} wants to reach {}", q.title, q.target));
+            }
+        }
+        if let Ok(store) = Store::open_at(&root) {
+            for t in store.list().unwrap_or_default() {
+                let id = t.id().to_string();
+                if t.is_live() {
+                    running.insert(id);
+                } else if running.remove(&id) {
+                    let held = changes::scan(&t.layers()).map(|c| Summary::of(&c).total()).unwrap_or(0);
+                    let pushes = outbox::pending(&t.dir).map(|p| p.len()).unwrap_or(0);
+                    let mut what = format!("{}: {}", render::title(&t), t.status_label());
+                    if held + pushes > 0 {
+                        what.push_str(&format!(" · {held} changes and {pushes} pushes held for review"));
+                    }
+                    send("agentos: a task finished", &what);
                 }
             }
         }

@@ -20,7 +20,7 @@ use nix::fcntl::OFlag;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::prctl;
-use nix::sys::signal::{SigHandler, Signal, signal};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction, signal};
 use nix::sys::statvfs::{FsFlags, statvfs};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, execve, fork, pipe2, pivot_root, sethostname};
@@ -32,6 +32,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::thread;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -104,6 +105,42 @@ pub struct Report {
     pub error: Option<String>,
 }
 
+/// The sandbox's namespace parent (process A), while it runs: killing it
+/// takes down everything inside, since pid 1 dies with it.
+static SANDBOX_PID: AtomicI32 = AtomicI32::new(0);
+/// Why the sandbox was cut short: 0 not, 1 stopped (signal), 2 timed out.
+static STOPPED: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// `agent stop`, SIGTERM or a closed terminal.
+    Stopped,
+    Timeout,
+}
+
+/// Ends the running sandbox, if any. Safe from a signal handler.
+pub fn stop(why: Stop) {
+    let pid = SANDBOX_PID.load(Ordering::SeqCst);
+    if pid <= 0 {
+        return;
+    }
+    let _ = STOPPED.compare_exchange(0, if why == Stop::Timeout { 2 } else { 1 }, Ordering::SeqCst, Ordering::SeqCst);
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+/// Why the last sandbox was cut short, if it was.
+pub fn stopped() -> Option<Stop> {
+    match STOPPED.load(Ordering::SeqCst) {
+        1 => Some(Stop::Stopped),
+        2 => Some(Stop::Timeout),
+        _ => None,
+    }
+}
+
+extern "C" fn on_terminate(_: libc::c_int) {
+    stop(Stop::Stopped);
+}
+
 /// Whether `path` is under a system dir every sandbox already sees read-only.
 pub fn is_system_path(path: &Path) -> bool {
     SYSTEM_DIRS.iter().any(|d| path.starts_with(d))
@@ -125,6 +162,11 @@ pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report))
     // Ctrl-C belongs to the agent; the supervisor must survive it to record the outcome.
     let prev_int = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn)? };
     let prev_quit = unsafe { signal(Signal::SIGQUIT, SigHandler::SigIgn)? };
+    // SIGTERM (agent stop) and SIGHUP (terminal gone) end the sandbox, and
+    // the supervisor lives on to record it.
+    let terminate = SigAction::new(SigHandler::Handler(on_terminate), SaFlags::SA_RESTART, SigSet::empty());
+    let prev_term = unsafe { sigaction(Signal::SIGTERM, &terminate)? };
+    let prev_hup = unsafe { sigaction(Signal::SIGHUP, &terminate)? };
 
     let result = match unsafe { fork() }? {
         ForkResult::Child => {
@@ -133,6 +175,7 @@ pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report))
             unsafe { libc::_exit(code) }
         }
         ForkResult::Parent { child } => {
+            SANDBOX_PID.store(child.as_raw(), Ordering::SeqCst);
             drop(report_tx);
             drop(stdout);
             let mut raw = String::new();
@@ -142,13 +185,17 @@ pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report))
                 ..Default::default()
             });
             on_ready(&report);
-            wait_for(child)
+            let code = wait_for(child);
+            SANDBOX_PID.store(0, Ordering::SeqCst);
+            code
         }
     };
 
     unsafe {
         signal(Signal::SIGINT, prev_int)?;
         signal(Signal::SIGQUIT, prev_quit)?;
+        sigaction(Signal::SIGTERM, &prev_term)?;
+        sigaction(Signal::SIGHUP, &prev_hup)?;
     }
     result
 }

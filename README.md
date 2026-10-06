@@ -79,6 +79,7 @@ scripts/dev.sh shell
 | `agent do` | Open an interactive agent session (also how you log it in) |
 | `agent run [GRANTS] [--net none\|host] -- CMD…` | Run any command as a sandboxed task |
 | `agent ls` | List tasks and their pending changes |
+| `agent logs [TASK] [-f]` / `wait` / `stop` | Follow, wait for, or stop a (background) task |
 | `agent diff [TASK] [PATH…] [--stat]` | Show what a task changed |
 | `agent commit [TASK] [PATH…] [--force] [--no-push]` | Apply changes to your files (all, or under PATHs) and send held git pushes |
 | `agent push [TASK] [--force]` | Send only the held git pushes |
@@ -157,16 +158,25 @@ $ agent diff
 
 `agent commit` applies the files, then sends the pushes from **your** git, outside the sandbox, with your usual SSH keys or credential helper. The agent never needs push rights. `agent push` sends only the pushes, `agent commit --no-push` only the files, and `agent rollback` drops both. If the remote moved in the meantime, git rejects the push as usual, and it stays held until you sort it out (`agent push --force` overwrites).
 
+## Background tasks
+
+```bash
+agent do --bg "upgrade the dependencies and fix what breaks"
+agent do --bg --timeout 30m "find and fix the flaky test"
+```
+
+`--bg` gives you the terminal back and prints the task id. The task keeps what it prints (`agent logs -f`). Its questions go to agentd's console, since there's no terminal to ask at; without agentd running, hosts outside the allowlist are refused. `agent wait` blocks until a task ends and exits with its code. `agent stop` ends it early. `--timeout` stops a task that runs too long. Either way, what it did up to that point is held for review like any other task. A task whose terminal closes is stopped the same way.
+
 ## agentd: the console
 
 ```bash
 agent serve
 ```
 
-This starts agentd and prints a link like `http://127.0.0.1:7777/#token=…`. The page lists your tasks, shows each one's diff, held pushes and journal, and has **Commit / Push / Roll back** buttons that run the same commands as the terminal. Questions from agents appear at the top with **Allow for this task / Always / Deny**, alongside the terminal prompt; the first answer wins. Tasks with no terminal to ask at, like Claude's full-screen interface or background runs, ask there too.
+This starts agentd and prints a link like `http://127.0.0.1:7777/#token=…`. The page lists your tasks, shows each one's diff, held pushes and journal, and has **Commit / Push / Roll back** buttons that run the same commands as the terminal. Running tasks show what they're doing right now. Questions from agents appear at the top with **Allow for this task / Always / Deny**, alongside the terminal prompt; the first answer wins. Tasks with no terminal to ask at, like Claude's full-screen interface or background runs, ask there too.
 
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
-- `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only).
+- `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only), and when a task finishes, with what it left for review.
 
 ## Configuration
 
