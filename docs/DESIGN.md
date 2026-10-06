@@ -130,11 +130,12 @@ It's verified at three levels:
 | M10: agentd console: tasks, diffs, commit/push/rollback and approvals in a browser; first answer wins; push notifications | ✅ CI green + checked in a browser |
 | M12: background tasks: --bg, logs/wait/stop, --timeout; agentd shows live progress and notifies on completion | ✅ automated |
 | M13: resource limits: --memory/--cpus/--pids via transient systemd scopes (cgroup v2); OOM kills journaled | ✅ automated; enforcement in the booted VM |
+| M14: agents as config files: any agent CLI via `agents/NAME.toml` (commands, allowlist, brokered secrets, output); `agent agents`; default agent | ✅ automated (stand-in agents); Codex/Gemini/Aider examples untested |
 | M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and runs doctor + run/diff/commit |
 
 ### Phase 1 backlog, in order
 
-1. **Profiles and configuration.** Claude Code is built in (`src/profiles.rs`). ✅ Config files: `~/.config/agentos/config.toml` and trust-on-review `.agentos.toml` (M6). Next: agent profiles as files, verified recipes for Codex and Aider, budgets.
+1. **Profiles and configuration.** Claude Code is built in (`src/profiles.rs`). ✅ Config files: `~/.config/agentos/config.toml` and trust-on-review `.agentos.toml` (M6). ✅ Agents as files (M14). Next: verified recipes for Codex, Gemini CLI and Aider, token budgets.
 2. **Egress proxy.** ✅ Done without veth or root: the sandbox has only loopback, and a forwarder inside relays to the proxy through a unix socket. Next: presets (`--allow @pypi`), upstream corporate proxies.
 3. **Credential broker.** ✅ Per-task CA, TLS termination for brokered hosts only, placeholder → real value in one header. ✅ OAuth logins (M9): tokens sealed in a vault, the token endpoint rewritten both ways so even `/login` in the sandbox yields placeholders. Next: keys from the OS keychain instead of the environment.
 4. **Effects outbox.** ✅ `git push` (M8): each remote gets a bare outbox repo in the task, git in the sandbox pushes there (`GIT_CONFIG_*`), `agent commit` replays from your own git. Next: HTTP writes to APIs, policy auto-release.

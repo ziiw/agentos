@@ -158,6 +158,8 @@ enum Command {
         #[arg(long, value_name = "HOST")]
         revoke: Option<String>,
     },
+    /// List the agents you can use with `agent do --agent NAME`
+    Agents,
     /// Review a project's .agentos.toml and let agentos apply it
     Trust {
         /// The file (default: the nearest .agentos.toml from here)
@@ -274,9 +276,9 @@ struct DoArgs {
     grants: GrantArgs,
     #[command(flatten)]
     mode: Mode,
-    /// Which agent
-    #[arg(long, default_value = "claude")]
-    agent: String,
+    /// Which agent (default: `agent` in your config, else claude; see `agent agents`)
+    #[arg(long)]
+    agent: Option<String>,
     /// Watch and steer the agent in its own interface instead of running it to completion
     #[arg(short, long)]
     interactive: bool,
@@ -323,12 +325,12 @@ struct Plan {
     /// Read-only grants for the agent's own installation.
     install: Vec<PathBuf>,
     profile_env: Vec<(String, String)>,
-    pass_env: Vec<&'static str>,
+    pass_env: Vec<String>,
     /// Agent profile name: gives the task a persistent home.
-    agent: Option<&'static str>,
+    agent: Option<String>,
     output: Output,
     /// Hosts the agent reaches for that stay closed on purpose: (host, why).
-    expected_denials: Vec<(&'static str, &'static str)>,
+    expected_denials: Vec<(String, String)>,
     /// Who to ask about hosts outside the allowlist.
     ask: Ask,
     /// Fail rather than run without the current directory.
@@ -363,6 +365,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Stop { task } => cmd_stop(&store, task.as_deref()),
         Command::Doctor => cmd_doctor(&store),
         Command::Trust { path } => cmd_trust(&store, path),
+        Command::Agents => cmd_agents(&store),
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
         Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
@@ -440,6 +443,27 @@ fn prepare_login(store: &Store, agent: &str, login: &profiles::Login, net: Net) 
     Ok(Some(LoginPlan { vault, hosts: login.hosts.iter().map(|h| h.to_string()).collect(), file, brokered }))
 }
 
+/// Where your agent definitions live: next to your config.
+fn agents_dir(home: &Path) -> PathBuf {
+    config::user_config_path(home).parent().map(|d| d.join("agents")).unwrap_or_else(|| home.join(".config/agentos/agents"))
+}
+
+fn cmd_agents(store: &Store) -> Result<i32> {
+    let home = home_dir()?;
+    let out = Paint::stdout();
+    let default = config::load(store.root(), &std::env::current_dir()?, &home)?.agent.unwrap_or_else(|| "claude".into());
+    for a in profiles::available(&agents_dir(&home)) {
+        let mark = if a.name == default { out.cyan("*") } else { " ".into() };
+        let program = match &a.program {
+            Some(p) => out.dim(display_path(p)),
+            None => out.yellow("not installed"),
+        };
+        println!("{mark} {:<12} {:<44} {program}", a.name, a.source);
+    }
+    println!("{}", out.dim(format!("add one: {}/NAME.toml (see README: Agents)", display_path(&agents_dir(&home)))));
+    Ok(0)
+}
+
 fn cmd_vault(store: &Store, action: &str, agent: &str) -> Result<i32> {
     let login = profiles::login_for(agent).with_context(|| format!("unknown agent '{agent}'"))?;
     let vault = Vault::open(store.root(), agent)?;
@@ -496,7 +520,12 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         bail!("give the agent a task: agent do \"…\"");
     }
     let interactive = args.interactive || task.is_none();
-    let profile = profiles::load(&args.agent, task.as_deref(), interactive, &home_dir()?)?;
+    let home = home_dir()?;
+    let agent = match args.agent.clone() {
+        Some(a) => a,
+        None => config::load(store.root(), &std::env::current_dir()?, &home)?.agent.unwrap_or_else(|| "claude".into()),
+    };
+    let profile = profiles::load(&agent, task.as_deref(), interactive, &home, &agents_dir(&home))?;
     let title = match &task {
         Some(t) => format!("{}: {t}", profile.name),
         None => format!("{} (interactive)", profile.name),
@@ -524,7 +553,7 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         bail!("--secret needs the agent's default, proxied network; drop --net {net}");
     }
     let login = match &profile.login {
-        Some(l) => prepare_login(store, profile.name, l, net)?,
+        Some(l) => prepare_login(store, &profile.name, l, net)?,
         None => None,
     };
     execute(
@@ -540,7 +569,7 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             install: profile.install,
             profile_env: profile.env,
             pass_env: profile.pass_env,
-            agent: Some(profile.name),
+            agent: Some(profile.name.clone()),
             // Claude's own full-screen interface owns the terminal: don't talk
             // over it, but agentd's console can still ask.
             ask: match (no_ask, &profile.output) {
@@ -703,17 +732,17 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         env.push((k, v));
     }
     for k in plan.pass_env {
-        if let (Ok(v), false) = (std::env::var(k), env.iter().any(|(name, _)| name == k)) {
-            env.push((k.to_string(), v));
+        if let (Ok(v), false) = (std::env::var(&k), env.iter().any(|(name, _)| *name == k)) {
+            env.push((k, v));
         }
     }
     let mut env_names: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
     env_names.push("AGENTOS_TASK".into());
-    let home_source = plan.agent.map(|name| store.agent_home(name)).transpose()?;
+    let home_source = plan.agent.as_deref().map(|name| store.agent_home(name)).transpose()?;
 
     let mut task = store.create(NewTask {
         title: plan.title,
-        agent: plan.agent.map(String::from),
+        agent: plan.agent.clone(),
         command: plan.argv.clone(),
         cwd: cwd.clone(),
         grants,
@@ -933,14 +962,14 @@ fn approver(
     ask: Ask,
     task: &Task,
     journal: Journal,
-    expected: Vec<(&'static str, &'static str)>,
+    expected: Vec<(String, String)>,
     err: Paint,
 ) -> Option<proxy::Approver> {
     let home = home_dir().ok()?;
     let project = approvals::project_root(cwd, &home);
     let asker = Asker::open(store.root(), &project, ask == Ask::TerminalAndConsole, task.id(), &render::title(task))?;
     Some(Arc::new(move |host: &str, port: u16| {
-        if expected.iter().any(|(h, _)| *h == host) {
+        if expected.iter().any(|(h, _)| h == host) {
             return false;
         }
         let (decision, asked) = asker.ask(host, port, |s| err.cyan(s));
@@ -983,13 +1012,13 @@ fn say(line: String) {
 
 /// Records each connection through the egress proxy and says so, live,
 /// when one is refused.
-fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(&'static str, &'static str)>, err: Paint) -> proxy::Sink {
+fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(String, String)>, err: Paint) -> proxy::Sink {
     let explained = Mutex::new(HashSet::new());
     Arc::new(move |event: NetEvent| {
         let expected_why = expected
             .iter()
             .find(|(host, _)| *host == event.host && event.reason.as_deref() == Some("not in the allowlist"))
-            .map(|(_, why)| *why);
+            .map(|(_, why)| why.clone());
         let mut data = json!(event);
         if expected_why.is_some() {
             data["expected"] = json!(true);

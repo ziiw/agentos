@@ -1,0 +1,8 @@
+# Google Gemini CLI. UNTESTED SKETCH: check the flags against `gemini --help`.
+# Copy to ~/.config/agentos/agents/gemini.toml, then: agent do --agent gemini "…"
+run = ["gemini", "--yolo", "-p", "{task}"]
+interactive = ["gemini", "--yolo"]
+allow = ["generativelanguage.googleapis.com"]
+
+[secrets]
+GEMINI_API_KEY = "generativelanguage.googleapis.com/x-goog-api-key"

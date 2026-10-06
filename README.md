@@ -88,6 +88,7 @@ scripts/dev.sh shell
 | `agent doctor` | Check this machine |
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
 | `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
+| `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 
@@ -238,6 +239,19 @@ agent do
 Then type `/login` and quit (Ctrl-D twice). Or `export ANTHROPIC_API_KEY=…`, which is passed through when set.
 
 Headless runs (`agent do "TASK"`) stream progress and journal every tool call, the result and the cost. `agent do -i "TASK"` opens Claude's own interface instead, so you can watch and steer.
+
+**Other agents** are defined in a file each, `~/.config/agentos/agents/NAME.toml`:
+
+```toml
+run = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{task}"]   # headless
+interactive = ["codex"]                    # agent do --agent codex, with no task
+allow = ["api.openai.com"]                 # hosts it needs
+
+[secrets]                                  # brokered: the agent only sees placeholders
+OPENAI_API_KEY = "api.openai.com"
+```
+
+`agent do --agent codex "…"` runs it like Claude: same sandbox, transactions, outbox, allowlist and broker, and its own persistent home. `agent agents` lists what you have, and `agent = "codex"` in your config makes it the default. [examples/agents/](examples/agents) has starting points for Codex, Gemini CLI and Aider. They're untested sketches, so check their flags.
 
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 

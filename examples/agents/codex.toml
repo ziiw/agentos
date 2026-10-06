@@ -1,0 +1,12 @@
+# OpenAI Codex CLI. UNTESTED SKETCH: check the flags against `codex --help`.
+# Copy to ~/.config/agentos/agents/codex.toml, then: agent do --agent codex "…"
+#
+# agentos is the sandbox and the review step, so Codex's own approvals and
+# sandbox are turned off.
+run = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{task}"]
+interactive = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+allow = ["api.openai.com"]
+
+[secrets]
+# The agent sees a placeholder; the proxy adds your key on the wire.
+OPENAI_API_KEY = "api.openai.com"

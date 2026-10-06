@@ -450,6 +450,38 @@ check "agent do --bg runs the agent headless, output kept" grep -q 'Added test_g
 check "agent logs -f returns once the task is over" "$AGENT" logs -f "$id"
 rm -rf "$HOME/.claude"
 
+section "agents as config files"
+reset_proj
+cd "$PROJ"
+mkdir -p "$WORK/cfg/agents" "$WORK/tools/echo-agent"
+cat > "$WORK/tools/echo-agent/echo-agent" <<'SH'
+#!/bin/sh
+echo "echo-agent got: $*"
+case "${ECHO_KEY:-}" in agentos-placeholder-*) echo "key: placeholder" ;; "") echo "key: none" ;; *) echo "key: real" ;; esac
+echo done > echo.txt
+SH
+chmod +x "$WORK/tools/echo-agent/echo-agent"
+cat > "$WORK/cfg/agents/echo.toml" <<'TOML'
+run = ["echo-agent", "--task", "{task}"]
+interactive = ["echo-agent", "--interactive"]
+allow = ["example.com"]
+
+[secrets]
+ECHO_KEY = "example.com"
+TOML
+export PATH="$WORK/tools/echo-agent:$PATH"
+CFG="$WORK/cfg/config.toml"
+: > "$CFG"
+out="$(AGENTOS_CONFIG="$CFG" ECHO_KEY=real-echo-key "$AGENT" do --agent echo fix the thing 2>&1)"
+check "a file-defined agent runs headless, with the task where its file says" grep -q 'echo-agent got: --task fix the thing' <<<"$out"
+check "...with its allowlist" grep -q 'net example.com' <<<"$out"
+check "...its credential brokered (a placeholder inside)" grep -q 'key: placeholder' <<<"$out"
+check "...and its change held for review" grep -Eq '^  A  .*echo.txt' <<<"$("$AGENT" diff --stat)"
+check "agent agents lists it, with its program" grep -Eq 'echo .*echo.toml .*echo-agent' <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" agents)"
+check "an unknown agent is refused, with what's available" grep -q "unknown agent 'nope' (available: claude, echo" <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do --agent nope x 2>&1)"
+echo 'agent = "echo"' > "$CFG"
+check "the default agent comes from your config" grep -q 'echo-agent got' <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do just do it 2>&1)"
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7

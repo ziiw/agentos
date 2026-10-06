@@ -13,8 +13,6 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-pub const AGENTS: &[&str] = &["claude"];
-
 pub enum Output {
     /// The agent talks to your terminal directly.
     Inherit,
@@ -23,32 +21,159 @@ pub enum Output {
 }
 
 pub struct Profile {
-    pub name: &'static str,
+    pub name: String,
     pub argv: Vec<String>,
     /// The agent's own installation, granted read-only.
     pub install: Vec<PathBuf>,
     pub env: Vec<(String, String)>,
-    /// Passed through from your shell when set (credentials, endpoints).
-    pub pass_env: Vec<&'static str>,
+    /// Passed through from your shell when set (endpoints, settings).
+    pub pass_env: Vec<String>,
     pub net: Net,
     /// Hosts the agent needs, for `Net::Proxy`.
-    pub allow: Vec<&'static str>,
+    pub allow: Vec<String>,
     /// Credentials brokered when set in your environment: (variable, host, header).
-    pub brokered: Vec<(&'static str, &'static str, &'static str)>,
+    pub brokered: Vec<(String, String, String)>,
     /// The agent's own login, sealed in the vault while it runs.
     pub login: Option<Login>,
     /// Hosts the agent reaches for that stay closed on purpose: (host, why).
     /// Refusals are journaled, and explained once instead of warned about.
-    pub expected_denials: Vec<(&'static str, &'static str)>,
+    pub expected_denials: Vec<(String, String)>,
     pub output: Output,
 }
 
-/// `task: None` opens an interactive session.
-pub fn load(agent: &str, task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile> {
-    match agent {
-        "claude" => claude(task, interactive, home),
-        other => bail!("unknown agent '{other}' (available: {})", AGENTS.join(", ")),
+/// `task: None` opens an interactive session. Agents other than the
+/// built-in ones are defined in `<agents_dir>/<name>.toml`.
+pub fn load(agent: &str, task: Option<&str>, interactive: bool, home: &Path, agents_dir: &Path) -> Result<Profile> {
+    if agent == "claude" {
+        return claude(task, interactive, home);
     }
+    let file = agents_dir.join(format!("{agent}.toml"));
+    if !file.is_file() {
+        let names: Vec<String> = available(agents_dir).into_iter().map(|a| a.name).collect();
+        bail!("unknown agent '{agent}' (available: {}; define one in {})", names.join(", "), file.display());
+    }
+    from_file(agent, &file, task, interactive, home)
+}
+
+/// An agent you can use: built in, or defined in a file.
+pub struct Available {
+    pub name: String,
+    /// "built in", or the definition file.
+    pub source: String,
+    /// The program it runs, if found.
+    pub program: Option<PathBuf>,
+}
+
+pub fn available(agents_dir: &Path) -> Vec<Available> {
+    let mut out = vec![Available { name: "claude".into(), source: "built in".into(), program: find_on_path("claude") }];
+    let mut files: Vec<PathBuf> = fs::read_dir(agents_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+        .collect();
+    files.sort();
+    for f in files {
+        let Some(name) = f.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+        if name == "claude" {
+            continue;
+        }
+        let program = fs::read_to_string(&f)
+            .ok()
+            .and_then(|t| toml::from_str::<AgentFile>(&t).ok())
+            .and_then(|a| a.run.first().cloned())
+            .and_then(|p| if p.contains('/') { Some(PathBuf::from(p)).filter(|p| p.is_file()) } else { find_on_path(&p) });
+        out.push(Available { name, source: f.display().to_string(), program });
+    }
+    out
+}
+
+/// An agent defined in a file:
+///
+/// ```toml
+/// run = ["codex", "exec", "--full-auto", "{task}"]   # headless; {task} is the task
+/// interactive = ["codex"]                            # agent do with no task, or -i
+/// allow = ["api.openai.com"]                         # hosts it needs
+/// output = "text"                                    # or "claude-stream"
+///
+/// [secrets]                                          # brokered when set in your environment
+/// OPENAI_API_KEY = "api.openai.com"                  # header: authorization (Bearer)
+///
+/// [env]                                              # set in the sandbox
+/// SOME_SETTING = "1"
+/// ```
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFile {
+    run: Vec<String>,
+    #[serde(default)]
+    interactive: Option<Vec<String>>,
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    secrets: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pass_env: Vec<String>,
+}
+
+fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile> {
+    let text = fs::read_to_string(file)?;
+    let def: AgentFile = toml::from_str(&text).with_context(|| format!("{}: invalid agent definition", file.display()))?;
+    crate::proxy::Allowlist::parse(&def.allow).with_context(|| format!("{}: allow", file.display()))?;
+    let headless = task.is_some() && !interactive;
+    let template = if headless {
+        def.run.clone()
+    } else {
+        def.interactive.clone().with_context(|| format!("agent '{name}' has no interactive command in {}", file.display()))?
+    };
+    if template.is_empty() {
+        bail!("{}: empty command", file.display());
+    }
+    // {task} goes where the file says, or at the end.
+    let mut argv: Vec<String> = template.iter().map(|a| a.replace("{task}", task.unwrap_or_default())).collect();
+    match task {
+        Some(t) if !template.iter().any(|a| a.contains("{task}")) => argv.push(t.to_string()),
+        None => argv.retain(|a| !a.is_empty()),
+        _ => {}
+    }
+    let program = if argv[0].contains('/') {
+        PathBuf::from(&argv[0])
+    } else {
+        find_on_path(&argv[0]).with_context(|| format!("agent '{name}' runs `{}`, which isn't on your PATH", argv[0]))?
+    };
+    let program = fs::canonicalize(program)?;
+    argv[0] = program.display().to_string();
+    let output = match def.output.as_deref() {
+        Some("claude-stream") if headless => Output::ClaudeStream,
+        None | Some("text") | Some("claude-stream") => Output::Inherit,
+        Some(other) => bail!("{}: output must be \"text\" or \"claude-stream\", not {other:?}", file.display()),
+    };
+    let brokered = def
+        .secrets
+        .iter()
+        .map(|(var, target)| {
+            let (host, header) = target.split_once('/').unwrap_or((target, "authorization"));
+            (var.clone(), host.to_ascii_lowercase(), header.to_ascii_lowercase())
+        })
+        .collect();
+    Ok(Profile {
+        name: name.to_string(),
+        install: install_roots(&program, home),
+        argv,
+        env: def.env.into_iter().collect(),
+        pass_env: def.pass_env,
+        net: Net::Proxy,
+        allow: def.allow,
+        brokered,
+        login: None,
+        expected_denials: Vec::new(),
+        output,
+    })
 }
 
 fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile> {
@@ -69,7 +194,7 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
         None => Output::Inherit,
     };
     Ok(Profile {
-        name: "claude",
+        name: "claude".into(),
         install: install_roots(&bin, home),
         argv,
         env: vec![
@@ -78,21 +203,21 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
             ("DISABLE_AUTOUPDATER".into(), "1".into()),
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()),
         ],
-        pass_env: vec!["ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"],
+        pass_env: vec!["ANTHROPIC_BASE_URL".into(), "ANTHROPIC_MODEL".into()],
         // The agent gets placeholders; the proxy adds the real values on the wire.
         brokered: vec![
-            ("ANTHROPIC_API_KEY", "api.anthropic.com", "x-api-key"),
-            ("ANTHROPIC_AUTH_TOKEN", "api.anthropic.com", "authorization"),
+            ("ANTHROPIC_API_KEY".into(), "api.anthropic.com".into(), "x-api-key".into()),
+            ("ANTHROPIC_AUTH_TOKEN".into(), "api.anthropic.com".into(), "authorization".into()),
         ],
         login: Some(claude_login()),
         expected_denials: vec![(
-            "mcp-proxy.anthropic.com",
-            "Claude's remote MCP connectors, which can reach your other accounts",
+            "mcp-proxy.anthropic.com".into(),
+            "Claude's remote MCP connectors, which can reach your other accounts".into(),
         )],
         net: Net::Proxy,
         // The API, plus what logging in and refreshing a login talk to.
         // Anything else shows up as "blocked" in the output and the journal.
-        allow: vec!["api.anthropic.com", "console.anthropic.com", "platform.claude.com", "claude.ai"],
+        allow: ["api.anthropic.com", "console.anthropic.com", "platform.claude.com", "claude.ai"].map(String::from).to_vec(),
         output,
     })
 }

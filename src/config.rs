@@ -8,6 +8,8 @@
 //!   permissions for the next run.
 //!
 //! ```toml
+//! agent = "claude"                        # default for `agent do`
+//!
 //! [network]
 //! allow = ["@pypi", "api.github.com"]     # presets: @pypi @npm @crates @github @go
 //!
@@ -38,6 +40,9 @@ pub const PROJECT_FILE: &str = ".agentos.toml";
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
+    /// Default agent for `agent do`.
+    #[serde(default)]
+    agent: Option<String>,
     #[serde(default)]
     network: Network,
     #[serde(default)]
@@ -77,6 +82,8 @@ pub struct Settings {
     pub notes: Vec<String>,
     /// Default resource limits (a project's override yours).
     pub limits: crate::limits::Limits,
+    /// Default agent for `agent do` (a project's overrides yours).
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -164,6 +171,9 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         s.ro.push(fs::canonicalize(&p).with_context(|| format!("{shown}: ro {entry}: no such file or directory"))?);
     }
 
+    if file.agent.is_some() {
+        s.agent = file.agent.clone();
+    }
     file.limits.validate().with_context(|| format!("{shown}: [limits]"))?;
     s.limits = file.limits.or(&s.limits);
 

@@ -1,0 +1,8 @@
+# Aider, here with an Anthropic model. UNTESTED SKETCH: check `aider --help`.
+# Copy to ~/.config/agentos/agents/aider.toml, then: agent do --agent aider "…"
+run = ["aider", "--yes-always", "--no-check-update", "--no-analytics", "--message", "{task}"]
+interactive = ["aider", "--no-check-update", "--no-analytics"]
+allow = ["api.anthropic.com"]
+
+[secrets]
+ANTHROPIC_API_KEY = "api.anthropic.com/x-api-key"
