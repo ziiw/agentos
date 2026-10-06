@@ -18,11 +18,16 @@ fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; failed=1; }
 ask()  { read -rp "  $1 [y/N] " answer; if [[ $answer == [yY]* ]]; then pass "$1"; else fail "$1"; fi; }
 
 echo "testing $(agent --version)"
-rm -rf "$APP" && mkdir -p "$APP" && cd "$APP" || exit 1
+REMOTE="$APP.remote.git"
+rm -rf "$APP" "$REMOTE" && mkdir -p "$APP" && cd "$APP" || exit 1
 cat > greet.py <<'EOF'
 def greet(name):
     return "hello " + name
 EOF
+# A git repo with a remote, to check that the agent's pushes wait for you.
+git init -q --bare "$REMOTE"
+git init -q -b main && git remote add origin "$REMOTE"
+git add greet.py && git -c user.name=you -c user.email=you@example.com commit -qm "greet" && git push -q origin main
 
 step "1. The agent is logged in"
 probe() { agent do "Reply with exactly the word READY. Do nothing else." 2>&1; }
@@ -34,9 +39,16 @@ if grep -q "Not logged in" <<<"$out"; then
   out="$(probe)"
 fi
 if grep -q READY <<<"$out"; then pass "agent answers"; else fail "agent answers"; echo "$out"; exit 1; fi
+if agent vault | grep -q 'claude: sealed'; then
+  pass "your login is sealed: the agent only holds placeholders, and it still works"
+elif agent vault | grep -q 'not logged in'; then
+  pass "(API key login: brokered as a placeholder)"
+else
+  fail "your login is sealed ($(agent vault))"
+fi
 
 step "2. agent do \"add a test for greet\""
-agent do "add a pytest test file for greet() in greet.py. Don't modify greet.py."
+agent do "add a pytest test file for greet() in greet.py. Don't modify greet.py. Then commit it with git (author: Agent <agent@example.com>) and push it to a new branch named test-greet on origin."
 code=$?
 if [ $code -eq 0 ]; then pass "agent finished (exit 0)"; else fail "agent finished (exit $code)"; fi
 if compgen -G "test_*.py" >/dev/null || compgen -G "tests/*" >/dev/null; then
@@ -46,6 +58,12 @@ else
 fi
 if agent log --json | grep -q '"kind":"agent.tool"'; then pass "tool calls were journaled"; else fail "tool calls were journaled"; fi
 
+if git --git-dir="$REMOTE" rev-parse -q --verify refs/heads/test-greet >/dev/null; then
+  fail "the agent's push is held, not sent"
+else
+  pass "the agent's push is held, not sent"
+fi
+
 step "3. Review"
 agent diff
 if agent diff --stat | grep -Eq '^  A  .*test.*\.py'; then pass "diff shows a new test file"; else fail "diff shows a new test file"; fi
@@ -54,6 +72,12 @@ ask "Does the diff look like what you asked for?"
 step "4. Commit"
 agent commit
 if compgen -G "test*.py" >/dev/null || compgen -G "tests/*.py" >/dev/null; then pass "the test is now in your folder"; else fail "the test is now in your folder"; fi
+
+if git --git-dir="$REMOTE" rev-parse -q --verify refs/heads/test-greet >/dev/null; then
+  pass "commit sent the held push to the remote"
+else
+  fail "commit sent the held push to the remote"
+fi
 
 step "5. Audit"
 agent log | tail -12

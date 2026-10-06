@@ -32,7 +32,7 @@ sudo podman run --rm --privileged --pull=newer \
   --type qcow2 --rootfs xfs localhost/agentos:latest
 ```
 
-Boot `output/qcow2/disk.qcow2` in QEMU, UTM or a cloud. `--type raw`, `ami` and `anaconda-iso` work too. Or let CI do it: Actions → ci → **Run workflow** builds a qcow2 artifact. It adds a user `agent` with your key if the repository secret `AGENTOS_SSH_KEY` is set.
+Boot `output/qcow2/disk.qcow2` in QEMU, UTM or a cloud. `--type raw`, `ami` and `anaconda-iso` work too. Or let CI do it: Actions → disk → **Run workflow** builds a qcow2 artifact. It adds a user `agent` with your key if the repository secret `AGENTOS_SSH_KEY` is set.
 
 ## Move an existing machine onto it
 

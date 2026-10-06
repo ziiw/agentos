@@ -3,7 +3,6 @@ name: ci
 on:
   push:
   pull_request:
-  workflow_dispatch:
 
 jobs:
   test:
@@ -68,39 +67,3 @@ jobs:
             useradd -m tester
             su - tester -c "E2E_DIR=/e2e bash /src/tests/e2e.sh"'
 
-  disk:
-    # A bootable disk image (qcow2) for a VM or cloud, on demand: Actions →
-    # ci → Run workflow. Takes a while and makes a ~2 GB artifact.
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build the image into podman's storage
-        run: sudo podman build -f image/Containerfile --build-arg AGENTOS_REV="$(git rev-parse --short HEAD)" -t localhost/agentos:latest .
-
-      - name: Make a qcow2 disk with bootc-image-builder
-        env:
-          # Optional repository secret: your SSH public key, to log in as `agent`.
-          SSH_KEY: ${{ secrets.AGENTOS_SSH_KEY }}
-        run: |
-          mkdir -p output
-          if [ -n "$SSH_KEY" ]; then
-            printf '[[customizations.user]]\nname = "agent"\nkey = "%s"\ngroups = ["wheel"]\n' "$SSH_KEY" > image/disk.toml
-          fi
-          sudo podman run --rm --privileged --pull=newer \
-            --security-opt label=type:unconfined_t \
-            -v ./image/disk.toml:/config.toml:ro \
-            -v ./output:/output \
-            -v /var/lib/containers/storage:/var/lib/containers/storage \
-            quay.io/centos-bootc/bootc-image-builder:latest \
-            --type qcow2 --rootfs xfs \
-            localhost/agentos:latest
-          sudo chown -R "$(id -u)" output
-          ls -la output/qcow2
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: agentos-qcow2
-          path: output/qcow2/disk.qcow2
-          retention-days: 7

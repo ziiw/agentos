@@ -11,12 +11,14 @@ export NO_COLOR=1
 PROJ="$WORK/proj"
 pass=0
 fail=0
+skipped=0
 
 ok()  { printf '  \033[32m✓\033[0m %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 # check NAME CMD...: pass if CMD succeeds
 check() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name"; fi; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+skip() { printf '  \033[33m-\033[0m skipped: %s\n' "$1"; skipped=$((skipped + 1)); }
 
 cleanup() { chmod -R u+rwx "$WORK" 2>/dev/null; rm -rf "$WORK" "$HOME/.e2e-secret"; }
 trap cleanup EXIT
@@ -131,6 +133,8 @@ import subprocess, threading
 t = threading.Thread(target=lambda: None); t.start(); t.join()
 subprocess.run(["sh", "-c", "true"], check=True)'
   rm -f "$PROJ/tiocsti.py"
+else
+  skip "TIOCSTI and thread checks need python3 and script(1)"
 fi
 
 section "secrets stay out"
@@ -231,6 +235,8 @@ if command -v script >/dev/null; then
   check "agent approvals lists it" grep -q 'example.com' <<<"$("$AGENT" approvals)"
   "$AGENT" approvals --revoke example.com >/dev/null
   check "revoking takes it back" lacks HTTP200 "$("$AGENT" run -- $GET 2>&1)"
+else
+  skip "terminal approvals need script(1)"
 fi
 out="$("$AGENT" run --ask -- $GET 2>&1 </dev/null)"
 check "without a terminal nobody is asked, the host is refused" grep -q 'blocked example.com:443' <<<"$out"
@@ -305,6 +311,8 @@ if command -v git >/dev/null; then
   check "agent push sends without committing files (the outbox is self-contained)" "$AGENT" push --force
   check "--force overwrote the remote" test "$(git --git-dir="$REMOTE" log -1 --format=%s main)" = four
   "$AGENT" rollback >/dev/null
+else
+  skip "the outbox needs git"
 fi
 
 section "ignored changes (.gitignore, __pycache__)"
@@ -405,5 +413,7 @@ sed -i 's/"exit_code":127/"exit_code":0/' "$(latest_task_dir)/events.jsonl"
 "$AGENT" log >/dev/null
 check "tampering is detected" test $? -eq 1
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
+printf '\n%d passed, %d failed' "$pass" "$fail"
+[ "$skipped" -gt 0 ] && printf ', %d sections skipped' "$skipped"
+printf '\n'
 [ "$fail" -eq 0 ]
