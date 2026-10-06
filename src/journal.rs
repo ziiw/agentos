@@ -159,6 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn floats_read_back_exactly() {
+        // Costs are sums of products like 3000 × 2e-6: their shortest decimal
+        // form only parses back to the same number with exact float parsing,
+        // and the chain hashes the re-serialized value.
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::new(dir.path().join("events.jsonl"));
+        let mut total = 0.0;
+        for i in 0..400u64 {
+            total += (3000 + i * 7) as f64 * 2e-6 + 40000.0 * 0.2e-6 + (1500 + i) as f64 * 10e-6;
+            j.append("model.call", json!({ "cost_usd": total, "third": (i as f64) / 3.0, "tiny": 1e-7 * i as f64 })).unwrap();
+        }
+        assert!(matches!(j.verify().unwrap(), Integrity::Intact { events: 400, .. }));
+    }
+
+    #[test]
     fn dropping_an_event_breaks_the_chain() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
