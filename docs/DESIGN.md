@@ -123,7 +123,8 @@ It's verified at three levels:
 | M3: egress proxy with an allowlist, replacing `net host`; ignored files left out of commits | ✅ automated; real Claude verified through the proxy (free 401 check); human acceptance pending |
 | M4: CI on ubuntu-24.04 (x86_64 + arm64): Landlock enforced, AppArmor path | ✅ green on GitHub Actions |
 | M5: credential broker: the agent holds a placeholder, the proxy adds the real key on the wire | ✅ CI green; real Claude Code verified (13/13 requests injected, free 401 check) |
-| M6: configuration: host presets, your config + project config with `agent trust`, expected denials | ✅ automated |
+| M6: configuration: host presets, your config + project config with `agent trust`, expected denials | ✅ CI green |
+| M7: live approvals: unlisted hosts are asked about at the terminal while the connection waits; "always" remembered per project | ✅ automated (pseudo-terminal tests) |
 
 ### Phase 1 backlog, in order
 
@@ -133,7 +134,7 @@ It's verified at three levels:
 4. **Effects outbox.** `git push`, mail and API writes are held as pending effects next to the file diff. `agent commit` releases them, or policy auto-releases low-risk ones.
 5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
 6. **cgroups.** CPU, memory and pid limits through a systemd transient scope. Token/$ budgets through the model gateway.
-7. **agentd + API.** Long-running daemon. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
+7. **agentd + API.** ◐ Approvals exist at the terminal (M7); the daemon makes them reachable from elsewhere. Long-running daemon. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
 8. **MCP gateway.** System services exposed as typed tools, governed by the same policy.
 
 ## Open decisions

@@ -1,3 +1,4 @@
+use agentos::approvals::{self, Asker};
 use agentos::broker::{self, Broker, Secret};
 use agentos::changes::{self, Summary};
 use agentos::config;
@@ -99,6 +100,12 @@ enum Command {
     },
     /// Check whether this machine can run agent sandboxes
     Doctor,
+    /// List hosts you approved "always", or revoke one for this project
+    Approvals {
+        /// Forget this host (as listed) for the current project
+        #[arg(long, value_name = "HOST")]
+        revoke: Option<String>,
+    },
     /// Review a project's .agentos.toml and let agentos apply it
     Trust {
         /// The file (default: the nearest .agentos.toml from here)
@@ -135,6 +142,13 @@ struct GrantArgs {
     /// requests to HOST, and nowhere else. HEADER defaults to authorization.
     #[arg(long, value_name = "NAME=HOST[/HEADER]")]
     secret: Vec<String>,
+    /// Ask in the terminal when the agent reaches for a host that isn't
+    /// allowed (default for headless `agent do`)
+    #[arg(long, conflicts_with = "no_ask")]
+    ask: bool,
+    /// Never ask: hosts that aren't allowed are refused
+    #[arg(long)]
+    no_ask: bool,
 }
 
 #[derive(Args)]
@@ -188,6 +202,8 @@ struct Plan {
     output: Output,
     /// Hosts the agent reaches for that stay closed on purpose: (host, why).
     expected_denials: Vec<(&'static str, &'static str)>,
+    /// Ask at the terminal about hosts outside the allowlist.
+    ask: bool,
     /// Fail rather than run without the current directory.
     needs_cwd: bool,
 }
@@ -215,6 +231,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Log { task, json } => cmd_log(&store, task.as_deref(), json),
         Command::Doctor => cmd_doctor(&store),
         Command::Trust { path } => cmd_trust(&store, path),
+        Command::Approvals { revoke } => cmd_approvals(&store, revoke),
     }
 }
 
@@ -227,10 +244,13 @@ fn home_dir() -> Result<PathBuf> {
 /// Returns the hosts they allow and the secrets they broker (those set in
 /// your environment).
 fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<(Vec<String>, Vec<Secret>)> {
-    let settings = config::load(store.root(), &std::env::current_dir()?, &home_dir()?)?;
+    let (cwd, home) = (std::env::current_dir()?, home_dir()?);
+    let mut settings = config::load(store.root(), &cwd, &home)?;
     for note in &settings.notes {
         eprintln!("{} {note}", Paint::stderr().yellow("agent:"));
     }
+    // Hosts you approved "always" for this project count like your own config.
+    settings.allow.extend(approvals::remembered(store.root(), &approvals::project_root(&cwd, &home))?);
     grants.ro.extend(settings.ro);
     grants.hide.extend(settings.hide);
     let mut secrets = Vec::new();
@@ -290,6 +310,7 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     allow.extend(config_allow);
     allow.extend(args.grants.allow.iter().cloned());
     let mut secrets = parse_secrets(&args.grants.secret)?;
+    let no_ask = args.grants.no_ask;
     if net == Net::Proxy {
         let from_profile = profile.brokered.iter().filter_map(|(var, host, header)| {
             std::env::var(var).ok().map(|value| Secret::new(var, host, header, value))
@@ -315,6 +336,8 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             profile_env: profile.env,
             pass_env: profile.pass_env,
             agent: Some(profile.name),
+            // Claude's own full-screen interface owns the terminal: don't talk over it.
+            ask: matches!(profile.output, Output::ClaudeStream) && !no_ask,
             output: profile.output,
             expected_denials: profile.expected_denials,
             needs_cwd: true,
@@ -326,9 +349,10 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     let argv = args.command;
     let (config_allow, config_secrets) = apply_config(store, &mut args.grants)?;
     let mut secrets = parse_secrets(&args.grants.secret)?;
-    let asked = !args.grants.allow.is_empty() || !secrets.is_empty();
+    let ask = args.grants.ask;
+    let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask;
     let net = match args.net {
-        Some(Net::Host) if asked => bail!("--allow/--secret and --net host contradict each other: they mean only those hosts"),
+        Some(Net::Host) if asked => bail!("--allow/--secret/--ask and --net host contradict each other: they mean only those hosts"),
         Some(net) => net,
         None if asked || !config_allow.is_empty() => Net::Proxy,
         None => Net::None,
@@ -358,6 +382,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             agent: None,
             output: Output::Inherit,
             expected_denials: Vec::new(),
+            ask,
             needs_cwd: false,
         },
     )?;
@@ -477,6 +502,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         hidden,
         net: plan.net,
         allow,
+        ask: plan.ask && plan.net == Net::Proxy,
         secrets: plan.secrets.iter().map(|s| s.env.clone()).collect(),
         env: env_names,
     })?;
@@ -493,6 +519,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             "hidden": task.meta.hidden,
             "net": task.meta.net,
             "allow": task.meta.allow,
+            "ask": task.meta.ask,
             "secrets": plan.secrets.iter().map(|s| json!({ "env": s.env, "host": s.host, "header": s.header })).collect::<Vec<_>>(),
             "env": task.meta.env,
         }),
@@ -511,6 +538,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     };
     let blocked = Arc::new(AtomicUsize::new(0));
     let expected_denials = plan.expected_denials;
+    let ask = plan.ask;
     // The CA's private key never leaves this process; only its certificate
     // is written out for the sandbox to trust.
     let (broker, run_files) = if plan.secrets.is_empty() {
@@ -569,7 +597,9 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
         setup_error = report.error.clone();
         if let Some(listener) = proxy_listener.take() {
-            proxy_handle = Some(proxy::serve(listener, allowlist, broker, net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err)));
+            let approver = ask.then(|| approver(store, &cwd, journal.clone(), expected_denials.clone(), err)).flatten();
+            let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
+            proxy_handle = Some(proxy::serve(listener, allowlist, broker, approver, sink));
         }
         if let Some(rx) = stdout_rx {
             outcome = follow_agent(rx, &journal, &cwd);
@@ -604,6 +634,45 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     }
     eprintln!("{}", render::exit_summary(err, &task, &summary, outcome.as_ref(), blocked.load(Ordering::SeqCst)));
     Ok(exit_code)
+}
+
+/// Asks at the terminal about hosts outside the allowlist, if there's a
+/// terminal to ask at.
+fn approver(store: &Store, cwd: &Path, journal: Journal, expected: Vec<(&'static str, &'static str)>, err: Paint) -> Option<proxy::Approver> {
+    let home = home_dir().ok()?;
+    let asker = Asker::open(store.root(), &approvals::project_root(cwd, &home))?;
+    Some(Arc::new(move |host: &str, port: u16| {
+        if expected.iter().any(|(h, _)| *h == host) {
+            return false;
+        }
+        let (decision, asked) = asker.ask(host, port, |s| err.cyan(s));
+        if asked {
+            let _ = journal.append("net.approval", json!({ "host": host, "port": port, "decision": decision.label() }));
+        }
+        decision.allows()
+    }))
+}
+
+fn cmd_approvals(store: &Store, revoke: Option<String>) -> Result<i32> {
+    let project = approvals::project_root(&std::env::current_dir()?, &home_dir()?);
+    if let Some(entry) = revoke {
+        if approvals::revoke(store.root(), &project, &entry)? {
+            println!("revoked {entry} for {}", display_path(&project));
+            return Ok(0);
+        }
+        bail!("{entry} isn't approved for {}", display_path(&project));
+    }
+    let all = approvals::all(store.root())?;
+    if all.is_empty() {
+        println!("no remembered approvals; answer [a] when an agent asks to remember one");
+    }
+    for (dir, hosts) in all {
+        println!("{}", Paint::stdout().bold(display_path(Path::new(&dir))));
+        for h in hosts {
+            println!("  {h}");
+        }
+    }
+    Ok(0)
 }
 
 /// Records each connection through the egress proxy and says so, live,

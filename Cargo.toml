@@ -20,7 +20,7 @@ humantime = "2"
 ignore = "0.4"
 landlock = "0.4"
 libc = "0.2"
-nix = { version = "0.30", features = ["feature", "fs", "hostname", "mount", "process", "sched", "signal", "user"] }
+nix = { version = "0.30", features = ["feature", "fs", "hostname", "mount", "poll", "process", "sched", "signal", "user"] }
 rcgen = "0.13"
 # ring rather than the default aws-lc-rs: no cmake/C toolchain needed to build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

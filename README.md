@@ -81,8 +81,9 @@ scripts/dev.sh shell
 | `agent log [TASK] [--json]` | Show the journal and verify its hash chain |
 | `agent doctor` | Check this machine |
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
+| `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 
-`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]` and `--no-cwd`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
+`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
 
 ## What the agent sees
 
@@ -120,6 +121,14 @@ The proxy accepts `CONNECT` to allowlisted hosts only, refuses hosts that resolv
 ```console
 agent: blocked pypi.org:443: not in the allowlist (allow it with --allow pypi.org)
 ```
+
+When an agent reaches for a host that isn't allowed, and there's a terminal to ask at, agentos asks you while the connection waits:
+
+```console
+agent ▸ the agent wants to reach pypi.org · [y] this task · [a] always, in ~/app · [N] deny ›
+```
+
+`y` allows it for this task. `a` remembers it for this project (in the task store, out of agents' reach; `agent approvals` lists them, `--revoke HOST` forgets one). Anything else, or no answer within 2 minutes, refuses it. Headless `agent do` asks by default (`--no-ask` to refuse instead); `agent run --ask` opts in, e.g. `agent run --ask -- npm install`. Nobody is asked in CI, pipes, or while Claude's own full-screen interface has the terminal. Every answer is journaled.
 
 Some hosts an agent reaches for stay closed on purpose. Claude, when logged in with a claude.ai account, tries `mcp-proxy.anthropic.com` for its remote MCP connectors, which can reach your other accounts. agentos explains that once per task, journals it, and doesn't count it as a problem.
 

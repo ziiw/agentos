@@ -118,9 +118,15 @@ pub struct NetEvent {
     /// Requests the broker added a credential to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub injected: Option<u64>,
+    /// Not in the allowlist, but approved when the agent asked.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
 }
 
 pub type Sink = Arc<dyn Fn(NetEvent) + Send + Sync>;
+
+/// Decides about hosts outside the allowlist, e.g. by asking you. `true` allows.
+pub type Approver = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
 
 pub struct Handle {
     active: Arc<AtomicUsize>,
@@ -146,16 +152,16 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
 /// Serves connections on background threads, reporting each one to `sink`.
 /// Hosts the `broker` holds credentials for are relayed through it.
 /// Threads must only be started after the sandbox has been forked.
-pub fn serve(listener: UnixListener, allow: Allowlist, broker: Option<Arc<Broker>>, sink: Sink) -> Handle {
+pub fn serve(listener: UnixListener, allow: Allowlist, broker: Option<Arc<Broker>>, approver: Option<Approver>, sink: Sink) -> Handle {
     let active = Arc::new(AtomicUsize::new(0));
     let allow = Arc::new(allow);
     let counter = active.clone();
     thread::spawn(move || {
         for client in listener.incoming().flatten() {
             counter.fetch_add(1, Ordering::SeqCst);
-            let (allow, broker, sink, counter) = (allow.clone(), broker.clone(), sink.clone(), counter.clone());
+            let (allow, broker, approver, sink, counter) = (allow.clone(), broker.clone(), approver.clone(), sink.clone(), counter.clone());
             thread::spawn(move || {
-                if let Some(event) = handle(client, &allow, broker.as_deref()) {
+                if let Some(event) = handle(client, &allow, broker.as_deref(), approver.as_ref()) {
                     sink(event);
                 }
                 counter.fetch_sub(1, Ordering::SeqCst);
@@ -165,7 +171,7 @@ pub fn serve(listener: UnixListener, allow: Allowlist, broker: Option<Arc<Broker
     Handle { active }
 }
 
-fn handle(mut client: UnixStream, allow: &Allowlist, broker: Option<&Broker>) -> Option<NetEvent> {
+fn handle(mut client: UnixStream, allow: &Allowlist, broker: Option<&Broker>, approver: Option<&Approver>) -> Option<NetEvent> {
     let start = Instant::now();
     let head = read_head(&mut client).ok()?;
     let mut words = head.lines().next().unwrap_or_default().split_whitespace();
@@ -181,6 +187,7 @@ fn handle(mut client: UnixStream, allow: &Allowlist, broker: Option<&Broker>) ->
         brokered: false,
         requests: None,
         injected: None,
+        approved: false,
     };
     let mut refuse = |status: &str, reason: &str, mut event: NetEvent| {
         let _ = write!(client, "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nagentos: {reason}\n");
@@ -198,7 +205,11 @@ fn handle(mut client: UnixStream, allow: &Allowlist, broker: Option<&Broker>) ->
     };
     (event.host, event.port) = (host.clone(), port);
     if !allow.allows(&host, port) {
-        return refuse("403 Forbidden", "not in the allowlist", event);
+        // The agent's connection waits while you're asked.
+        if !approver.is_some_and(|approve| approve(&host, port)) {
+            return refuse("403 Forbidden", "not in the allowlist", event);
+        }
+        event.approved = true;
     }
     let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
         Ok(a) => a.filter(|a| is_public(a.ip())).collect(),

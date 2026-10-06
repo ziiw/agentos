@@ -5,6 +5,7 @@
 //! everything it did is recorded in a hash-chained journal. When the task
 //! ends you review the diff and commit or roll back — all of it or per path.
 
+pub mod approvals;
 pub mod broker;
 pub mod changes;
 pub mod config;

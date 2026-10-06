@@ -211,6 +211,30 @@ printf '[secrets]\nAGENTOS_E2E_TOKEN = "postman-echo.com/x-test-token"\n' > "$WO
 out="$(AGENTOS_CONFIG="$WORK/user.toml" AGENTOS_E2E_TOKEN=from-user-config "$AGENT" run --allow example.com -- sh -c 'echo "token=$AGENTOS_E2E_TOKEN"' 2>&1)"
 check "your config brokers secrets" grep -q 'token=agentos-placeholder-' <<<"$out"
 
+section "live approvals"
+reset_proj
+cd "$PROJ"
+GET="curl -sS -m 20 -o /dev/null -w HTTP%{http_code} https://example.com"
+if command -v script >/dev/null; then
+  # script(1) gives the agent a terminal and types the answer into it.
+  answer() { script -qec "$AGENT run --ask -- $GET" /dev/null <<<"$1" 2>&1; }
+  out="$(answer y)"
+  check "you're asked while the connection waits" grep -q 'the agent wants to reach example.com' <<<"$out"
+  check "[y] lets it through" grep -q HTTP200 <<<"$out"
+  check "the answer is journaled" grep -q '"kind":"net.approval".*"decision":"once"' "$(latest_task_dir)/events.jsonl"
+  check "the banner says it will ask" grep -q 'net asks you first' <<<"$out"
+  script -qec "$AGENT run --ask -- sh -c '$GET; $GET'" /dev/null <<<"y" >/dev/null 2>&1
+  check "one question per host per task" test "$(grep -c '"kind":"net.approval"' "$(latest_task_dir)/events.jsonl")" -eq 1
+  check "[n] refuses it" lacks HTTP200 "$(answer n)"
+  check "[a] lets it through" grep -q HTTP200 <<<"$(answer a)"
+  check "...and remembers it for this project" grep -q HTTP200 <<<"$("$AGENT" run -- $GET 2>&1)"
+  check "agent approvals lists it" grep -q 'example.com' <<<"$("$AGENT" approvals)"
+  "$AGENT" approvals --revoke example.com >/dev/null
+  check "revoking takes it back" lacks HTTP200 "$("$AGENT" run -- $GET 2>&1)"
+fi
+out="$("$AGENT" run --ask -- $GET 2>&1 </dev/null)"
+check "without a terminal nobody is asked, the host is refused" grep -q 'blocked example.com:443' <<<"$out"
+
 section "ignored changes (.gitignore, __pycache__)"
 reset_proj
 echo "build/" > "$PROJ/.gitignore"

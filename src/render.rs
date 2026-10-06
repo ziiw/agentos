@@ -98,7 +98,11 @@ pub fn banner(p: Paint, task: &Task) -> String {
         let label = if g.access == Access::Rw { "rw" } else { "ro" };
         parts.push(format!("{} {}", p.dim(label), display_path(&g.path)));
     }
-    parts.push(format!("{} {}", p.dim("net"), net_label(&task.meta.net, &task.meta.allow)));
+    let mut net = net_label(&task.meta.net, &task.meta.allow);
+    if task.meta.ask {
+        net = if task.meta.allow.is_empty() { "asks you first".into() } else { format!("{net}, asks about others") };
+    }
+    parts.push(format!("{} {net}", p.dim("net")));
     if !task.meta.secrets.is_empty() {
         parts.push(format!("{} {}", p.dim("brokered"), task.meta.secrets.join(",")));
     }
@@ -437,6 +441,15 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
+        "net.approval" => {
+            let target = format!("{}:{}", s(&d["host"]), d["port"]);
+            match d["decision"].as_str().unwrap_or_default() {
+                "once" => format!("{} {target} · you allowed it for this task", p.green("?")),
+                "always" => format!("{} {target} · you allowed it, always, for this project", p.green("?")),
+                "timeout" => format!("{} {target} · no answer, denied", p.yellow("?")),
+                _ => format!("{} {target} · you denied it", p.yellow("?")),
+            }
+        }
         "agent.tool" => format!("{} {}", s(&d["name"]), truncate(&s(&d["target"]), 80)),
         "agent.result" => {
             let mut parts = vec![if d["is_error"].as_bool() == Some(true) { p.red("error") } else { "ok".into() }];
