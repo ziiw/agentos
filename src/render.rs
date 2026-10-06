@@ -98,7 +98,7 @@ fn summary_short(p: Paint, s: &Summary) -> String {
     format!("{} {} {}", p.green(format!("+{}", s.added)), p.yellow(format!("~{}", s.modified)), p.red(format!("-{}", s.deleted)))
 }
 
-pub fn banner(p: Paint, task: &Task, outbox: bool) -> String {
+pub fn banner(p: Paint, task: &Task, outbox: bool, login_sealed: bool) -> String {
     let mut parts = vec![format!("task {}", p.bold(task.id()))];
     if let Some(t) = &task.meta.title {
         parts.push(p.bold(truncate(t, 60)));
@@ -117,6 +117,9 @@ pub fn banner(p: Paint, task: &Task, outbox: bool) -> String {
     }
     if outbox {
         parts.push(format!("{} held", p.dim("git push")));
+    }
+    if login_sealed {
+        parts.push(format!("{} sealed", p.dim("login")));
     }
     format!("{} {}", p.cyan("agent ▸"), parts.join("  "))
 }
@@ -484,6 +487,7 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
+        "login.sealed" => format!("{} tokens moved to the vault", d["tokens"]),
         "outbox.ready" => {
             let remotes: Vec<String> = d["remotes"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
             format!("git pushes to {} are held", remotes.join(", "))

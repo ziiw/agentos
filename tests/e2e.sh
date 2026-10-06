@@ -337,6 +337,27 @@ out="$("$AGENT" run "add a test for greet" 2>&1)"
 check "a task given to agent run suggests agent do" grep -q 'agent do "add a test for greet"' <<<"$out"
 "$AGENT" run -- sh -c 'echo x > made-by-run.txt' 2>/dev/null
 check "agent run also grants the current folder" grep -Eq '^  A  .*made-by-run.txt' <<<"$("$AGENT" diff --stat)"
+
+# A claude.ai login in the agent's home, as `/login` would leave it.
+CREDS="$AGENT_STATE/.credentials.json"
+printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-e2e-real-access","refreshToken":"sk-ant-ort01-e2e-real-refresh","expiresAt":1}}' > "$CREDS"
+out="$("$AGENT" do look at the login 2>&1)"
+check "the agent's login gets sealed before it runs" grep -qx 'login: placeholder' "$AGENT_STATE/observations"
+check "...it's told once" grep -q 'login is now sealed' <<<"$out"
+check "the real tokens are out of the agent's home" lacks e2e-real-access "$(cat "$CREDS")"
+check "...in the vault, which no sandbox sees" grep -q e2e-real-access "$AGENTOS_HOME/vault/claude.json"
+check "...and never in the journal" bash -c "! grep -rq e2e-real "$AGENTOS_HOME/tasks""
+check "placeholders keep the token prefix" grep -q 'sk-ant-oat01-agentosplaceholder-' "$CREDS"
+check "agent vault reports it" grep -q 'claude: sealed' <<<"$("$AGENT" vault)"
+"$AGENT" do --net host with the host network >/dev/null 2>&1
+check "with --net host (no proxy to swap tokens) the agent gets the real login..." grep -qx 'login: real' "$AGENT_STATE/observations"
+check "...and it's sealed again afterwards" grep -q agentosplaceholder "$CREDS"
+"$AGENT" vault unseal >/dev/null
+check "agent vault unseal puts it back" grep -q e2e-real-access "$CREDS"
+"$AGENT" do after unsealing >/dev/null 2>&1
+check "...and stops sealing" grep -qx 'login: real' "$AGENT_STATE/observations"
+"$AGENT" vault seal >/dev/null
+check "agent vault seal resumes" lacks e2e-real-access "$(cat "$CREDS")"
 rm -rf "$HOME/.claude"
 
 section "exit codes and the audit journal"

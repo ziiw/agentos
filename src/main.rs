@@ -10,6 +10,7 @@ use agentos::proxy::{self, Allowlist, NetEvent};
 use agentos::sandbox::{self, GrantMount, Mount, RunMount};
 use agentos::store::{Access, Grant, Net, NewTask, Status, Store, Task};
 use agentos::util::{self, display_path};
+use agentos::vault::Vault;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use nix::fcntl::OFlag;
@@ -112,6 +113,15 @@ enum Command {
     },
     /// Check whether this machine can run agent sandboxes
     Doctor,
+    /// Your agent's sealed login: status, seal (move tokens to the vault) or
+    /// unseal (put them back and stop sealing)
+    Vault {
+        #[arg(value_parser = ["status", "seal", "unseal"], default_value = "status")]
+        action: String,
+        /// Which agent
+        #[arg(long, default_value = "claude")]
+        agent: String,
+    },
     /// List hosts you approved "always", or revoke one for this project
     Approvals {
         /// Forget this host (as listed) for the current project
@@ -195,6 +205,16 @@ struct DoArgs {
     task: Vec<String>,
 }
 
+struct LoginPlan {
+    vault: Arc<Vault>,
+    hosts: Vec<String>,
+    /// The credentials file in the agent's home.
+    file: PathBuf,
+    /// Placeholders in the sandbox, real tokens added by the broker. Without
+    /// the proxy (--net host) the login is unsealed for the task instead.
+    brokered: bool,
+}
+
 /// Everything needed to run one task, whether from `agent run` or `agent do`.
 struct Plan {
     title: Option<String>,
@@ -205,6 +225,8 @@ struct Plan {
     allow: Vec<String>,
     /// Credentials the broker adds on the wire.
     secrets: Vec<Secret>,
+    /// The agent's login, sealed in the vault.
+    login: Option<LoginPlan>,
     /// Read-only grants for the agent's own installation.
     install: Vec<PathBuf>,
     profile_env: Vec<(String, String)>,
@@ -245,6 +267,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Doctor => cmd_doctor(&store),
         Command::Trust { path } => cmd_trust(&store, path),
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
+        Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
     }
 }
 
@@ -293,6 +316,65 @@ fn cmd_trust(store: &Store, path: Option<PathBuf>) -> Result<i32> {
     Ok(0)
 }
 
+/// Seals the agent's login before it runs (or unseals it for a task without
+/// the proxy, to be sealed again afterwards).
+fn prepare_login(store: &Store, agent: &str, login: &profiles::Login, net: Net) -> Result<Option<LoginPlan>> {
+    let vault = Arc::new(Vault::open(store.root(), agent)?);
+    if vault.disabled() {
+        return Ok(None);
+    }
+    let file = store.agent_home(agent)?.join(login.file);
+    let err = Paint::stderr();
+    let brokered = net == Net::Proxy;
+    if brokered {
+        if vault.seal_file(&file)? > 0 {
+            eprintln!(
+                "  {}",
+                err.dim(format!("{agent}'s login is now sealed: the agent holds placeholders; `agent vault unseal` undoes it"))
+            );
+        }
+        if !vault.knows_all(&file) {
+            eprintln!("{} {agent}'s login placeholders aren't in the vault; log in again with `agent do` and /login", err.yellow("agent:"));
+        }
+    } else {
+        vault.unseal_file(&file)?;
+    }
+    Ok(Some(LoginPlan { vault, hosts: login.hosts.iter().map(|h| h.to_string()).collect(), file, brokered }))
+}
+
+fn cmd_vault(store: &Store, action: &str, agent: &str) -> Result<i32> {
+    let login = profiles::login_for(agent).with_context(|| format!("unknown agent '{agent}'"))?;
+    let vault = Vault::open(store.root(), agent)?;
+    let file = store.agent_home(agent)?.join(login.file);
+    let out = Paint::stdout();
+    match action {
+        "seal" => {
+            vault.set_disabled(false)?;
+            let n = vault.seal_file(&file)?;
+            println!("{} {agent}'s login is sealed ({n} tokens moved to the vault)", out.green("✓"));
+        }
+        "unseal" => {
+            let n = vault.unseal_file(&file)?;
+            vault.set_disabled(true)?;
+            println!("{} {agent}'s login is back in its home ({n} tokens) and won't be sealed; `agent vault seal` to resume", out.yellow("!"));
+        }
+        _ => {
+            let text = fs::read_to_string(&file).unwrap_or_default();
+            let state = if text.is_empty() {
+                "not logged in".to_string()
+            } else if vault.disabled() {
+                "unsealed (sealing is off)".to_string()
+            } else if text.contains("agentosplaceholder") {
+                if vault.knows_all(&file) { "sealed".to_string() } else { "sealed, but the vault lost its tokens: log in again".to_string() }
+            } else {
+                "not sealed yet (sealed on the next `agent do`)".to_string()
+            };
+            println!("{agent}: {state}");
+        }
+    }
+    Ok(0)
+}
+
 fn parse_secrets(specs: &[String]) -> Result<Vec<Secret>> {
     let secrets = specs.iter().map(|s| Secret::parse(s)).collect::<Result<Vec<_>>>()?;
     for (i, s) in secrets.iter().enumerate() {
@@ -336,10 +418,15 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     } else if !secrets.is_empty() {
         bail!("--secret needs the agent's default, proxied network; drop --net {net}");
     }
+    let login = match &profile.login {
+        Some(l) => prepare_login(store, profile.name, l, net)?,
+        None => None,
+    };
     execute(
         store,
         Plan {
             title: Some(title),
+            login,
             argv: profile.argv,
             grants: args.grants,
             net,
@@ -384,6 +471,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
         store,
         Plan {
             title: None,
+            login: None,
             argv: argv.clone(),
             grants: args.grants,
             net,
@@ -484,7 +572,8 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 
     let mut env = build_env(&plan.grants.env, &home)?;
     let brokered_env = plan.secrets.iter().map(|s| (s.env.clone(), s.placeholder.clone()));
-    let ca_env = (!plan.secrets.is_empty())
+    let brokering = !plan.secrets.is_empty() || plan.login.as_ref().is_some_and(|l| l.brokered);
+    let ca_env = brokering
         .then(|| {
             // Node and Bun add to their roots; curl, Python, git and OpenSSL
             // read a whole bundle (system roots + the task CA).
@@ -556,7 +645,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
         journal.append("outbox.ready", json!({ "remotes": o.remotes }))?;
     }
-    eprintln!("{}", render::banner(err, &task, outbox.is_some()));
+    eprintln!("{}", render::banner(err, &task, outbox.is_some(), plan.login.as_ref().is_some_and(|l| l.brokered)));
     // The proxy's socket must exist before the sandbox mounts it, but its
     // threads may only start once the sandbox has been forked.
     let (proxy_socket, mut proxy_listener) = if task.meta.net == Net::Proxy {
@@ -571,10 +660,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     let ask = plan.ask;
     // The CA's private key never leaves this process; only its certificate
     // is written out for the sandbox to trust.
-    let broker = if plan.secrets.is_empty() {
+    let login = plan.login;
+    let broker = if !brokering {
         None
     } else {
-        let broker = Broker::new(plan.secrets)?;
+        let vault = login.as_ref().filter(|l| l.brokered).map(|l| (l.vault.clone(), l.hosts.clone()));
+        let broker = Broker::new(plan.secrets, vault)?;
         let (ca, bundle) = (task.dir.join("ca.pem"), task.dir.join("ca-bundle.pem"));
         fs::write(&ca, broker.ca_pem())?;
         fs::write(&bundle, broker::ca_bundle(broker.ca_pem()))?;
@@ -653,6 +744,17 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     }
 
     outbox::seal(&task.dir)?;
+    // Whatever happened inside (a login with --net host, say), real tokens
+    // don't stay in the agent's home.
+    if let Some(l) = &login {
+        match l.vault.seal_file(&l.file) {
+            Ok(n) if n > 0 => {
+                journal.append("login.sealed", json!({ "tokens": n }))?;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("{} couldn't seal the agent's login: {e:#}", err.yellow("agent: warning:")),
+        }
+    }
     let pushes = outbox::pending(&task.dir)?;
     if !pushes.is_empty() {
         let held: Vec<_> = pushes.iter().map(|p| json!({ "remote": p.remote, "ref": p.refname, "sha": p.sha })).collect();

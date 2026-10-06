@@ -10,6 +10,7 @@
 //! body, or sent to any other host, stays a placeholder. Otherwise an agent
 //! could get the real key echoed back, or put it in front of the model.
 
+use crate::vault::Vault;
 use anyhow::{Context, Result, bail};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -76,13 +77,15 @@ impl Secret {
 /// The per-task CA and TLS settings for brokered hosts.
 pub struct Broker {
     secrets: Vec<Secret>,
+    /// An agent's sealed login, and the hosts it's used with.
+    vault: Option<(Arc<Vault>, Vec<String>)>,
     servers: HashMap<String, Arc<ServerConfig>>,
     client: Arc<ClientConfig>,
     ca_pem: String,
 }
 
 impl Broker {
-    pub fn new(secrets: Vec<Secret>) -> Result<Broker> {
+    pub fn new(secrets: Vec<Secret>, vault: Option<(Arc<Vault>, Vec<String>)>) -> Result<Broker> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let ca_key = KeyPair::generate()?;
         let mut ca = CertificateParams::new(Vec::<String>::new())?;
@@ -92,7 +95,8 @@ impl Broker {
         let ca_cert = ca.self_signed(&ca_key)?;
 
         let mut servers = HashMap::new();
-        for host in secrets.iter().map(|s| s.host.clone()) {
+        let vault_hosts = vault.iter().flat_map(|(_, hosts)| hosts.iter().cloned());
+        for host in secrets.iter().map(|s| s.host.clone()).chain(vault_hosts) {
             if servers.contains_key(&host) {
                 continue;
             }
@@ -118,7 +122,7 @@ impl Broker {
             .with_no_client_auth();
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-        Ok(Broker { secrets, servers, client: Arc::new(client), ca_pem: ca_cert.pem() })
+        Ok(Broker { secrets, vault, servers, client: Arc::new(client), ca_pem: ca_cert.pem() })
     }
 
     /// The CA certificate (public) the sandbox must trust.
@@ -138,7 +142,8 @@ impl Broker {
         let name = ServerName::try_from(host.to_string())?;
         let remote = StreamOwned::new(ClientConnection::new(self.client.clone(), name)?, upstream);
         let secrets: Vec<&Secret> = self.secrets.iter().filter(|s| s.host == host).collect();
-        relay_http(agent, remote, &secrets)
+        let vault = self.vault.as_ref().filter(|(_, hosts)| hosts.iter().any(|h| h == host)).map(|(v, _)| v.as_ref());
+        relay_http(agent, remote, &secrets, vault)
     }
 }
 
@@ -260,6 +265,50 @@ fn copy_body(body: Body, r: &mut impl BufRead, w: &mut impl Write) -> io::Result
     Ok(n)
 }
 
+/// Reads a whole (de-chunked) body, for the few exchanges that must be rewritten.
+fn read_body(body: Body, r: &mut impl BufRead) -> io::Result<Vec<u8>> {
+    const LIMIT: u64 = 1 << 20;
+    let mut out = Vec::new();
+    match body {
+        Body::None => {}
+        Body::Length(n) if n <= LIMIT => {
+            copy_exact(r, &mut out, n)?;
+        }
+        Body::Length(_) => return Err(io::Error::other("body too large to inspect")),
+        Body::UntilClose => {
+            r.take(LIMIT).read_to_end(&mut out)?;
+        }
+        Body::Chunked => loop {
+            let mut line = String::new();
+            r.read_line(&mut line)?;
+            let size = u64::from_str_radix(line.trim().split(';').next().unwrap_or_default().trim(), 16)
+                .map_err(|_| io::Error::other("bad chunk size"))?;
+            if size == 0 {
+                loop {
+                    let mut trailer = String::new();
+                    if r.read_line(&mut trailer)? == 0 || trailer.trim().is_empty() {
+                        break;
+                    }
+                }
+                break;
+            }
+            if out.len() as u64 + size > LIMIT {
+                return Err(io::Error::other("body too large to inspect"));
+            }
+            copy_exact(r, &mut out, size)?;
+            let mut crlf = String::new();
+            r.read_line(&mut crlf)?;
+        },
+    }
+    Ok(out)
+}
+
+/// Replaces the framing headers of a message whose body we rewrote.
+fn set_length(h: &mut Head, len: usize) {
+    h.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("content-length") && !n.eq_ignore_ascii_case("transfer-encoding"));
+    h.headers.push(("Content-Length".into(), len.to_string()));
+}
+
 fn request_body(h: &Head) -> Body {
     if h.has_token("transfer-encoding", "chunked") {
         Body::Chunked
@@ -287,7 +336,7 @@ fn response_body(method: &str, status: u16, h: &Head) -> Body {
 /// HTTP/1.1, one exchange at a time: parse each request head (to inject
 /// credentials) and frame bodies so the next head can be found; stream the
 /// responses back as they arrive.
-fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[&Secret]) -> Result<(u64, u64, u64, u64)> {
+fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[&Secret], vault: Option<&Vault>) -> Result<(u64, u64, u64, u64)> {
     let mut agent = BufReader::new(agent);
     let mut remote = BufReader::new(remote);
     let (mut up, mut down, mut requests, mut injected) = (0, 0, 0, 0);
@@ -295,9 +344,19 @@ fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[
         while let Some(raw) = read_head(&mut agent)? {
             let mut req = Head::parse(&raw);
             for (name, value) in req.headers.iter_mut() {
-                if secrets.iter().any(|s| s.inject(name, value)) {
+                if secrets.iter().any(|s| s.inject(name, value)) || vault.is_some_and(|v| v.inject_header(name, value)) {
                     injected += 1;
                 }
+            }
+            let method = req.start.split_whitespace().next().unwrap_or_default().to_string();
+            let path = req.start.split_whitespace().nth(1).unwrap_or_default().split('?').next().unwrap_or_default().to_string();
+            if let Some(v) = vault.filter(|_| method.eq_ignore_ascii_case("POST") && path.ends_with("/oauth/token")) {
+                let (n, sent, got, close) = token_exchange(&mut agent, &mut remote, req, v)?;
+                (injected, up, down, requests) = (injected + n, up + sent, down + got, requests + 1);
+                if close {
+                    return Ok(());
+                }
+                continue;
             }
             // We answer 100-continue ourselves, so the agent sends its body now.
             if req.has_token("expect", "100-continue") {
@@ -305,7 +364,6 @@ fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[
                 agent.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                 agent.get_mut().flush()?;
             }
-            let method = req.start.split_whitespace().next().unwrap_or_default().to_string();
             let head = req.serialize();
             remote.get_mut().write_all(head.as_bytes())?;
             up += head.len() as u64 + copy_body(request_body(&req), &mut agent, remote.get_mut())?;
@@ -338,6 +396,57 @@ fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// One request to an OAuth token endpoint (login or refresh), rewritten both
+/// ways: placeholder refresh token → real on the way out, new real tokens →
+/// fresh placeholders on the way back. Returns (tokens unsealed, bytes up,
+/// bytes down, close the connection).
+fn token_exchange<A: Read + Write, B: Read + Write>(
+    agent: &mut BufReader<A>,
+    remote: &mut BufReader<B>,
+    mut req: Head,
+    vault: &Vault,
+) -> io::Result<(u64, u64, u64, bool)> {
+    if req.has_token("expect", "100-continue") {
+        agent.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        agent.get_mut().flush()?;
+    }
+    // Plain bodies only: we have to read the response.
+    req.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("accept-encoding") && !n.eq_ignore_ascii_case("expect"));
+    let body = read_body(request_body(&req), agent)?;
+    let (body, unsealed) = vault.unseal_json(&body).unwrap_or((body, 0));
+    set_length(&mut req, body.len());
+    let head = req.serialize();
+    remote.get_mut().write_all(head.as_bytes())?;
+    remote.get_mut().write_all(&body)?;
+    remote.get_mut().flush()?;
+
+    let mut raw = read_head(remote)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+    let mut resp = Head::parse(&raw);
+    while resp.start.split_whitespace().nth(1).is_some_and(|s| s.starts_with('1')) {
+        raw = read_head(remote)?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        resp = Head::parse(&raw);
+    }
+    let status: u16 = resp.start.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = read_body(response_body("POST", status, &resp), remote)?;
+    let encoded = resp.get("content-encoding").is_some_and(|e| !e.eq_ignore_ascii_case("identity"));
+    let (body, close) = if encoded {
+        // Can't look inside, so it can't go to the agent: it might hold real tokens.
+        resp = Head::parse("HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+        (b"agentos: compressed token response, refusing to pass it on".to_vec(), true)
+    } else {
+        let close = resp.has_token("connection", "close");
+        // Not JSON (an error page): no tokens to seal, pass it on.
+        (vault.seal_json(&body).map(|(b, _)| b).unwrap_or(body), close)
+    };
+    resp.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("content-encoding"));
+    set_length(&mut resp, body.len());
+    let head = resp.serialize();
+    agent.get_mut().write_all(head.as_bytes())?;
+    agent.get_mut().write_all(&body)?;
+    agent.get_mut().flush()?;
+    Ok((unsealed as u64, head.len() as u64, (raw.len() + body.len()) as u64, close))
 }
 
 #[cfg(test)]
@@ -377,7 +486,7 @@ mod tests {
         let s = secret();
         let mut agent = pipe(requests);
         let mut remote = pipe(responses);
-        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s]).unwrap();
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s], None).unwrap();
         (String::from_utf8(remote.output).unwrap(), String::from_utf8(agent.output).unwrap(), n, injected)
     }
 
@@ -409,12 +518,44 @@ mod tests {
         let resps = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye";
         let mut agent = pipe(reqs);
         let mut remote = pipe(resps);
-        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s]).unwrap();
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s], None).unwrap();
         let sent = String::from_utf8(remote.output).unwrap();
         assert_eq!(sent.matches("Authorization: Bearer real-key\r\n").count(), 2);
         assert_eq!((n, injected), (2, 2));
         let got = String::from_utf8(agent.output).unwrap();
         assert!(got.contains("5\r\nhello\r\n0\r\n\r\n") && got.ends_with("bye"));
+    }
+
+    #[test]
+    fn token_endpoint_is_rewritten_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path(), "claude").unwrap();
+        let (sealed, _) = vault
+            .seal_json(br#"{"accessToken":"sk-ant-oat01-OLDACCESS","refreshToken":"sk-ant-ort01-OLDREFRESH"}"#)
+            .unwrap();
+        let sealed: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+        let (access, refresh) = (sealed["accessToken"].as_str().unwrap(), sealed["refreshToken"].as_str().unwrap());
+
+        let body = format!(r#"{{"grant_type":"refresh_token","refresh_token":"{refresh}"}}"#);
+        let reqs = format!(
+            "POST /v1/oauth/token HTTP/1.1\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\n\r\n{body}GET /api/me HTTP/1.1\r\nAuthorization: Bearer {access}\r\n\r\n",
+            body.len()
+        );
+        let token = r#"{"access_token":"sk-ant-oat01-NEWACCESS","refresh_token":"sk-ant-ort01-NEWREFRESH","expires_in":3600}"#;
+        let resps = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{token}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", token.len());
+        let mut agent = pipe(&reqs);
+        let mut remote = pipe(&resps);
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[], Some(&vault)).unwrap();
+        assert_eq!((n, injected), (2, 2));
+
+        let sent = String::from_utf8(remote.output).unwrap();
+        assert!(sent.contains("sk-ant-ort01-OLDREFRESH"), "real refresh token goes upstream");
+        assert!(!sent.to_ascii_lowercase().contains("accept-encoding"));
+        assert!(sent.contains("Authorization: Bearer sk-ant-oat01-OLDACCESS"));
+
+        let got = String::from_utf8(agent.output).unwrap();
+        assert!(!got.contains("NEWACCESS") && !got.contains("NEWREFRESH"), "new tokens reach the agent sealed: {got}");
+        assert!(got.contains("sk-ant-oat01-agentosplaceholder-") && got.ends_with("ok"));
     }
 
     #[test]

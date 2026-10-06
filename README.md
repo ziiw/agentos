@@ -82,6 +82,7 @@ scripts/dev.sh shell
 | `agent log [TASK] [--json]` | Show the journal and verify its hash chain |
 | `agent doctor` | Check this machine |
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
+| `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 
 `GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
@@ -176,6 +177,8 @@ The agent never holds your real API key. With `ANTHROPIC_API_KEY` set, `agent do
 
 Only that header, only on that host. A placeholder pasted into a request body, another header, or a request to another host stays a placeholder. Otherwise an agent could have the real key echoed back to it, or put it in front of the model.
 
+**Logins too.** If you logged Claude in with a claude.ai account (`agent do`, then `/login`), the tokens in its home are **sealed**. The real ones move to a vault in the task store, and the agent's file keeps look-alike placeholders (`sk-ant-oat01-agentosplaceholder-…`). On API calls, the proxy swaps the access-token placeholder in `Authorization`. On Anthropic's token endpoint it works both ways: the placeholder refresh token goes out as the real one, and fresh tokens come back as new placeholders. So even a `/login` inside the sandbox never hands the agent a real token. `agent vault` shows the state, and `agent vault unseal` puts the real tokens back and stops sealing, if you ever need it. With `--net host` there's no proxy to swap tokens, so the login is unsealed for that task and sealed again afterwards.
+
 Any command can use it:
 
 ```bash
@@ -202,7 +205,6 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 
 - **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
 - **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
-- **A Claude *login* (as opposed to an API key) is still visible to the agent**: it lives in the agent's own home. API keys are brokered; logins aren't yet.
 - **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
 - **The syscall filter is a denylist** (seccomp): it blocks typing into your terminal (TIOCSTI), new namespaces, mounts, kernel modules, bpf, io_uring, keyrings and userfaultfd. Kernel bugs reachable through the remaining syscalls are out of scope until the microVM tier.

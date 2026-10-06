@@ -16,6 +16,10 @@ echo $((runs + 1)) > "$state/runs"
     *) echo "api-key: real" ;;
   esac
   if [ -n "${HTTPS_PROXY:-}" ]; then echo "proxy: set"; else echo "proxy: unset"; fi
+  creds="$state/.credentials.json"
+  if [ ! -f "$creds" ]; then echo "login: none"
+  elif grep -q agentosplaceholder "$creds"; then echo "login: placeholder"
+  else echo "login: real"; fi
 } > "$state/observations"
 
 # Like real Claude Code with a claude.ai login: reach for the MCP connector proxy.

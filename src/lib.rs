@@ -17,3 +17,4 @@ pub mod proxy;
 pub mod sandbox;
 pub mod store;
 pub mod util;
+pub mod vault;

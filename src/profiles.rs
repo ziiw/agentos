@@ -35,6 +35,8 @@ pub struct Profile {
     pub allow: Vec<&'static str>,
     /// Credentials brokered when set in your environment: (variable, host, header).
     pub brokered: Vec<(&'static str, &'static str, &'static str)>,
+    /// The agent's own login, sealed in the vault while it runs.
+    pub login: Option<Login>,
     /// Hosts the agent reaches for that stay closed on purpose: (host, why).
     /// Refusals are journaled, and explained once instead of warned about.
     pub expected_denials: Vec<(&'static str, &'static str)>,
@@ -82,6 +84,7 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
             ("ANTHROPIC_API_KEY", "api.anthropic.com", "x-api-key"),
             ("ANTHROPIC_AUTH_TOKEN", "api.anthropic.com", "authorization"),
         ],
+        login: Some(claude_login()),
         expected_denials: vec![(
             "mcp-proxy.anthropic.com",
             "Claude's remote MCP connectors, which can reach your other accounts",
@@ -92,6 +95,28 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
         allow: vec!["api.anthropic.com", "console.anthropic.com", "platform.claude.com", "claude.ai"],
         output,
     })
+}
+
+pub struct Login {
+    /// Credentials file, relative to the agent's home.
+    pub file: &'static str,
+    /// Hosts the tokens are sent to (API calls and the token endpoint).
+    pub hosts: Vec<&'static str>,
+}
+
+/// The login spec of a known agent, without needing it installed.
+pub fn login_for(agent: &str) -> Option<Login> {
+    match agent {
+        "claude" => Some(claude_login()),
+        _ => None,
+    }
+}
+
+fn claude_login() -> Login {
+    Login {
+        file: ".claude/.credentials.json",
+        hosts: vec!["api.anthropic.com", "console.anthropic.com", "platform.claude.com", "claude.ai"],
+    }
 }
 
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
