@@ -18,6 +18,8 @@ echo $((runs + 1)) > "$state/runs"
   if [ -n "${HTTPS_PROXY:-}" ]; then echo "proxy: set"; else echo "proxy: unset"; fi
 } > "$state/observations"
 
+# Like real Claude Code with a claude.ai login: reach for the MCP connector proxy.
+command -v curl >/dev/null && curl -s -m 5 -o /dev/null https://mcp-proxy.anthropic.com/ 2>/dev/null
 echo "plain line from the agent"
 cat <<EOF
 {"type":"system","subtype":"init","session_id":"fake","model":"fake-model-1","tools":["Write","Bash"]}

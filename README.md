@@ -80,6 +80,7 @@ scripts/dev.sh shell
 | `agent rollback [TASK] [PATH…]` | Discard changes (all, or under PATHs) |
 | `agent log [TASK] [--json]` | Show the journal and verify its hash chain |
 | `agent doctor` | Check this machine |
+| `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
 
 `GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]` and `--no-cwd`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
 
@@ -120,7 +121,30 @@ The proxy accepts `CONNECT` to allowlisted hosts only, refuses hosts that resolv
 agent: blocked pypi.org:443: not in the allowlist (allow it with --allow pypi.org)
 ```
 
+Some hosts an agent reaches for stay closed on purpose. Claude, when logged in with a claude.ai account, tries `mcp-proxy.anthropic.com` for its remote MCP connectors, which can reach your other accounts. agentos explains that once per task, journals it, and doesn't count it as a problem.
+
 `agent log` lists every connection: `✓ api.anthropic.com:443 · ↑1.9 kB ↓4.8 kB · 228ms`.
+
+## Configuration
+
+Two optional files, in TOML:
+
+```toml
+[network]
+allow = ["@pypi", "api.github.com"]   # presets: @pypi @npm @crates @github @go
+
+[files]
+hide = [".env"]
+ro = ["~/.cargo"]
+
+[secrets]                             # your file only
+GITHUB_TOKEN = "api.github.com"       # header defaults to authorization (Bearer)
+```
+
+- **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`; they're brokered whenever the variable is set in your environment and the task uses the allowlist network.
+- **`.agentos.toml` in a project** (the current directory or a parent, below `$HOME`) can allow hosts, and hide or grant read-only paths *inside the project*. It comes with the repo, so agentos ignores it until you've read it and run `agent trust`, and again after any change. That includes a change an agent made and you committed: `agent diff` flags it. Without this, an agent could widen its own permissions for the next run, and a cloned repo could send your tokens anywhere.
+
+With an allowlist from either file, `agent run` uses the proxied network instead of none.
 
 ## Credentials
 
@@ -162,6 +186,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **Writable grants must be directories**, and their paths can't contain `,` `:` or `\`.
 - **Conflict detection uses mtimes.** If you *delete* a file on the host that the agent modified, commit recreates it without warning.
 - **Only the top-level `.gitignore` of a grant is read**, not nested ones.
+- **`agent trust` records what you saw, not what you understood.** Read the file it prints.
 - **The journal is tamper-evident against the agent, not against you.** Anchoring its head (TPM, remote witness) is a later phase.
 - **Landlock is best-effort.** It's used when the kernel has it (`agent doctor` tells you). Namespaces do the isolation either way.
 - **Grants are mounted at their canonical path.** If `~/app` is a symlink, the agent sees the real path.

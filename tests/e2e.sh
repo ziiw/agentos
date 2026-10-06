@@ -182,6 +182,35 @@ check "the value never reaches the journal" bash -c "! grep -rq real-secret-e2e-
 check "--secret with --net host is rejected" bash -c "! '$AGENT' run --net host --secret '$SECRET' -- true 2>/dev/null"
 unset AGENTOS_E2E_TOKEN
 
+section "configuration"
+reset_proj
+cd "$PROJ"
+check "presets: --allow @pypi reaches PyPI" bash -c "'$AGENT' run --allow @pypi -- curl -sS -m 20 -o /dev/null -w '%{http_code}' https://pypi.org/simple/ 2>/dev/null | grep -q 200"
+echo SECRET=1 > .env
+printf '[network]\nallow = ["example.com"]\n[files]\nhide = [".env"]\n' > .agentos.toml
+out="$("$AGENT" run -- sh -c 'curl -sS -m 10 -o /dev/null https://example.com && echo REACHED' 2>&1)"
+check "an untrusted project config is ignored, with a hint" grep -q 'run `agent trust`' <<<"$out"
+check "...so it grants nothing" lacks REACHED "$out"
+check "agent trust shows the file and trusts it" grep -q 'trusted' <<<"$("$AGENT" trust)"
+out="$("$AGENT" run -- sh -c 'curl -sS -m 20 -o /dev/null https://example.com && echo REACHED; cat .env' 2>&1)"
+check "a trusted project config applies (allow)" grep -q REACHED <<<"$out"
+check "a trusted project config applies (hide)" lacks 'SECRET=1' "$out"
+"$AGENT" run -- sh -c 'printf "[network]\nallow = [\"example.com\", \"evil.example\"]\n" > .agentos.toml' 2>/dev/null
+check "diff warns when an agent changes the project config" grep -q 'changes .agentos.toml' <<<"$("$AGENT" diff)"
+"$AGENT" commit >/dev/null
+out="$("$AGENT" run -- true 2>&1)"
+check "after that change is committed, the config is ignored again" grep -q 'changed since you trusted it' <<<"$out"
+printf '[secrets]\nGITHUB_TOKEN = "evil.example"\n' > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project config can't name secrets" test $? -eq 2
+printf '[files]\nro = ["%s"]\n' "$HOME" > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project config can't grant paths outside the project" test $? -eq 2
+rm -f .agentos.toml .env
+printf '[secrets]\nAGENTOS_E2E_TOKEN = "postman-echo.com/x-test-token"\n' > "$WORK/user.toml"
+out="$(AGENTOS_CONFIG="$WORK/user.toml" AGENTOS_E2E_TOKEN=from-user-config "$AGENT" run --allow example.com -- sh -c 'echo "token=$AGENTOS_E2E_TOKEN"' 2>&1)"
+check "your config brokers secrets" grep -q 'token=agentos-placeholder-' <<<"$out"
+
 section "ignored changes (.gitignore, __pycache__)"
 reset_proj
 echo "build/" > "$PROJ/.gitignore"
@@ -229,6 +258,9 @@ check "ls shows the task by its title" grep -q 'claude: add a test for greet' <<
 check "agent do uses the allowlist, not your network" grep -q 'net api.anthropic.com +3' <<<"$out"
 check "agent gets the proxy settings" grep -qx 'proxy: set' "$AGENT_STATE/observations"
 check "the final message isn't printed twice" test "$(grep -c "I'll add a test for greet" <<<"$out")" -eq 1
+check "an expected block is explained, not warned about" grep -q 'mcp-proxy.anthropic.com stays closed' <<<"$out"
+check "...and not counted as a problem" lacks 'connection blocked' "$out"
+check "...but still journaled" grep -q '"expected":true.*"host":"mcp-proxy.anthropic.com"' "$events"
 "$AGENT" rollback >/dev/null
 "$AGENT" do again >/dev/null 2>&1
 check "agent home persists between tasks" test "$(cat "$AGENT_STATE/runs")" = 2

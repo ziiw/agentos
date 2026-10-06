@@ -70,7 +70,16 @@ pub struct Change {
 }
 
 /// Generated files nobody wants committed, on top of the project's .gitignore.
-const BUILTIN_IGNORES: &[&str] = &["__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".DS_Store"];
+const BUILTIN_IGNORES: &[&str] = &[
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".venv/",
+    "node_modules/",
+    ".DS_Store",
+];
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct Summary {

@@ -1,5 +1,6 @@
 use agentos::broker::{self, Broker, Secret};
 use agentos::changes::{self, Summary};
+use agentos::config;
 use agentos::doctor::{self, Level};
 use agentos::journal::{Integrity, Journal};
 use agentos::profiles::{self, AgentEvent, Output};
@@ -17,7 +18,8 @@ use std::io::{BufRead, BufReader, IsTerminal};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -97,6 +99,11 @@ enum Command {
     },
     /// Check whether this machine can run agent sandboxes
     Doctor,
+    /// Review a project's .agentos.toml and let agentos apply it
+    Trust {
+        /// The file (default: the nearest .agentos.toml from here)
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
@@ -134,9 +141,10 @@ struct GrantArgs {
 struct RunArgs {
     #[command(flatten)]
     grants: GrantArgs,
-    /// Network: none (loopback only) or host. --allow gives an allowlist instead.
-    #[arg(long, default_value = "none")]
-    net: Net,
+    /// Network: none (loopback only, the default) or host. --allow, or an allow
+    /// list in your config, gives an allowlist instead.
+    #[arg(long)]
+    net: Option<Net>,
     /// The command to run
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
     command: Vec<String>,
@@ -178,6 +186,8 @@ struct Plan {
     /// Agent profile name: gives the task a persistent home.
     agent: Option<&'static str>,
     output: Output,
+    /// Hosts the agent reaches for that stay closed on purpose: (host, why).
+    expected_denials: Vec<(&'static str, &'static str)>,
     /// Fail rather than run without the current directory.
     needs_cwd: bool,
 }
@@ -204,12 +214,50 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Rollback { task, paths } => cmd_rollback(&store, task.as_deref(), &paths),
         Command::Log { task, json } => cmd_log(&store, task.as_deref(), json),
         Command::Doctor => cmd_doctor(&store),
+        Command::Trust { path } => cmd_trust(&store, path),
     }
 }
 
 fn home_dir() -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
     Ok(fs::canonicalize(&home).unwrap_or(home))
+}
+
+/// Merges your config and a trusted project config into this task's grants.
+/// Returns the hosts they allow and the secrets they broker (those set in
+/// your environment).
+fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<(Vec<String>, Vec<Secret>)> {
+    let settings = config::load(store.root(), &std::env::current_dir()?, &home_dir()?)?;
+    for note in &settings.notes {
+        eprintln!("{} {note}", Paint::stderr().yellow("agent:"));
+    }
+    grants.ro.extend(settings.ro);
+    grants.hide.extend(settings.hide);
+    let mut secrets = Vec::new();
+    for (name, target) in settings.secrets {
+        if std::env::var_os(&name).is_some() {
+            secrets.push(Secret::parse(&format!("{name}={target}"))?);
+        }
+    }
+    Ok((settings.allow, secrets))
+}
+
+fn cmd_trust(store: &Store, path: Option<PathBuf>) -> Result<i32> {
+    let home = home_dir()?;
+    let path = match path {
+        Some(p) => fs::canonicalize(&p).with_context(|| format!("{}: no such file", p.display()))?,
+        None => config::find_project_config(&std::env::current_dir()?, &home)
+            .context("no .agentos.toml here or in a parent directory (below your home)")?,
+    };
+    config::check_project(&path, &home)?;
+    let out = Paint::stdout();
+    println!("{}\n", out.bold(display_path(&path)));
+    for line in fs::read_to_string(&path)?.lines() {
+        println!("  {line}");
+    }
+    config::trust(store.root(), &path)?;
+    println!("\n{} trusted: agentos applies it from now on, and ignores it again if it changes", out.green("✓"));
+    Ok(0)
 }
 
 fn parse_secrets(specs: &[String]) -> Result<Vec<Secret>> {
@@ -222,7 +270,7 @@ fn parse_secrets(specs: &[String]) -> Result<Vec<Secret>> {
     Ok(secrets)
 }
 
-fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
+fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     let task = (!args.task.is_empty()).then(|| args.task.join(" "));
     if task.is_none() && !std::io::stdin().is_terminal() {
         bail!("give the agent a task: agent do \"…\"");
@@ -233,19 +281,22 @@ fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
         Some(t) => format!("{}: {t}", profile.name),
         None => format!("{} (interactive)", profile.name),
     };
+    let (config_allow, config_secrets) = apply_config(store, &mut args.grants)?;
     let net = args.net.unwrap_or(profile.net);
     if net != Net::Proxy && !args.grants.allow.is_empty() {
         bail!("--allow only applies to the agent's default, proxied network; drop --net {net}");
     }
     let mut allow: Vec<String> = profile.allow.iter().map(|h| h.to_string()).collect();
+    allow.extend(config_allow);
     allow.extend(args.grants.allow.iter().cloned());
     let mut secrets = parse_secrets(&args.grants.secret)?;
     if net == Net::Proxy {
-        for (var, host, header) in &profile.brokered {
-            if let Ok(value) = std::env::var(var) {
-                if !secrets.iter().any(|s| s.env == *var) {
-                    secrets.push(Secret::new(var, host, header, value));
-                }
+        let from_profile = profile.brokered.iter().filter_map(|(var, host, header)| {
+            std::env::var(var).ok().map(|value| Secret::new(var, host, header, value))
+        });
+        for secret in from_profile.chain(config_secrets) {
+            if !secrets.iter().any(|s| s.env == secret.env) {
+                secrets.push(secret);
             }
         }
     } else if !secrets.is_empty() {
@@ -265,20 +316,33 @@ fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
             pass_env: profile.pass_env,
             agent: Some(profile.name),
             output: profile.output,
+            expected_denials: profile.expected_denials,
             needs_cwd: true,
         },
     )
 }
 
-fn cmd_run(store: &Store, args: RunArgs) -> Result<i32> {
+fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     let argv = args.command;
-    let secrets = parse_secrets(&args.grants.secret)?;
-    let net = match (args.grants.allow.is_empty() && secrets.is_empty(), args.net) {
-        (true, net) => net,
-        (false, Net::Host) => bail!("--allow/--secret and --net host contradict each other: they mean only those hosts"),
-        (false, _) => Net::Proxy,
+    let (config_allow, config_secrets) = apply_config(store, &mut args.grants)?;
+    let mut secrets = parse_secrets(&args.grants.secret)?;
+    let asked = !args.grants.allow.is_empty() || !secrets.is_empty();
+    let net = match args.net {
+        Some(Net::Host) if asked => bail!("--allow/--secret and --net host contradict each other: they mean only those hosts"),
+        Some(net) => net,
+        None if asked || !config_allow.is_empty() => Net::Proxy,
+        None => Net::None,
     };
-    let allow = args.grants.allow.clone();
+    let mut allow = Vec::new();
+    if net == Net::Proxy {
+        allow.extend(config_allow);
+        allow.extend(args.grants.allow.iter().cloned());
+        for secret in config_secrets {
+            if !secrets.iter().any(|s| s.env == secret.env) {
+                secrets.push(secret);
+            }
+        }
+    }
     let code = execute(
         store,
         Plan {
@@ -293,6 +357,7 @@ fn cmd_run(store: &Store, args: RunArgs) -> Result<i32> {
             pass_env: Vec::new(),
             agent: None,
             output: Output::Inherit,
+            expected_denials: Vec::new(),
             needs_cwd: false,
         },
     )?;
@@ -343,8 +408,11 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
                     display_path(store.root())
                 );
             }
-            if grants.iter().any(|g| g.path == path) {
-                bail!("{} is granted twice", display_path(&path));
+            if let Some(g) = grants.iter().find(|g| g.path == path) {
+                if g.access == access {
+                    continue;
+                }
+                bail!("{} is granted both read-only and read-write", display_path(&path));
             }
             grants.push(Grant { path, access, layer: None });
         }
@@ -442,6 +510,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         (None, None)
     };
     let blocked = Arc::new(AtomicUsize::new(0));
+    let expected_denials = plan.expected_denials;
     // The CA's private key never leaves this process; only its certificate
     // is written out for the sandbox to trust.
     let (broker, run_files) = if plan.secrets.is_empty() {
@@ -500,7 +569,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
         setup_error = report.error.clone();
         if let Some(listener) = proxy_listener.take() {
-            proxy_handle = Some(proxy::serve(listener, allowlist, broker, net_sink(journal.clone(), blocked.clone(), err)));
+            proxy_handle = Some(proxy::serve(listener, allowlist, broker, net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err)));
         }
         if let Some(rx) = stdout_rx {
             outcome = follow_agent(rx, &journal, &cwd);
@@ -539,10 +608,24 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 
 /// Records each connection through the egress proxy and says so, live,
 /// when one is refused.
-fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, err: Paint) -> proxy::Sink {
+fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(&'static str, &'static str)>, err: Paint) -> proxy::Sink {
+    let explained = Mutex::new(HashSet::new());
     Arc::new(move |event: NetEvent| {
-        let _ = journal.append("net.connect", json!(event));
-        if !event.allowed {
+        let expected_why = expected
+            .iter()
+            .find(|(host, _)| *host == event.host && event.reason.as_deref() == Some("not in the allowlist"))
+            .map(|(_, why)| *why);
+        let mut data = json!(event);
+        if expected_why.is_some() {
+            data["expected"] = json!(true);
+        }
+        let _ = journal.append("net.connect", data);
+        if let Some(why) = expected_why {
+            // Deliberately closed: say why once, don't count it as a problem.
+            if explained.lock().is_ok_and(|mut seen| seen.insert(event.host.clone())) {
+                eprintln!("  {}", err.dim(format!("{} stays closed: {why} (--allow {} opens it)", event.host, event.host)));
+            }
+        } else if !event.allowed {
             blocked.fetch_add(1, Ordering::SeqCst);
             let target = format!("{}:{}", event.host, event.port);
             let why = event.reason.as_deref().unwrap_or("refused");

@@ -122,11 +122,12 @@ It's verified at three levels:
 | M2: Claude Code profile, per-agent persistent home, streamed progress, tool calls and cost journaled | ✅ accepted with real Claude (2026-10-06) |
 | M3: egress proxy with an allowlist, replacing `net host`; ignored files left out of commits | ✅ automated; real Claude verified through the proxy (free 401 check); human acceptance pending |
 | M4: CI on ubuntu-24.04 (x86_64 + arm64): Landlock enforced, AppArmor path | ✅ green on GitHub Actions |
-| M5: credential broker: the agent holds a placeholder, the proxy adds the real key on the wire | ✅ automated (echo server proves header-only injection) |
+| M5: credential broker: the agent holds a placeholder, the proxy adds the real key on the wire | ✅ CI green; real Claude Code verified (13/13 requests injected, free 401 check) |
+| M6: configuration: host presets, your config + project config with `agent trust`, expected denials | ✅ automated |
 
 ### Phase 1 backlog, in order
 
-1. **Profiles.** Claude Code is built in (`src/profiles.rs`). Next: profiles as files (grants, env, network policy, budget) and verified recipes for Codex and Aider.
+1. **Profiles and configuration.** Claude Code is built in (`src/profiles.rs`). ✅ Config files: `~/.config/agentos/config.toml` and trust-on-review `.agentos.toml` (M6). Next: agent profiles as files, verified recipes for Codex and Aider, budgets.
 2. **Egress proxy.** ✅ Done without veth or root: the sandbox has only loopback, and a forwarder inside relays to the proxy through a unix socket. Next: presets (`--allow @pypi`), upstream corporate proxies.
 3. **Credential broker.** ✅ Per-task CA, TLS termination for brokered hosts only, placeholder → real value in one header. Next: OAuth logins (keep refresh tokens outside), keys from the OS keychain instead of the environment.
 4. **Effects outbox.** `git push`, mail and API writes are held as pending effects next to the file diff. `agent commit` releases them, or policy auto-releases low-risk ones.

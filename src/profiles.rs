@@ -35,6 +35,9 @@ pub struct Profile {
     pub allow: Vec<&'static str>,
     /// Credentials brokered when set in your environment: (variable, host, header).
     pub brokered: Vec<(&'static str, &'static str, &'static str)>,
+    /// Hosts the agent reaches for that stay closed on purpose: (host, why).
+    /// Refusals are journaled, and explained once instead of warned about.
+    pub expected_denials: Vec<(&'static str, &'static str)>,
     pub output: Output,
 }
 
@@ -79,6 +82,10 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
             ("ANTHROPIC_API_KEY", "api.anthropic.com", "x-api-key"),
             ("ANTHROPIC_AUTH_TOKEN", "api.anthropic.com", "authorization"),
         ],
+        expected_denials: vec![(
+            "mcp-proxy.anthropic.com",
+            "Claude's remote MCP connectors, which can reach your other accounts",
+        )],
         net: Net::Proxy,
         // The API, plus what logging in and refreshing a login talk to.
         // Anything else shows up as "blocked" in the output and the journal.

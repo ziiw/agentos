@@ -7,6 +7,7 @@
 
 pub mod broker;
 pub mod changes;
+pub mod config;
 pub mod doctor;
 pub mod journal;
 pub mod profiles;

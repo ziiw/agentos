@@ -290,6 +290,14 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool, show_ign
     if hidden > 0 {
         let _ = writeln!(out, "  {}", p.dim(format!("+ {}, not committed (--all to see and include them)", ignored_summary(changes))));
     }
+    if shown.iter().any(|c| c.path.file_name().is_some_and(|n| n == agentos::config::PROJECT_FILE)) {
+        let _ = writeln!(
+            out,
+            "\n{} this task changes {} (what agents may access). Once committed, agentos ignores it until you run `agent trust` again.",
+            p.yellow("!"),
+            agentos::config::PROJECT_FILE
+        );
+    }
     if stat_only {
         return out;
     }
@@ -421,6 +429,8 @@ fn describe(p: Paint, e: &Event) -> String {
                     bytes(d["bytes_in"].as_u64().unwrap_or(0)),
                     util::duration(d["ms"].as_u64().unwrap_or(0))
                 )
+            } else if d["expected"].as_bool() == Some(true) {
+                format!("{} {target} · closed on purpose", p.dim("✗ blocked"))
             } else {
                 format!("{} {target} · {}", p.red("✗ blocked"), s(&d["reason"]))
             }

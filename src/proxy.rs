@@ -38,12 +38,39 @@ struct Rule {
     port: u16,
 }
 
+/// `--allow @name`: the hosts a package manager or service needs.
+pub const PRESETS: &[(&str, &[&str])] = &[
+    ("pypi", &["pypi.org", "files.pythonhosted.org"]),
+    ("npm", &["registry.npmjs.org"]),
+    ("crates", &["crates.io", "index.crates.io", "static.crates.io"]),
+    ("github", &["github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com", "raw.githubusercontent.com"]),
+    ("go", &["proxy.golang.org", "sum.golang.org"]),
+];
+
+/// Expands `@preset` entries into their hosts.
+pub fn expand(entries: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in entries {
+        match entry.strip_prefix('@') {
+            Some(name) => {
+                let Some((_, hosts)) = PRESETS.iter().find(|(n, _)| *n == name) else {
+                    let known: Vec<String> = PRESETS.iter().map(|(n, _)| format!("@{n}")).collect();
+                    bail!("--allow {entry}: unknown preset (known: {})", known.join(" "));
+                };
+                out.extend(hosts.iter().map(|h| h.to_string()));
+            }
+            None => out.push(entry.clone()),
+        }
+    }
+    Ok(out)
+}
+
 impl Allowlist {
-    /// Entries look like `api.example.com`, `*.example.com` or `host:8443`.
-    /// The port defaults to 443.
+    /// Entries look like `api.example.com`, `*.example.com`, `host:8443` or
+    /// a preset like `@pypi`. The port defaults to 443.
     pub fn parse(entries: &[String]) -> Result<Allowlist> {
         let mut rules = Vec::new();
-        for entry in entries {
+        for entry in &expand(entries)? {
             let e = entry.trim().to_ascii_lowercase();
             let (host, port) = match e.rsplit_once(':') {
                 Some((h, p)) => (h, p.parse::<u16>().with_context(|| format!("--allow {entry}: bad port"))?),
@@ -338,6 +365,11 @@ mod tests {
         assert!(!a.allows("internal.dev", 443));
         assert!(Allowlist::parse(&["https://x.com/path".into()]).is_err());
         assert!(Allowlist::parse(&["*".into()]).is_err());
+
+        let p = list(&["@pypi", "@github"]);
+        assert!(p.allows("files.pythonhosted.org", 443) && p.allows("api.github.com", 443));
+        assert!(!p.allows("example.com", 443));
+        assert!(Allowlist::parse(&["@nope".into()]).is_err());
     }
 
     #[test]
