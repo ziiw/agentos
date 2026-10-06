@@ -127,8 +127,8 @@ It's verified at three levels:
 | M7: live approvals: unlisted hosts are asked about at the terminal while the connection waits; "always" remembered per project | ✅ CI green |
 | M8: git push outbox: pushes held per remote, replayed from your own git on commit | ✅ CI green |
 | M9: login brokering: OAuth tokens sealed in a vault; placeholders in the sandbox; token endpoint rewritten both ways | ✅ CI green; real Claude verified with fake tokens (API + refresh paths) |
-| M10: agentd console: tasks, diffs, commit/push/rollback and approvals in a browser; first answer wins; push notifications | ✅ automated + checked in a browser |
-| M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ see CI |
+| M10: agentd console: tasks, diffs, commit/push/rollback and approvals in a browser; first answer wins; push notifications | ✅ CI green + checked in a browser |
+| M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and runs doctor + run/diff/commit |
 
 ### Phase 1 backlog, in order
 
