@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod render;
+mod web;
 
 /// Environment variables an agent inherits by default. Anything else (API
 /// keys, tokens) must be passed explicitly with --env.
@@ -122,6 +123,15 @@ enum Command {
         #[arg(long, default_value = "claude")]
         agent: String,
     },
+    /// Run agentd: a web console for tasks and approvals (phone-friendly)
+    Serve {
+        /// Address to listen on; 0.0.0.0:PORT to reach it from other devices
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        listen: String,
+        /// Ping this URL on each new question (e.g. https://ntfy.sh/your-topic)
+        #[arg(long, value_name = "URL")]
+        notify: Option<String>,
+    },
     /// List hosts you approved "always", or revoke one for this project
     Approvals {
         /// Forget this host (as listed) for the current project
@@ -215,6 +225,15 @@ struct LoginPlan {
     brokered: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    Never,
+    /// agentd's console only (the terminal belongs to a full-screen agent).
+    Console,
+    /// The terminal and agentd's console, if running.
+    TerminalAndConsole,
+}
+
 /// Everything needed to run one task, whether from `agent run` or `agent do`.
 struct Plan {
     title: Option<String>,
@@ -236,8 +255,8 @@ struct Plan {
     output: Output,
     /// Hosts the agent reaches for that stay closed on purpose: (host, why).
     expected_denials: Vec<(&'static str, &'static str)>,
-    /// Ask at the terminal about hosts outside the allowlist.
-    ask: bool,
+    /// Who to ask about hosts outside the allowlist.
+    ask: Ask,
     /// Fail rather than run without the current directory.
     needs_cwd: bool,
 }
@@ -267,6 +286,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Doctor => cmd_doctor(&store),
         Command::Trust { path } => cmd_trust(&store, path),
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
+        Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
     }
 }
@@ -436,8 +456,13 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             profile_env: profile.env,
             pass_env: profile.pass_env,
             agent: Some(profile.name),
-            // Claude's own full-screen interface owns the terminal: don't talk over it.
-            ask: matches!(profile.output, Output::ClaudeStream) && !no_ask,
+            // Claude's own full-screen interface owns the terminal: don't talk
+            // over it, but agentd's console can still ask.
+            ask: match (no_ask, &profile.output) {
+                (true, _) => Ask::Never,
+                (false, Output::ClaudeStream) => Ask::TerminalAndConsole,
+                (false, Output::Inherit) => Ask::Console,
+            },
             output: profile.output,
             expected_denials: profile.expected_denials,
             needs_cwd: true,
@@ -483,7 +508,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             agent: None,
             output: Output::Inherit,
             expected_denials: Vec::new(),
-            ask,
+            ask: if ask { Ask::TerminalAndConsole } else { Ask::Never },
             needs_cwd: false,
         },
     )?;
@@ -604,7 +629,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         hidden,
         net: plan.net,
         allow,
-        ask: plan.ask && plan.net == Net::Proxy,
+        ask: plan.ask != Ask::Never && plan.net == Net::Proxy,
         secrets: plan.secrets.iter().map(|s| s.env.clone()).collect(),
         env: env_names,
     })?;
@@ -721,7 +746,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
         setup_error = report.error.clone();
         if let Some(listener) = proxy_listener.take() {
-            let approver = ask.then(|| approver(store, &cwd, journal.clone(), expected_denials.clone(), err)).flatten();
+            let approver = (ask != Ask::Never).then(|| approver(store, &cwd, ask, &task, journal.clone(), expected_denials.clone(), err)).flatten();
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
             proxy_handle = Some(proxy::serve(listener, allowlist, broker, approver, sink));
         }
@@ -779,9 +804,18 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 
 /// Asks at the terminal about hosts outside the allowlist, if there's a
 /// terminal to ask at.
-fn approver(store: &Store, cwd: &Path, journal: Journal, expected: Vec<(&'static str, &'static str)>, err: Paint) -> Option<proxy::Approver> {
+fn approver(
+    store: &Store,
+    cwd: &Path,
+    ask: Ask,
+    task: &Task,
+    journal: Journal,
+    expected: Vec<(&'static str, &'static str)>,
+    err: Paint,
+) -> Option<proxy::Approver> {
     let home = home_dir().ok()?;
-    let asker = Asker::open(store.root(), &approvals::project_root(cwd, &home))?;
+    let project = approvals::project_root(cwd, &home);
+    let asker = Asker::open(store.root(), &project, ask == Ask::TerminalAndConsole, task.id(), &render::title(task))?;
     Some(Arc::new(move |host: &str, port: u16| {
         if expected.iter().any(|(h, _)| *h == host) {
             return false;

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentd</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e4e3df;
+    --accent: #3b5bdb; --ok: #2b8a3e; --warn: #c27a00; --bad: #c92a2a; --add: #e6f4ea; --del: #fdecea;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --card: #1e1e1c; --text: #ecebe6; --muted: #9a9993; --line: #2e2e2b;
+      --accent: #748ffc; --ok: #69db7c; --warn: #ffc078; --bad: #ff8787; --add: #1b3324; --del: #3b1d1d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 20px 16px 64px; }
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 20px; }
+  header h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-left: auto; align-self: center; }
+  .dot.live { background: var(--ok); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 26px 0 10px; font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; }
+  .ask { border-color: var(--warn); }
+  .ask .what { font-size: 16px; margin: 2px 0 6px; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  button { font: inherit; font-size: 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--text);
+           padding: 8px 14px; cursor: pointer; min-height: 40px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  .task { cursor: pointer; }
+  .task .title { font-weight: 600; overflow-wrap: anywhere; }
+  .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .badge.running { color: var(--accent); border-color: var(--accent); }
+  .badge.committed { color: var(--ok); border-color: var(--ok); }
+  .badge.crashed, .badge.failed { color: var(--bad); border-color: var(--bad); }
+  .badge.exited { color: var(--warn); border-color: var(--warn); }
+  .counts { font-family: var(--mono); font-size: 12px; }
+  .a { color: var(--ok); } .m { color: var(--warn); } .d { color: var(--bad); } .p { color: var(--accent); }
+  pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+        padding: 10px 12px; overflow-x: auto; white-space: pre; margin: 10px 0 0; }
+  pre .add { background: var(--add); display: block; } pre .del { background: var(--del); display: block; }
+  pre .hunk { color: var(--accent); display: block; }
+  .empty { color: var(--muted); font-size: 14px; }
+  .notice { background: var(--card); border: 1px solid var(--bad); border-radius: 12px; padding: 14px 16px; }
+  .output { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>agentos</h1><span class="sub">agentd console</span><span class="dot" id="dot" title="connection"></span>
+  </header>
+  <div id="notice"></div>
+  <section id="asks"></section>
+  <h2>Tasks</h2>
+  <section id="tasks"><p class="empty">Loading…</p></section>
+</main>
+<script>
+(() => {
+  const store = {
+    get() { try { return localStorage.getItem("agentd-token"); } catch { return null; } },
+    set(v) { try { localStorage.setItem("agentd-token", v); } catch {} },
+  };
+  const fromHash = new URLSearchParams(location.hash.slice(1)).get("token");
+  if (fromHash) { store.set(fromHash); history.replaceState(null, "", location.pathname); }
+  let token = fromHash || store.get();
+  let openTask = null;
+  let lastTasks = [];
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const ago = (ms) => {
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return s + "s ago"; if (s < 3600) return Math.round(s / 60) + "m ago";
+    if (s < 86400) return Math.round(s / 3600) + "h ago"; return Math.round(s / 86400) + "d ago";
+  };
+
+  async function api(path, body) {
+    const res = await fetch(path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (res.status === 401) throw new Error("unauthorized");
+    return res.json();
+  }
+
+  function colorDiff(text) {
+    return text.split("\n").map((l) => {
+      const e = esc(l);
+      if (l.startsWith("@@")) return `<span class="hunk">${e}</span>`;
+      if (l.startsWith("+") && !l.startsWith("+++")) return `<span class="add">${e}</span>`;
+      if (l.startsWith("-") && !l.startsWith("---")) return `<span class="del">${e}</span>`;
+      return e;
+    }).join("\n");
+  }
+
+  function renderAsks(asks) {
+    if (!asks.length) { $("asks").innerHTML = ""; return; }
+    $("asks").innerHTML = `<h2>Waiting for you</h2>` + asks.map((q) => {
+      const project = q.project.split("/").filter(Boolean).pop() || q.project;
+      return `<div class="card ask">
+        <div class="meta">${esc(q.title)} · ${ago(q.asked_ms)}</div>
+        <div class="what">The agent wants to reach <strong>${esc(q.target)}</strong></div>
+        <div class="row">
+          <button class="primary" data-q="${q.id}" data-d="once">Allow for this task</button>
+          <button data-q="${q.id}" data-d="always">Always in ${esc(project)}</button>
+          <button class="danger" data-q="${q.id}" data-d="deny">Deny</button>
+        </div></div>`;
+    }).join("");
+  }
+
+  function counts(t) {
+    const c = t.changes; const parts = [];
+    if (c && c.added + c.modified + c.deleted > 0) parts.push(`<span class="a">+${c.added}</span> <span class="m">~${c.modified}</span> <span class="d">-${c.deleted}</span>`);
+    if (c && c.git) parts.push(`<span class="p">git</span>`);
+    if (t.pushes) parts.push(`<span class="p">↑${t.pushes}</span>`);
+    return parts.length ? `<span class="counts">${parts.join(" ")}</span>` : "";
+  }
+
+  function renderTasks(tasks) {
+    if (!tasks.length) { $("tasks").innerHTML = `<p class="empty">No tasks yet. Start one with <code>agent do "…"</code>.</p>`; return; }
+    $("tasks").innerHTML = tasks.map((t) => {
+      const status = t.status.split(" ")[0];
+      return `<div class="card task" data-id="${t.id}">
+        <div class="title">${esc(t.title)}</div>
+        <div class="meta"><span class="badge ${esc(status)}">${esc(t.status)}</span><span>${t.id}</span><span>${ago(t.started_ms)}</span>${counts(t)}</div>
+        ${openTask === t.id ? `<div id="detail"><p class="empty">Loading…</p></div>` : ""}
+      </div>`;
+    }).join("");
+    if (openTask) loadDetail(openTask);
+  }
+
+  async function loadDetail(id) {
+    const el = $("detail"); if (!el) return;
+    const t = await api("/api/tasks/" + id);
+    const actions = t.open && !t.live ? `<div class="row">
+        <button class="primary" data-act="commit" data-id="${id}">Commit${t.pushes ? " and push" : ""}</button>
+        ${t.pushes ? `<button data-act="push" data-id="${id}">Push only</button>` : ""}
+        <button class="danger" data-act="rollback" data-id="${id}">Roll back</button></div>` : "";
+    el.innerHTML = `${actions}<div id="result"></div><pre>${colorDiff(t.diff)}</pre><pre>${esc(t.log)}</pre>`;
+  }
+
+  async function refresh() {
+    if (!token) { $("notice").innerHTML = `<div class="notice">Open the link that <code>agent serve</code> printed: it carries the access token.</div>`; return; }
+    try {
+      const [asks, tasks] = await Promise.all([api("/api/approvals"), api("/api/tasks")]);
+      $("notice").innerHTML = ""; $("dot").classList.add("live");
+      renderAsks(asks);
+      lastTasks = tasks;
+      if (!document.querySelector("#detail button:focus")) renderTasks(tasks);
+    } catch (e) {
+      $("dot").classList.remove("live");
+      if (e.message === "unauthorized") { $("notice").innerHTML = `<div class="notice">This link's token isn't valid anymore. Open the one <code>agent serve</code> printed.</div>`; }
+    }
+  }
+
+  document.addEventListener("click", async (ev) => {
+    const b = ev.target.closest("button");
+    if (b && b.dataset.q) {
+      b.disabled = true;
+      await api("/api/approvals/" + b.dataset.q, { decision: b.dataset.d }).catch(() => {});
+      return refresh();
+    }
+    if (b && b.dataset.act) {
+      if (b.dataset.act === "rollback" && !confirm("Discard this task's changes and held pushes?")) return;
+      document.querySelectorAll("#detail button").forEach((x) => (x.disabled = true));
+      const r = await api(`/api/tasks/${b.dataset.id}/${b.dataset.act}`, {});
+      const res = $("result");
+      if (res) res.innerHTML = `<pre class="output">${esc(r.output || r.error || "")}</pre>`;
+      setTimeout(refresh, 1500);
+      return;
+    }
+    const card = ev.target.closest(".task");
+    if (card && !ev.target.closest("#detail")) { openTask = openTask === card.dataset.id ? null : card.dataset.id; renderTasks(lastTasks); }
+  });
+
+  // A fresh link from `agent serve` opened in this same tab.
+  window.addEventListener("hashchange", () => {
+    const t = new URLSearchParams(location.hash.slice(1)).get("token");
+    if (t) { token = t; store.set(t); history.replaceState(null, "", location.pathname); refresh(); }
+  });
+
+  refresh();
+  setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>

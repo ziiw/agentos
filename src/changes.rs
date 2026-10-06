@@ -67,6 +67,9 @@ pub struct Change {
     /// Matches the grant's .gitignore or a built-in pattern for generated
     /// files: shown, but left out of a plain `commit`.
     pub ignored: bool,
+    /// Inside the grant's `.git`: git's own bookkeeping for commits the agent
+    /// made. Applied like any change, but summarized rather than listed.
+    pub git: bool,
 }
 
 /// Generated files nobody wants committed, on top of the project's .gitignore.
@@ -88,6 +91,8 @@ pub struct Summary {
     pub deleted: usize,
     /// Ignored changes, not counted in the others.
     pub ignored: usize,
+    /// Files changed inside `.git`, not counted in the others.
+    pub git: usize,
 }
 
 impl Summary {
@@ -96,6 +101,7 @@ impl Summary {
         for c in changes {
             match c.kind {
                 _ if c.ignored => s.ignored += 1,
+                _ if c.git => s.git += 1,
                 Kind::Added => s.added += 1,
                 Kind::Modified => s.modified += 1,
                 Kind::Deleted => s.deleted += 1,
@@ -119,6 +125,7 @@ pub fn scan(layers: &[Layer]) -> Result<Vec<Change>> {
         let rules = ignore_rules(&layer.source);
         for c in &mut out[first..] {
             c.ignored = rules.matched_path_or_any_parents(&c.path, c.entry == Entry::Dir).is_ignore();
+            c.git = c.rel.components().next().is_some_and(|p| p.as_os_str() == ".git");
         }
     }
     Ok(out)
@@ -208,6 +215,18 @@ pub fn rollback(layers: &[Layer], changes: &[Change], targets: &[PathBuf]) -> Re
     Ok(discarded)
 }
 
+/// What the agent did with git in this grant, from the reflog entries it
+/// added (`commit: Fix greet`, `checkout: moving from main to fix`, …).
+pub fn git_activity(layer: &Layer) -> Vec<String> {
+    let entries = |root: &Path| fs::read_to_string(root.join(".git/logs/HEAD")).unwrap_or_default();
+    let (before, after) = (entries(&layer.source), entries(&layer.upper));
+    if after.is_empty() {
+        return Vec::new();
+    }
+    let old = before.lines().count();
+    after.lines().skip(old).filter_map(|l| l.split_once('\t').map(|(_, msg)| msg.to_string())).collect()
+}
+
 /// Number of non-directory entries under `path` (for describing deleted dirs).
 pub fn count_files(path: &Path) -> usize {
     let Ok(entries) = fs::read_dir(path) else { return 0 };
@@ -275,6 +294,7 @@ fn change(layer: &Layer, rel: PathBuf, kind: Kind, entry: Entry, implied: bool) 
         rel,
         implied,
         ignored: false,
+        git: false,
     }
 }
 

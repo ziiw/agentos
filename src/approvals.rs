@@ -108,23 +108,103 @@ pub fn entry(host: &str, port: u16) -> String {
     if port == 443 { host.to_string() } else { format!("{host}:{port}") }
 }
 
-/// Asks at the terminal, one question at a time; answers last for the task.
+/// Whether `agent serve` (agentd) is running, and where.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Agentd {
+    pub pid: u32,
+    pub listen: String,
+    pub token: String,
+}
+
+pub fn agentd_path(store_root: &Path) -> PathBuf {
+    store_root.join("agentd.json")
+}
+
+/// The running agentd, if any.
+pub fn agentd(store_root: &Path) -> Option<Agentd> {
+    let d: Agentd = serde_json::from_slice(&fs::read(agentd_path(store_root)).ok()?).ok()?;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(d.pid as i32), None).ok()?;
+    Some(d)
+}
+
+/// A question waiting for an answer in agentd's console.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Question {
+    pub id: String,
+    pub task: String,
+    pub title: String,
+    pub target: String,
+    pub project: PathBuf,
+    pub asked_ms: u64,
+}
+
+fn queue(store_root: &Path, which: &str) -> PathBuf {
+    store_root.join("approvals").join(which)
+}
+
+/// Questions agentd should show.
+pub fn questions(store_root: &Path) -> Vec<Question> {
+    let mut out: Vec<Question> = fs::read_dir(queue(store_root, "pending"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| serde_json::from_slice(&fs::read(e.path()).ok()?).ok())
+        .collect();
+    out.sort_by_key(|q| q.asked_ms);
+    out
+}
+
+/// agentd's side: answer a question.
+pub fn answer(store_root: &Path, id: &str, decision: Decision) -> Result<()> {
+    if !id.chars().all(|c| c.is_ascii_hexdigit()) || !queue(store_root, "pending").join(format!("{id}.json")).exists() {
+        anyhow::bail!("no such question");
+    }
+    let dir = queue(store_root, "answers");
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(format!("{id}.json")), decision.label())?;
+    Ok(())
+}
+
+fn parse_decision(text: &str) -> Decision {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "o" | "once" => Decision::Once,
+        "a" | "always" => Decision::Always,
+        _ => Decision::Deny,
+    }
+}
+
+/// Asks about hosts outside the allowlist: at the terminal, in agentd's
+/// console, or both (the first answer wins). One question at a time; answers
+/// last for the task.
 pub struct Asker {
-    tty: Mutex<File>,
+    tty: Option<Mutex<File>>,
+    web: bool,
+    asking: Mutex<()>,
     answers: Mutex<HashMap<String, Decision>>,
     store_root: PathBuf,
     project: PathBuf,
+    task: String,
+    title: String,
 }
 
 impl Asker {
-    /// `None` without a controlling terminal (CI, cron, pipes): nobody to ask.
-    pub fn open(store_root: &Path, project: &Path) -> Option<Asker> {
-        let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+    /// `None` when there's nobody to ask: no terminal (or `use_tty` off, e.g.
+    /// over a full-screen agent) and no agentd.
+    pub fn open(store_root: &Path, project: &Path, use_tty: bool, task: &str, title: &str) -> Option<Asker> {
+        let tty = use_tty.then(|| OpenOptions::new().read(true).write(true).open("/dev/tty").ok()).flatten();
+        let web = agentd(store_root).is_some();
+        if tty.is_none() && !web {
+            return None;
+        }
         Some(Asker {
-            tty: Mutex::new(tty),
+            tty: tty.map(Mutex::new),
+            web,
+            asking: Mutex::new(()),
             answers: Mutex::new(HashMap::new()),
             store_root: store_root.to_path_buf(),
             project: project.to_path_buf(),
+            task: task.to_string(),
+            title: title.to_string(),
         })
     }
 
@@ -132,31 +212,79 @@ impl Asker {
     /// just now (rather than answered earlier in this task). Blocks until answered.
     pub fn ask(&self, host: &str, port: u16, paint: impl Fn(&str) -> String) -> (Decision, bool) {
         let key = entry(host, port);
-        if let Some(d) = self.answers.lock().ok().and_then(|a| a.get(&key).copied()) {
+        let cached = || self.answers.lock().ok().and_then(|a| a.get(&key).copied());
+        if let Some(d) = cached() {
             return (d, false);
         }
-        // Holding the terminal serializes questions; whoever waited may find
-        // their answer already given.
-        let Ok(mut tty) = self.tty.lock() else { return (Decision::Deny, false) };
-        if let Some(d) = self.answers.lock().ok().and_then(|a| a.get(&key).copied()) {
+        // Serialize questions; whoever waited may find theirs answered.
+        let Ok(_turn) = self.asking.lock() else { return (Decision::Deny, false) };
+        if let Some(d) = cached() {
             return (d, false);
         }
-        let question = format!(
-            "\n{} the agent wants to reach {} · [y] this task · [a] always, in {} · [N] deny › ",
-            paint("agent ▸"),
-            key,
-            display_path(&self.project)
-        );
-        let decision = match tty.write_all(question.as_bytes()).and_then(|_| tty.flush()) {
-            Ok(()) => read_answer(&mut tty),
-            Err(_) => Decision::Deny,
+
+        let mut tty = self.tty.as_ref().and_then(|t| t.lock().ok());
+        let id = crate::util::random_hex(8).unwrap_or_default();
+        let pending = queue(&self.store_root, "pending").join(format!("{id}.json"));
+        let answer_file = queue(&self.store_root, "answers").join(format!("{id}.json"));
+        if self.web {
+            let q = Question {
+                id: id.clone(),
+                task: self.task.clone(),
+                title: self.title.clone(),
+                target: key.clone(),
+                project: self.project.clone(),
+                asked_ms: crate::util::now_ms(),
+            };
+            let _ = fs::create_dir_all(pending.parent().unwrap_or(Path::new(".")));
+            let _ = fs::write(&pending, serde_json::to_vec(&q).unwrap_or_default());
+        }
+        if let Some(t) = tty.as_mut() {
+            let elsewhere = if self.web { " (or answer in agentd)" } else { "" };
+            let _ = write!(
+                t,
+                "\n{} the agent wants to reach {} · [y] this task · [a] always, in {} · [N] deny{elsewhere} › ",
+                paint("agent ▸"),
+                key,
+                display_path(&self.project)
+            );
+            let _ = t.flush();
+        }
+
+        let deadline = Instant::now() + ANSWER_TIMEOUT;
+        let mut line = Vec::new();
+        let decision = loop {
+            if Instant::now() >= deadline {
+                break Decision::Timeout;
+            }
+            if let Ok(text) = fs::read_to_string(&answer_file) {
+                let d = parse_decision(&text);
+                if let Some(t) = tty.as_mut() {
+                    let _ = writeln!(t, "{} (answered in agentd)", d.label());
+                }
+                break d;
+            }
+            match tty.as_mut() {
+                Some(t) => match read_line_for(t, &mut line, Duration::from_millis(250)) {
+                    Some(true) => break parse_decision(&String::from_utf8_lossy(&line)),
+                    Some(false) => {}
+                    None => break Decision::Deny,
+                },
+                None => std::thread::sleep(Duration::from_millis(250)),
+            }
         };
-        if decision == Decision::Timeout {
-            let _ = writeln!(tty, "(no answer in {}s: denied)", ANSWER_TIMEOUT.as_secs());
+        let _ = fs::remove_file(&pending);
+        let _ = fs::remove_file(&answer_file);
+
+        if let Some(t) = tty.as_mut() {
+            if decision == Decision::Timeout {
+                let _ = writeln!(t, "(no answer in {}s: denied)", ANSWER_TIMEOUT.as_secs());
+            }
         }
         if decision == Decision::Always {
             if let Err(e) = remember(&self.store_root, &self.project, &key) {
-                let _ = writeln!(tty, "(couldn't remember it: {e:#}; allowed for this task)");
+                if let Some(t) = tty.as_mut() {
+                    let _ = writeln!(t, "(couldn't remember it: {e:#}; allowed for this task)");
+                }
             }
         }
         if let Ok(mut answers) = self.answers.lock() {
@@ -166,34 +294,29 @@ impl Asker {
     }
 }
 
-fn read_answer(tty: &mut File) -> Decision {
+/// Reads terminal input into `line` for up to `wait`. `Some(true)` once a
+/// full line is in, `Some(false)` if not yet, `None` if the terminal is gone.
+fn read_line_for(tty: &mut File, line: &mut Vec<u8>, wait: Duration) -> Option<bool> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-    let deadline = Instant::now() + ANSWER_TIMEOUT;
-    let mut line = Vec::new();
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Decision::Timeout;
-        }
-        let ms = PollTimeout::try_from(left.as_millis().min(i32::MAX as u128) as i32).unwrap_or(PollTimeout::MAX);
-        let mut fds = [PollFd::new(tty.as_fd(), PollFlags::POLLIN)];
-        match poll(&mut fds, ms) {
-            Ok(0) => return Decision::Timeout,
-            Ok(_) => {}
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => return Decision::Deny,
-        }
-        let mut byte = [0u8; 1];
-        match tty.read(&mut byte) {
-            Ok(0) | Err(_) => return Decision::Deny,
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => line.push(byte[0]),
-        }
+    let ms = PollTimeout::try_from(wait.as_millis() as i32).unwrap_or(PollTimeout::ZERO);
+    let mut fds = [PollFd::new(tty.as_fd(), PollFlags::POLLIN)];
+    match poll(&mut fds, ms) {
+        Ok(0) | Err(nix::errno::Errno::EINTR) => return Some(false),
+        Ok(_) => {}
+        Err(_) => return None,
     }
-    match String::from_utf8_lossy(&line).trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" | "o" | "once" => Decision::Once,
-        "a" | "always" => Decision::Always,
-        _ => Decision::Deny,
+    let mut buf = [0u8; 64];
+    match tty.read(&mut buf) {
+        Ok(0) | Err(_) => None,
+        Ok(n) => {
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    return Some(true);
+                }
+                line.push(b);
+            }
+            Some(false)
+        }
     }
 }
 

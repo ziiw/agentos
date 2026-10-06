@@ -22,6 +22,10 @@ impl Paint {
     pub fn stdout() -> Self {
         Paint(std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
     }
+    /// No colors, e.g. for agentd's console.
+    pub fn plain() -> Self {
+        Paint(false)
+    }
     pub fn stderr() -> Self {
         Paint(std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
     }
@@ -92,10 +96,11 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn summary_short(p: Paint, s: &Summary) -> String {
+    let git = if s.git > 0 { p.cyan(" git") } else { String::new() };
     if s.total() == 0 {
-        return p.dim("none");
+        return if s.git > 0 { p.cyan("git") } else { p.dim("none") };
     }
-    format!("{} {} {}", p.green(format!("+{}", s.added)), p.yellow(format!("~{}", s.modified)), p.red(format!("-{}", s.deleted)))
+    format!("{} {} {}{git}", p.green(format!("+{}", s.added)), p.yellow(format!("~{}", s.modified)), p.red(format!("-{}", s.deleted)))
 }
 
 pub fn banner(p: Paint, task: &Task, outbox: bool, login_sealed: bool) -> String {
@@ -150,12 +155,12 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
         let _ = write!(head, " · {}", p.yellow(format!("{blocked} connection{} blocked", if blocked == 1 { "" } else { "s" })));
     }
     let ignored = if s.ignored > 0 { p.dim(format!(" · {} ignored", s.ignored)) } else { String::new() };
-    if s.total() == 0 && pushes.is_empty() {
+    if s.total() == 0 && s.git == 0 && pushes.is_empty() {
         return format!("{head} · no changes{ignored}");
     }
     let n = s.total();
     let mut held = Vec::new();
-    if n > 0 {
+    if n > 0 || s.git > 0 {
         held.push(format!("{} ({})", if n == 1 { "1 change".to_string() } else { format!("{n} changes") }, summary_short(p, s)));
     }
     if !pushes.is_empty() {
@@ -303,9 +308,11 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], stat
         truncate(&title(task), 60),
         state
     );
-    let shown: Vec<&Change> = changes.iter().filter(|c| show_ignored || !c.ignored).collect();
-    let hidden = changes.len() - shown.len();
-    if shown.is_empty() && pushes.is_empty() {
+    // Git's bookkeeping under .git is summarized per repository; --all lists it.
+    let shown: Vec<&Change> = changes.iter().filter(|c| show_ignored || (!c.ignored && !c.git)).collect();
+    let git_files = if show_ignored { 0 } else { changes.iter().filter(|c| c.git && !c.ignored).count() };
+    let hidden = changes.iter().filter(|c| c.ignored).count() - shown.iter().filter(|c| c.ignored).count();
+    if shown.is_empty() && pushes.is_empty() && git_files == 0 {
         let _ = writeln!(out, "{}", p.dim("no pending changes"));
     } else if !shown.is_empty() {
         let width = shown.iter().map(|c| change_path(c).chars().count()).max().unwrap_or(0).min(70);
@@ -315,6 +322,21 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], stat
             let pad = " ".repeat(width.saturating_sub(path.chars().count()));
             let note = if c.ignored { p.dim("  (ignored)") } else { String::new() };
             let _ = writeln!(out, "  {}  {path}{pad}  {}{note}", kind_mark(p, c.kind), detail(p, c));
+        }
+    }
+    if git_files > 0 {
+        if shown.is_empty() {
+            out.push('\n');
+        }
+        for layer in task.layers() {
+            let n = changes.iter().filter(|c| c.git && !c.ignored && c.layer == layer.index).count();
+            if n == 0 {
+                continue;
+            }
+            let did = changes::git_activity(&layer);
+            let what = if did.is_empty() { "git internals changed".to_string() } else { did.join("; ") };
+            let path = format!("{}/.git", display_path(&layer.source));
+            let _ = writeln!(out, "  {}  {path}  {}  {}", p.cyan("G"), truncate(&what, 90), p.dim(format!("({n} files)")));
         }
     }
     if hidden > 0 {
@@ -398,8 +420,12 @@ pub fn conflicts(p: Paint, task: &Task, conflicts: &[&Change]) -> String {
 
 pub fn committed(p: Paint, task: &Task, applied: &[Change], remaining: usize) -> String {
     let mut out = String::new();
-    for c in applied {
+    for c in applied.iter().filter(|c| !c.git) {
         let _ = writeln!(out, "  {}  {}", kind_mark(p, c.kind), change_path(c));
+    }
+    let git = applied.iter().filter(|c| c.git).count();
+    if git > 0 {
+        let _ = writeln!(out, "  {}  .git  {}", p.cyan("G"), p.dim(format!("({git} files: the agent's git work)")));
     }
     let n = applied.len();
     let _ = write!(

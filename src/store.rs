@@ -241,6 +241,11 @@ impl Store {
         &self.root
     }
 
+    /// A store at a known location (agentd's request handlers).
+    pub fn open_at(root: &Path) -> Result<Store> {
+        Ok(Store { root: fs::canonicalize(root)? })
+    }
+
     fn tasks_dir(&self) -> PathBuf {
         self.root.join("tasks")
     }

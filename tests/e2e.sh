@@ -235,6 +235,38 @@ fi
 out="$("$AGENT" run --ask -- $GET 2>&1 </dev/null)"
 check "without a terminal nobody is asked, the host is refused" grep -q 'blocked example.com:443' <<<"$out"
 
+section "agentd console"
+PORT=$((20000 + RANDOM % 10000))
+"$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve.log" 2>&1 &
+SERVE_PID=$!
+for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
+TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
+CONSOLE="http://127.0.0.1:$PORT"
+api() { curl -sS -m 10 -H "Authorization: Bearer $TOKEN" "$@"; }
+check "agent serve prints a link with a token" grep -q "#token=$TOKEN" "$WORK/serve.log"
+check "the console page is served" grep -q 'agentd console' <<<"$(curl -sS -m 10 "$CONSOLE/")"
+check "the API refuses calls without the token" test "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 401
+check "it lists tasks" grep -q '"id"' <<<"$(api "$CONSOLE/api/tasks")"
+reset_proj
+cd "$PROJ"
+"$AGENT" run --ask -- curl -sS -m 30 -o /dev/null -w 'HTTP%{http_code}' https://example.com >"$WORK/ask.out" 2>&1 </dev/null &
+RUN_PID=$!
+Q=""
+for _ in $(seq 100); do Q="$(api "$CONSOLE/api/approvals")"; grep -q '"id"' <<<"$Q" && break; sleep 0.1; done
+check "a task with no terminal asks in the console" grep -q '"target":"example.com"' <<<"$Q"
+QID="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$Q")"
+api -X POST -d '{"decision":"once"}' "$CONSOLE/api/approvals/$QID" >/dev/null
+wait $RUN_PID
+check "answering there lets the connection through" grep -q HTTP200 "$WORK/ask.out"
+check "the answer is journaled" grep -q '"kind":"net.approval".*"decision":"once"' "$(latest_task_dir)/events.jsonl"
+"$AGENT" run -- sh -c 'echo from-agent > console.txt' 2>/dev/null
+ID="$("$AGENT" ls | sed -n 2p | cut -d' ' -f1)"
+check "a task's detail shows its diff" grep -q 'console.txt' <<<"$(api "$CONSOLE/api/tasks/$ID")"
+check "commit from the console" grep -q '"ok":true' <<<"$(api -X POST "$CONSOLE/api/tasks/$ID/commit")"
+check "...applies the change" grep -qx from-agent console.txt
+kill $SERVE_PID 2>/dev/null
+wait $SERVE_PID 2>/dev/null
+
 section "git push outbox"
 if command -v git >/dev/null; then
   # The remote is a bare repo outside the sandbox: the agent can't reach it,
@@ -252,6 +284,9 @@ if command -v git >/dev/null; then
   check "...but nothing reached the remote" test -z "$(on_remote refs/heads/feature)"
   check "the push is held for review" grep -q '1 git push (origin feature)' <<<"$out"
   check "diff shows it with its commit" grep -Eq 'origin feature  [0-9a-f]{7} two' <<<"$("$AGENT" diff)"
+  check "the agent's git work is one line, from the reflog" grep -Eq '^  G  .*/.git  commit: two' <<<"$("$AGENT" diff)"
+  check "...not git's internal files" lacks COMMIT_EDITMSG "$("$AGENT" diff)"
+  check "diff --all lists them" grep -q COMMIT_EDITMSG <<<"$("$AGENT" diff --all)"
   check "ls counts it" grep -q '↑1' <<<"$("$AGENT" ls)"
   "$AGENT" commit >/dev/null
   check "commit sends it, with your own git" test "$(on_remote refs/heads/feature)" = "$(git rev-parse HEAD)"

@@ -83,6 +83,7 @@ scripts/dev.sh shell
 | `agent doctor` | Check this machine |
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
 | `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
+| `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 
 `GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
@@ -138,6 +139,8 @@ Some hosts an agent reaches for stay closed on purpose. Claude, when logged in w
 
 ## Git pushes wait in an outbox
 
+When the agent commits, its git work shows up in `agent diff` as one line, taken from git's reflog (`G  ~/app/.git  commit: Add a test for greet`), rather than as files inside `.git`. `--all` lists those files.
+
 In a git repository with remotes, the agent's `git push` works, but nothing leaves your machine. Each remote gets an outbox inside the task, and git in the sandbox is configured to push there. The push shows up with the rest of the changes:
 
 ```console
@@ -149,6 +152,17 @@ $ agent diff
 ```
 
 `agent commit` applies the files, then sends the pushes from **your** git, outside the sandbox, with your usual SSH keys or credential helper. The agent never needs push rights. `agent push` sends only the pushes, `agent commit --no-push` only the files, and `agent rollback` drops both. If the remote moved in the meantime, git rejects the push as usual, and it stays held until you sort it out (`agent push --force` overwrites).
+
+## agentd: the console
+
+```bash
+agent serve
+```
+
+This starts agentd and prints a link like `http://127.0.0.1:7777/#token=…`. The page lists your tasks, shows each one's diff, held pushes and journal, and has **Commit / Push / Roll back** buttons that run the same commands as the terminal. Questions from agents appear at the top with **Allow for this task / Always / Deny**, alongside the terminal prompt; the first answer wins. Tasks with no terminal to ask at, like Claude's full-screen interface or background runs, ask there too.
+
+- `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
+- `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only).
 
 ## Configuration
 

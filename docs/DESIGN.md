@@ -126,7 +126,8 @@ It's verified at three levels:
 | M6: configuration: host presets, your config + project config with `agent trust`, expected denials | ✅ CI green |
 | M7: live approvals: unlisted hosts are asked about at the terminal while the connection waits; "always" remembered per project | ✅ CI green |
 | M8: git push outbox: pushes held per remote, replayed from your own git on commit | ✅ CI green |
-| M9: login brokering: OAuth tokens sealed in a vault; placeholders in the sandbox; token endpoint rewritten both ways | ✅ automated |
+| M9: login brokering: OAuth tokens sealed in a vault; placeholders in the sandbox; token endpoint rewritten both ways | ✅ CI green; real Claude verified with fake tokens (API + refresh paths) |
+| M10: agentd console: tasks, diffs, commit/push/rollback and approvals in a browser; first answer wins; push notifications | ✅ automated + checked in a browser |
 
 ### Phase 1 backlog, in order
 
@@ -136,7 +137,7 @@ It's verified at three levels:
 4. **Effects outbox.** ✅ `git push` (M8): each remote gets a bare outbox repo in the task, git in the sandbox pushes there (`GIT_CONFIG_*`), `agent commit` replays from your own git. Next: HTTP writes to APIs, policy auto-release.
 5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
 6. **cgroups.** CPU, memory and pid limits through a systemd transient scope. Token/$ budgets through the model gateway.
-7. **agentd + API.** ◐ Approvals exist at the terminal (M7); the daemon makes them reachable from elsewhere. Long-running daemon. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
+7. **agentd + API.** ✅ `agent serve` (M10): token-protected web console and JSON API; approvals reach you away from the terminal, with optional push notifications. Next: run tasks *from* agentd, accounts for teams. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
 8. **MCP gateway.** System services exposed as typed tools, governed by the same policy.
 
 ## Open decisions
