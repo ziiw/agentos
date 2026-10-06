@@ -8,11 +8,12 @@
 
 use crate::util::{hex, now_ms};
 use anyhow::{Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -33,6 +34,7 @@ pub enum Integrity {
     Broken { line: usize, reason: String },
 }
 
+#[derive(Clone)]
 pub struct Journal {
     path: PathBuf,
 }
@@ -68,9 +70,21 @@ impl Journal {
             .collect()
     }
 
+    /// Appends an event. Safe to call from several threads or processes at
+    /// once (the egress proxy reports from its own threads): the file is
+    /// locked from reading the chain head to writing the new event.
     pub fn append(&self, kind: &str, data: Value) -> Result<Event> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("open {}", self.path.display()))?;
+        let mut f = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| e).context("lock journal")?;
+        let mut content = String::new();
+        f.read_to_string(&mut content)?;
         // Only the last event matters for chaining; agents can log hundreds of tool calls.
-        let (seq, prev) = match self.lines()?.last() {
+        let (seq, prev) = match content.lines().rev().find(|l| !l.trim().is_empty()) {
             Some(line) => {
                 let last: Event = serde_json::from_str(line).context("journal: unparseable last event")?;
                 (last.seq + 1, last.hash)
@@ -80,11 +94,6 @@ impl Journal {
         let ts_ms = now_ms();
         let hash = digest(seq, ts_ms, kind, &data, &prev);
         let event = Event { seq, ts_ms, kind: kind.to_string(), data, prev, hash };
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("open {}", self.path.display()))?;
         writeln!(f, "{}", serde_json::to_string(&event)?)?;
         f.sync_data()?;
         Ok(event)
@@ -129,6 +138,24 @@ mod tests {
         let tampered = fs::read_to_string(&path).unwrap().replace("\"exit_code\":0", "\"exit_code\":1");
         fs::write(&path, tampered).unwrap();
         assert!(matches!(j.verify().unwrap(), Integrity::Broken { line: 2, .. }));
+    }
+
+    #[test]
+    fn concurrent_appends_keep_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::new(dir.path().join("events.jsonl"));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let j = j.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        j.append("tick", json!({ "t": t, "i": i })).unwrap();
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert!(matches!(j.verify().unwrap(), Integrity::Intact { events: 200, .. }));
     }
 
     #[test]

@@ -34,6 +34,14 @@ section "doctor"
 check "agent doctor passes" "$AGENT" doctor
 "$AGENT" doctor | sed 's/^/    /'
 
+if [ "${REQUIRE_LANDLOCK:-}" = 1 ]; then
+  section "landlock (required on this machine)"
+  check "doctor finds Landlock" grep -Eq 'landlock +ABI v[0-9]' <<<"$("$AGENT" doctor)"
+  "$AGENT" run --no-cwd -- true 2>/dev/null
+  # "partially" = the kernel predates some access rights we ask for (e.g. ioctl, ABI v5)
+  check "sandboxes run with Landlock enforced" grep -Eq '"landlock":"(partially )?enforced' "$(latest_task_dir)/events.jsonl"
+fi
+
 section "an agent works on a copy, not your files"
 reset_proj
 echo "top secret" > "$HOME/.e2e-secret"
@@ -111,6 +119,44 @@ check "--env passes it explicitly" "$AGENT" run -e SECRET_TOKEN -- sh -c 'test "
 check "value never written to the journal" bash -c "! grep -rq s3cr3t-value '$AGENTOS_HOME'"
 unset SECRET_TOKEN
 
+section "network allowlist (egress proxy)"
+reset_proj
+cd "$PROJ"
+API=https://api.anthropic.com/v1/messages
+out="$("$AGENT" run --allow api.anthropic.com -- curl -sS -m 20 -o /dev/null -w 'HTTP %{http_code}' "$API" 2>&1)"
+check "an allowed host is reachable through the proxy" grep -q 'HTTP 405' <<<"$out"
+events="$(latest_task_dir)/events.jsonl"
+check "the connection is journaled with byte counts" grep -Eq '"kind":"net.connect".*"allowed":true,"bytes_in":[1-9]' "$events"
+check "banner shows the allowlist" grep -q 'net api.anthropic.com' <<<"$out"
+out="$("$AGENT" run --allow api.anthropic.com -- curl -sS -m 20 https://example.com 2>&1)"
+check "other hosts are refused" test $? -ne 0
+check "the refusal is shown live, with the fix" grep -q 'blocked example.com:443: not in the allowlist (allow it with --allow example.com)' <<<"$out"
+check "the refusal is journaled" grep -q '"kind":"net.connect".*"allowed":false.*"host":"example.com"' "$(latest_task_dir)/events.jsonl"
+check "the summary counts blocked connections" grep -q '1 connection blocked' <<<"$out"
+check "bypassing the proxy: no DNS" bash -c "! '$AGENT' run --allow api.anthropic.com -- curl -sS -m 5 --noproxy '*' $API"
+check "bypassing the proxy: no route, even to a raw IP" bash -c "! '$AGENT' run --allow api.anthropic.com -- curl -sS -m 5 --noproxy '*' https://1.1.1.1"
+check "wildcards cover subdomains" "$AGENT" run --allow '*.anthropic.com' -- curl -sS -m 20 -o /dev/null "$API"
+"$AGENT" run --allow localhost:8080 -- sh -c 'NO_PROXY= no_proxy= curl -sS -m 5 https://localhost:8080' >/dev/null 2>&1
+check "allowed names that resolve to local addresses are refused" grep -q '"reason":"resolves only to private or local addresses"' "$(latest_task_dir)/events.jsonl"
+check "--allow with --net host is rejected" bash -c "! '$AGENT' run --net host --allow x.com -- true 2>/dev/null"
+
+section "ignored changes (.gitignore, __pycache__)"
+reset_proj
+echo "build/" > "$PROJ/.gitignore"
+cd "$PROJ"
+"$AGENT" run -- sh -c 'mkdir -p __pycache__ build && echo x > __pycache__/m.pyc && echo y > build/out && echo "def test(): pass" > test_m.py' 2>/dev/null
+out="$("$AGENT" diff --stat)"
+check "diff lists the real change" grep -Eq '^  A  .*test_m.py' <<<"$out"
+check "ignored changes are summarized, not listed" grep -q '+ 4 ignored changes: __pycache__/, build/' <<<"$out"
+check "--all lists them" grep -Eq '^  A  .*__pycache__/m.pyc.*\(ignored\)' <<<"$("$AGENT" diff --stat --all)"
+"$AGENT" commit >/dev/null
+check "commit applies the real change" test -f test_m.py
+check "commit leaves ignored files out" test ! -e __pycache__ -a ! -e build
+check "task is closed" grep -Eq 'committed' <<<"$("$AGENT" ls | sed -n 2p)"
+"$AGENT" run -- sh -c 'mkdir -p build && echo y > build/out' 2>/dev/null
+"$AGENT" commit --all >/dev/null
+check "commit --all includes them" test -f build/out
+
 section "agent do (with a stand-in for Claude Code)"
 mkdir -p "$WORK/tools/claude-code"
 cp "$(dirname "$0")/fake-claude" "$WORK/tools/claude-code/claude"
@@ -136,6 +182,9 @@ check "journal records tool calls" grep -q '"kind":"agent.tool".*"name":"Bash"' 
 check "journal records result and cost" grep -q '"kind":"agent.result".*"cost_usd":0.0421' "$events"
 check "agent can't see your real ~/.claude" grep -qx 'host-secret: hidden' "$AGENT_STATE/observations"
 check "ls shows the task by its title" grep -q 'claude: add a test for greet' <<<"$("$AGENT" ls)"
+check "agent do uses the allowlist, not your network" grep -q 'net api.anthropic.com +3' <<<"$out"
+check "agent gets the proxy settings" grep -qx 'proxy: set' "$AGENT_STATE/observations"
+check "the final message isn't printed twice" test "$(grep -c "I'll add a test for greet" <<<"$out")" -eq 1
 "$AGENT" rollback >/dev/null
 "$AGENT" do again >/dev/null 2>&1
 check "agent home persists between tasks" test "$(cat "$AGENT_STATE/runs")" = 2

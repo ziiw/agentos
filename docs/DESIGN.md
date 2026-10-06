@@ -20,10 +20,11 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Agents have their own identity | Each task is its own principal, not "runs as you" | user namespaces, per-task ids, cgroups | ◐ namespaces |
 | Explicit grants, no inherited access | The agent gets *this folder* and *this API with these scopes*, nothing else | mount namespaces, Landlock, seccomp | ◐ fs done |
 | Local changes are reversible | A task ends as a diff you merge or throw away | overlayfs upper dirs, read-only base | ● |
-| External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | per-task netns + effects broker | ○ Phase 1 |
+| Network is an allowlist | No direct network, not even DNS; an egress proxy outside the sandbox lets through allowed hosts only and journals every connection | private netns + unix-socket proxy | ● |
+| External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | egress proxy + effects broker | ○ Phase 1 |
 | Secrets never reach the model | The agent sees placeholders; real credentials are added at the proxy | credential broker, keystore/TPM | ◐ env scrubbing |
 | Taint tracking | Once a session reads untrusted input, its risky actions need approval | policy engine (Cedar) | ○ Phase 1 |
-| Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal |
+| Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, cost |
 | Tokens are a budgeted resource | $/token/time budgets per task | model gateway | ○ Phase 1 |
 | Interfaces built for agents | System services exposed as typed tools | MCP gateway, D-Bus bridge, AT-SPI | ○ Phase 1 |
 | Agents can live for days | Sleep, wake on events, survive reboots | systemd units, CRIU | ○ Phase 3 |
@@ -72,7 +73,7 @@ supervisor (host)       validates grants, writes the journal, survives Ctrl-C
 
 - **Transactions.** Each `--rw` grant is `overlay(lower=real dir, upper=store/tasks/<id>/layers/<n>/upper)`. The upper dir is the changeset: files are additions/modifications, `0:0` char devices are deletions, and `user.overlay.opaque` dirs replaced their lower dir. `commit` applies entries and retires them from the upper dir, so what remains is exactly what is pending. That makes partial commit and rollback natural, including for replaced directories (see `changes.rs` tests).
 - **Journal.** `events.jsonl`. Each event is `sha256(prev_hash ‖ canonical_json(event))`. Written only by the supervisor, outside the sandbox, and the store is masked from every sandbox.
-- **Tests.** Unit tests for the transaction engine and journal, plus `tests/e2e.sh` (38 checks covering isolation, transactions, conflicts, env scrubbing, exit codes and tamper detection).
+- **Tests.** Unit tests for the transaction engine and journal, plus `tests/e2e.sh` (80 checks covering isolation, transactions, conflicts, env scrubbing, the network allowlist and attempts to bypass it, ignored files, `agent do`, exit codes and tamper detection).
 
 ## Threat model (Phase 0)
 
@@ -84,7 +85,7 @@ supervisor (host)       validates grants, writes the journal, survives Ctrl-C
 - reach the network under `--net none`,
 - alter the record of what it did.
 
-**Out of scope for now.** Kernel exploits (the microVM tier addresses those). Exfiltration under `--net host`. Abuse of secrets you pass explicitly. Terminal injection on old kernels (seccomp, Phase 1). A malicious *user* rewriting the journal.
+**Out of scope for now.** Kernel exploits (the microVM tier addresses those). Exfiltration under `--net host`, or to an allowed host (an allowlist limits destinations, not content). Abuse of secrets you pass explicitly. Terminal injection on old kernels (seccomp, Phase 1). A malicious *user* rewriting the journal.
 
 ## Roadmap
 
@@ -118,14 +119,14 @@ It's verified at three levels:
 | Milestone | Status |
 |---|---|
 | M1: `agent do`, current folder granted by default, hint for tasks passed to `agent run` | ✅ |
-| M2: Claude Code profile, per-agent persistent home, streamed progress, tool calls and cost journaled | ✅ automated; real-Claude smoke test passes up to login; human acceptance pending |
-| M3: egress proxy with an allowlist, replacing `net host` | next |
-| M4: CI on ubuntu-24.04 (x86_64 + arm64): Landlock enforced, AppArmor path | next |
+| M2: Claude Code profile, per-agent persistent home, streamed progress, tool calls and cost journaled | ✅ accepted with real Claude (2026-10-06) |
+| M3: egress proxy with an allowlist, replacing `net host`; ignored files left out of commits | ✅ automated; real Claude verified through the proxy (free 401 check); human acceptance pending |
+| M4: CI on ubuntu-24.04 (x86_64 + arm64): Landlock enforced, AppArmor path | workflow written; runs once pushed to GitHub |
 
 ### Phase 1 backlog, in order
 
 1. **Profiles.** Claude Code is built in (`src/profiles.rs`). Next: profiles as files (grants, env, network policy, budget) and verified recipes for Codex and Aider.
-2. **Egress proxy.** Network via `pasta`/veth into a per-task proxy with a domain allowlist. Replaces `--net host`. Every request goes to the journal.
+2. **Egress proxy.** ✅ Done without veth or root: the sandbox has only loopback, and a forwarder inside relays to the proxy through a unix socket. Next: presets (`--allow @pypi`), upstream corporate proxies.
 3. **Credential broker.** Secrets live in the broker. The agent gets placeholder tokens, and the proxy swaps them in on the wire for the allowed host only.
 4. **Effects outbox.** `git push`, mail and API writes are held as pending effects next to the file diff. `agent commit` releases them, or policy auto-releases low-risk ones.
 5. **seccomp profile.** Block TIOCSTI, ptrace of non-children, bpf, keyctl, mount APIs and other unneeded syscalls.

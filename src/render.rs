@@ -3,7 +3,7 @@
 use agentos::changes::{self, Change, Entry, Kind, Summary};
 use agentos::journal::Event;
 use agentos::profiles::AgentEvent;
-use agentos::store::{Access, Task};
+use agentos::store::{Access, Net, Task};
 use agentos::util::{self, display_path};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
@@ -60,6 +60,14 @@ pub fn command_line(argv: &[String]) -> String {
         .join(" ")
 }
 
+fn bytes(n: u64) -> String {
+    match n {
+        0..=999 => format!("{n} B"),
+        1000..=999_999 => format!("{:.1} kB", n as f64 / 1e3),
+        _ => format!("{:.1} MB", n as f64 / 1e6),
+    }
+}
+
 /// How to name a task: its title, or the command it ran.
 pub fn title(task: &Task) -> String {
     task.meta.title.clone().unwrap_or_else(|| command_line(&task.meta.command))
@@ -90,11 +98,21 @@ pub fn banner(p: Paint, task: &Task) -> String {
         let label = if g.access == Access::Rw { "rw" } else { "ro" };
         parts.push(format!("{} {}", p.dim(label), display_path(&g.path)));
     }
-    parts.push(format!("{} {}", p.dim("net"), task.meta.net));
+    parts.push(format!("{} {}", p.dim("net"), net_label(&task.meta.net, &task.meta.allow)));
     format!("{} {}", p.cyan("agent ▸"), parts.join("  "))
 }
 
-pub fn exit_summary(p: Paint, task: &Task, s: &Summary, outcome: Option<&AgentEvent>) -> String {
+/// "none", "host", or the allowlist: "api.anthropic.com +3".
+fn net_label(net: &Net, allow: &[String]) -> String {
+    match (net, allow) {
+        (Net::Proxy, []) => "proxy (nothing allowed)".into(),
+        (Net::Proxy, [one]) => one.clone(),
+        (Net::Proxy, [first, rest @ ..]) => format!("{first} +{}", rest.len()),
+        (other, _) => other.to_string(),
+    }
+}
+
+pub fn exit_summary(p: Paint, task: &Task, s: &Summary, outcome: Option<&AgentEvent>, blocked: usize) -> String {
     let id = task.id();
     let took = util::duration(task.meta.ended_at_ms.unwrap_or(0).saturating_sub(task.meta.started_at_ms));
     let mut head = format!("{} task {} exited {} in {took}", p.cyan("agent ▸"), p.bold(id), task.meta.exit_code.unwrap_or(-1));
@@ -106,12 +124,16 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, outcome: Option<&AgentEv
             let _ = write!(head, " · {n} turn{}", if *n == 1 { "" } else { "s" });
         }
     }
+    if blocked > 0 {
+        let _ = write!(head, " · {}", p.yellow(format!("{blocked} connection{} blocked", if blocked == 1 { "" } else { "s" })));
+    }
+    let ignored = if s.ignored > 0 { p.dim(format!(" · {} ignored", s.ignored)) } else { String::new() };
     if s.total() == 0 {
-        return format!("{head} · no changes");
+        return format!("{head} · no changes{ignored}");
     }
     let n = s.total();
     let mut out = format!(
-        "{head} · {} held for review ({})",
+        "{head} · {} held for review ({}){ignored}",
         if n == 1 { "1 change".to_string() } else { format!("{n} changes") },
         summary_short(p, s),
     );
@@ -224,7 +246,20 @@ fn kind_mark(p: Paint, k: Kind) -> String {
     }
 }
 
-pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool) -> String {
+/// "3 ignored changes: __pycache__/, build/" — just the outermost paths.
+pub fn ignored_summary(changes: &[Change]) -> String {
+    let ignored: Vec<&Change> = changes.iter().filter(|c| c.ignored).collect();
+    let roots: Vec<String> = ignored
+        .iter()
+        .filter(|c| !ignored.iter().any(|o| o.path != c.path && c.path.starts_with(&o.path)))
+        .map(|c| c.rel.display().to_string() + if c.entry == Entry::Dir { "/" } else { "" })
+        .collect();
+    let more = if roots.len() > 3 { format!(" +{} more", roots.len() - 3) } else { String::new() };
+    let n = ignored.len();
+    format!("{n} ignored change{}: {}{more}", if n == 1 { "" } else { "s" }, roots.iter().take(3).cloned().collect::<Vec<_>>().join(", "))
+}
+
+pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool, show_ignored: bool) -> String {
     let mut out = String::new();
     let state = if task.is_live() { p.cyan("running") } else { p.dim(task.status_label()) };
     let _ = writeln!(
@@ -235,21 +270,27 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool) -> Strin
         truncate(&title(task), 60),
         state
     );
-    if changes.is_empty() {
+    let shown: Vec<&Change> = changes.iter().filter(|c| show_ignored || !c.ignored).collect();
+    let hidden = changes.len() - shown.len();
+    if shown.is_empty() {
         let _ = writeln!(out, "{}", p.dim("no pending changes"));
-        return out;
+    } else {
+        let width = shown.iter().map(|c| change_path(c).chars().count()).max().unwrap_or(0).min(70);
+        out.push('\n');
+        for c in &shown {
+            let path = change_path(c);
+            let pad = " ".repeat(width.saturating_sub(path.chars().count()));
+            let note = if c.ignored { p.dim("  (ignored)") } else { String::new() };
+            let _ = writeln!(out, "  {}  {path}{pad}  {}{note}", kind_mark(p, c.kind), detail(p, c));
+        }
     }
-    let width = changes.iter().map(|c| change_path(c).chars().count()).max().unwrap_or(0).min(70);
-    out.push('\n');
-    for c in changes {
-        let path = change_path(c);
-        let pad = " ".repeat(width.saturating_sub(path.chars().count()));
-        let _ = writeln!(out, "  {}  {path}{pad}  {}", kind_mark(p, c.kind), detail(p, c));
+    if hidden > 0 {
+        let _ = writeln!(out, "  {}", p.dim(format!("+ {}, not committed (--all to see and include them)", ignored_summary(changes))));
     }
     if stat_only {
         return out;
     }
-    for c in changes {
+    for c in shown {
         let Some((old, new)) = texts(c) else { continue };
         let shown = display_path(&c.path);
         let (a, b) = match c.kind {
@@ -339,9 +380,26 @@ fn describe(p: Paint, e: &Event) -> String {
                 .flatten()
                 .map(|g| format!("{} {}", s(&g["access"]), display_path(Path::new(&s(&g["path"])))))
                 .collect();
-            parts.push(format!("net {}", s(&d["net"])));
+            match d["allow"].as_array() {
+                Some(hosts) if !hosts.is_empty() => parts.push(format!("net only {}", list(&d["allow"]))),
+                _ => parts.push(format!("net {}", s(&d["net"]))),
+            }
             parts.push(format!("env {}", list(&d["env"])));
             parts.join(" · ")
+        }
+        "net.connect" => {
+            let target = format!("{}:{}", s(&d["host"]), d["port"]);
+            if d["allowed"].as_bool() == Some(true) {
+                format!(
+                    "{} {target} · ↑{} ↓{} · {}",
+                    p.green("✓"),
+                    bytes(d["bytes_out"].as_u64().unwrap_or(0)),
+                    bytes(d["bytes_in"].as_u64().unwrap_or(0)),
+                    util::duration(d["ms"].as_u64().unwrap_or(0))
+                )
+            } else {
+                format!("{} {target} · {}", p.red("✗ blocked"), s(&d["reason"]))
+            }
         }
         "sandbox.ready" => format!("landlock {} · proc {}", s(&d["landlock"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
@@ -349,7 +407,7 @@ fn describe(p: Paint, e: &Event) -> String {
         "agent.result" => {
             let mut parts = vec![if d["is_error"].as_bool() == Some(true) { p.red("error") } else { "ok".into() }];
             if let Some(n) = d["turns"].as_u64() {
-                parts.push(format!("{n} turns"));
+                parts.push(format!("{n} turn{}", if n == 1 { "" } else { "s" }));
             }
             if let Some(c) = d["cost_usd"].as_f64() {
                 parts.push(format!("${c:.4}"));

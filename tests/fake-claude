@@ -11,6 +11,7 @@ echo $((runs + 1)) > "$state/runs"
 {
   if [ -e "$state/host-secret" ]; then echo "host-secret: visible"; else echo "host-secret: hidden"; fi
   if [ -n "${ANTHROPIC_API_KEY:-}" ]; then echo "api-key: set"; else echo "api-key: unset"; fi
+  if [ -n "${HTTPS_PROXY:-}" ]; then echo "proxy: set"; else echo "proxy: unset"; fi
 } > "$state/observations"
 
 echo "plain line from the agent"

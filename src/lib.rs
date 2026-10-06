@@ -9,6 +9,7 @@ pub mod changes;
 pub mod doctor;
 pub mod journal;
 pub mod profiles;
+pub mod proxy;
 pub mod sandbox;
 pub mod store;
 pub mod util;

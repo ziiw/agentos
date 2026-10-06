@@ -15,6 +15,7 @@
 
 use crate::util::{force_remove_dir_all, mtime_ms};
 use anyhow::{Context, Result, bail};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Serialize;
 use std::ffi::{CString, OsString};
 use std::fs::{self, Metadata};
@@ -63,13 +64,21 @@ pub struct Change {
     pub upper: PathBuf,
     /// A deletion implied by an opaque parent dir (no whiteout of its own).
     pub implied: bool,
+    /// Matches the grant's .gitignore or a built-in pattern for generated
+    /// files: shown, but left out of a plain `commit`.
+    pub ignored: bool,
 }
+
+/// Generated files nobody wants committed, on top of the project's .gitignore.
+const BUILTIN_IGNORES: &[&str] = &["__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".DS_Store"];
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct Summary {
     pub added: usize,
     pub modified: usize,
     pub deleted: usize,
+    /// Ignored changes, not counted in the others.
+    pub ignored: usize,
 }
 
 impl Summary {
@@ -77,6 +86,7 @@ impl Summary {
         let mut s = Summary::default();
         for c in changes {
             match c.kind {
+                _ if c.ignored => s.ignored += 1,
                 Kind::Added => s.added += 1,
                 Kind::Modified => s.modified += 1,
                 Kind::Deleted => s.deleted += 1,
@@ -85,6 +95,7 @@ impl Summary {
         s
     }
 
+    /// Changes that matter (not ignored).
     pub fn total(&self) -> usize {
         self.added + self.modified + self.deleted
     }
@@ -94,9 +105,25 @@ impl Summary {
 pub fn scan(layers: &[Layer]) -> Result<Vec<Change>> {
     let mut out = Vec::new();
     for layer in layers {
+        let first = out.len();
         walk(layer, Path::new(""), &mut out).with_context(|| format!("scan {}", layer.upper.display()))?;
+        let rules = ignore_rules(&layer.source);
+        for c in &mut out[first..] {
+            c.ignored = rules.matched_path_or_any_parents(&c.path, c.entry == Entry::Dir).is_ignore();
+        }
     }
     Ok(out)
+}
+
+/// The grant's own .gitignore (the real one, not the agent's copy) plus
+/// built-in patterns. Nested .gitignore files aren't read yet.
+fn ignore_rules(source: &Path) -> Gitignore {
+    let mut rules = GitignoreBuilder::new(source);
+    for pattern in BUILTIN_IGNORES {
+        let _ = rules.add_line(None, pattern);
+    }
+    let _ = rules.add(source.join(".gitignore"));
+    rules.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
 /// Keeps the changes at or under any of `filters` (all of them if empty).
@@ -238,6 +265,7 @@ fn change(layer: &Layer, rel: PathBuf, kind: Kind, entry: Entry, implied: bool) 
         upper: layer.upper.join(&rel),
         rel,
         implied,
+        ignored: false,
     }
 }
 
@@ -545,6 +573,21 @@ mod tests {
         assert!(!lo.join("src/main.rs").exists());
         assert!(scan(layers).unwrap().is_empty());
         assert!(!up.join("src").exists(), "settled opaque dir should be pruned");
+    }
+
+    #[test]
+    fn generated_and_gitignored_files_are_flagged() {
+        let f = fixture();
+        write(&f.layer.source.join(".gitignore"), "build/\n*.log\n");
+        write(&f.layer.upper.join("test_greet.py"), "def test(): pass");
+        write(&f.layer.upper.join("__pycache__/greet.cpython-311.pyc"), "\0bytecode");
+        write(&f.layer.upper.join("build/out.bin"), "artifact");
+        write(&f.layer.upper.join("debug.log"), "noise");
+        let changes = scan(std::slice::from_ref(&f.layer)).unwrap();
+        let ignored: Vec<String> = changes.iter().filter(|c| c.ignored).map(|c| c.rel.display().to_string()).collect();
+        assert_eq!(ignored, vec!["__pycache__", "__pycache__/greet.cpython-311.pyc", "build", "build/out.bin", "debug.log"]);
+        let s = Summary::of(&changes);
+        assert_eq!((s.total(), s.ignored), (1, 5));
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub struct Profile {
     /// Passed through from your shell when set (credentials, endpoints).
     pub pass_env: Vec<&'static str>,
     pub net: Net,
+    /// Hosts the agent needs, for `Net::Proxy`.
+    pub allow: Vec<&'static str>,
     pub output: Output,
 }
 
@@ -70,7 +72,10 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()),
         ],
         pass_env: vec!["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"],
-        net: Net::Host,
+        net: Net::Proxy,
+        // The API, plus what logging in and refreshing a login talk to.
+        // Anything else shows up as "blocked" in the output and the journal.
+        allow: vec!["api.anthropic.com", "console.anthropic.com", "platform.claude.com", "claude.ai"],
         output,
     })
 }

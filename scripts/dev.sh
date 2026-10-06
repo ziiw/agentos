@@ -19,6 +19,12 @@ CMD="${1:-shell}"
 TTY=()
 [ -t 0 ] && [ -t 1 ] && TTY=(-it)
 
+# Say which checkout gets built: every checkout shares the same build cache,
+# so running an old copy's dev.sh silently installs the old code.
+REV="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "no git")"
+DIRTY="$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -q . && echo " + uncommitted changes" || true)"
+echo "agentos: building $REV$DIRTY from $ROOT" >&2
+
 # /home/dev and /data are named volumes (ext4 inside the Docker VM) because
 # overlayfs can't use the container's own overlay root as an upper dir. As a
 # bonus, your home, tasks and projects survive between shells.

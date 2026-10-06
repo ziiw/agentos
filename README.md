@@ -5,7 +5,7 @@
 ```console
 $ cd ~/app
 $ agent do "add a test for greet"
-agent ▸ task 7c1e04a2  claude: add a test for greet  rw ~/app  ro ~/.local/share/claude/versions  net host
+agent ▸ task 7c1e04a2  claude: add a test for greet  rw ~/app  ro ~/.local/share/claude/versions  net api.anthropic.com +3
   I'll add a test for greet.
   ⏺ Read greet.py
   ⏺ Write test_greet.py
@@ -24,7 +24,7 @@ $ agent log           # what happened, verifiably
 
 Every agent task is a *transaction*:
 
-- the agent sees **only what you grant**: by default the current folder. No `~/.ssh`, no other projects, no environment secrets, no network unless the agent needs it.
+- the agent sees **only what you grant**: by default the current folder. No `~/.ssh`, no other projects, no environment secrets. Network access is an **allowlist**: Claude reaches Anthropic's API and nothing else, and every connection is logged.
 - its writes land in an **overlay, not your files**: when it finishes you `diff`, then `commit` or `rollback`, all of it or per path. That's why the agent runs with its own permission prompts off: nothing it does is final until you say so.
 - everything, including each tool call and what it cost, is recorded in a **hash-chained journal** the agent can't reach.
 
@@ -97,11 +97,29 @@ scripts/dev.sh shell
 | `/tmp`, `/var/tmp`, `/run`, `/dev/shm` | private, discarded at exit |
 | `/proc` | its own pid namespace only |
 | `/dev` | `null zero full random urandom tty`, a private `pts` |
-| network | loopback only (`--net none`, default) or the host's (`--net host`) |
+| network | `agent run`: loopback only by default. `agent do`: the agent's allowlist. `--allow HOST` adds hosts (and switches `agent run` to an allowlist); `--net host` shares your network. |
 | environment | `PATH TERM LANG LC_* TZ USER SHELL EDITOR…`, `HOME`, `AGENTOS_TASK`, and only what you pass with `-e` |
 | the task store | never visible, even through a grant |
 
 Conflicts: if a file changed on your side while the agent worked on its copy, `commit` refuses, tells you which files, and applies nothing. `--force` takes the agent's version.
+
+Ignored changes: files matching the folder's `.gitignore`, or generated files like `__pycache__/` and `*.pyc`, are summarized in one line by `diff` and left out by `commit`. `diff --all` and `commit --all` include them, as does naming them: `agent commit last build/`.
+
+## Network
+
+With an allowlist, the agent has no network at all, not even DNS. Its only way out is an HTTPS proxy outside the sandbox, reached through a socket passed into it:
+
+```
+agent ──HTTPS_PROXY──▶ 127.0.0.1 (inside) ──▶ socket ══╪══▶ proxy (outside) ──▶ allowed host
+```
+
+The proxy accepts `CONNECT` to allowlisted hosts only, refuses hosts that resolve to private or local addresses, and journals every attempt with byte counts. Refused connections show up live, with the flag that would allow them:
+
+```console
+agent: blocked pypi.org:443: not in the allowlist (allow it with --allow pypi.org)
+```
+
+`agent log` lists every connection: `✓ api.anthropic.com:443 · ↑1.9 kB ↓4.8 kB · 228ms`.
 
 ## Agents
 
@@ -117,15 +135,17 @@ Headless runs (`agent do "TASK"`) stream progress and journal every tool call, t
 
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 
-## Limits of Phase 0 (honest list)
+## Limits (honest list)
 
-- **Network is all or nothing.** `agent do` gives Claude your network (`net host`) because it needs the API. The next milestone replaces that with an egress proxy that only lets through the hosts the agent needs.
+- **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
+- **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
 - **Credentials are visible to the agent**: the API key it's given, or its login in its own home. The credential broker fixes this.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
 - **No seccomp filter yet.** In particular, on kernels before 6.2 (or with `dev.tty.legacy_tiocsti=1`), a process sharing your terminal can inject keystrokes into it.
 - **Only your own uid is mapped.** Files in a writable grant owned by another user (e.g. root-owned build output) can be read but not modified.
 - **Writable grants must be directories**, and their paths can't contain `,` `:` or `\`.
 - **Conflict detection uses mtimes.** If you *delete* a file on the host that the agent modified, commit recreates it without warning.
+- **Only the top-level `.gitignore` of a grant is read**, not nested ones.
 - **The journal is tamper-evident against the agent, not against you.** Anchoring its head (TPM, remote witness) is a later phase.
 - **Landlock is best-effort.** It's used when the kernel has it (`agent doctor` tells you). Namespaces do the isolation either way.
 - **Grants are mounted at their canonical path.** If `~/app` is a symlink, the agent sees the real path.
@@ -139,7 +159,9 @@ src/journal.rs   hash-chained event log
 src/store.rs     on-disk task store
 src/doctor.rs    environment checks
 src/profiles.rs  agent profiles (Claude Code) and their output
+src/proxy.rs     egress proxy and allowlist
 src/main.rs      CLI          src/render.rs   output
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run
+.github/workflows/ci.yml   unit + e2e tests on real Ubuntu 24.04 (x86_64, arm64), Landlock required
 ```

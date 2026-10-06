@@ -2,6 +2,7 @@ use agentos::changes::{self, Summary};
 use agentos::doctor::{self, Level};
 use agentos::journal::{Integrity, Journal};
 use agentos::profiles::{self, AgentEvent, Output};
+use agentos::proxy::{self, Allowlist, NetEvent};
 use agentos::sandbox::{self, GrantMount, Mount};
 use agentos::store::{Access, Grant, Net, NewTask, Status, Store, Task};
 use agentos::util::{self, display_path};
@@ -15,6 +16,9 @@ use std::io::{BufRead, BufReader, IsTerminal};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 mod render;
 
@@ -28,7 +32,7 @@ const PASS_ENV: &[&str] = &[
 #[derive(Parser)]
 #[command(
     name = "agent",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENTOS_REV"), ")"),
     about = "Run AI agents as transactions: sandboxed, reversible, audited.",
     after_help = "Examples:
   agent do \"add a test for greet\"   give a task to Claude Code, working on this folder
@@ -59,6 +63,9 @@ enum Command {
         /// Only list changed paths, no contents
         #[arg(long)]
         stat: bool,
+        /// Also show ignored changes (.gitignore, __pycache__, …)
+        #[arg(long)]
+        all: bool,
     },
     /// Apply a task's changes to your files (all of them, or only those under PATHs)
     Commit {
@@ -68,6 +75,9 @@ enum Command {
         /// Commit even if the files changed on your side while the agent ran
         #[arg(long)]
         force: bool,
+        /// Include ignored changes (.gitignore, __pycache__, …)
+        #[arg(long)]
+        all: bool,
     },
     /// Discard a task's changes (all of them, or only those under PATHs)
     #[command(alias = "discard")]
@@ -108,13 +118,17 @@ struct GrantArgs {
     /// Don't grant the current directory
     #[arg(long)]
     no_cwd: bool,
+    /// Let the agent reach this host through the egress proxy (HOST,
+    /// *.DOMAIN or HOST:PORT; port 443 by default). Nothing else is reachable.
+    #[arg(long, value_name = "HOST")]
+    allow: Vec<String>,
 }
 
 #[derive(Args)]
 struct RunArgs {
     #[command(flatten)]
     grants: GrantArgs,
-    /// Network: none (loopback only) or host
+    /// Network: none (loopback only) or host. --allow gives an allowlist instead.
     #[arg(long, default_value = "none")]
     net: Net,
     /// The command to run
@@ -132,7 +146,8 @@ struct DoArgs {
     /// Watch and steer the agent in its own interface instead of running it to completion
     #[arg(short, long)]
     interactive: bool,
-    /// Network: none or host (default: what the agent needs)
+    /// Network: none or host, instead of the default allowlist of what the
+    /// agent needs (extend that with --allow)
     #[arg(long)]
     net: Option<Net>,
     /// What the agent should do. Omit it to open an interactive session.
@@ -146,6 +161,8 @@ struct Plan {
     argv: Vec<String>,
     grants: GrantArgs,
     net: Net,
+    /// Hosts reachable through the egress proxy (`Net::Proxy`).
+    allow: Vec<String>,
     /// Read-only grants for the agent's own installation.
     install: Vec<PathBuf>,
     profile_env: Vec<(String, String)>,
@@ -174,8 +191,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Do(args) => cmd_do(&store, args),
         Command::Run(args) => cmd_run(&store, args),
         Command::Ls => cmd_ls(&store),
-        Command::Diff { task, paths, stat } => cmd_diff(&store, task.as_deref(), &paths, stat),
-        Command::Commit { task, paths, force } => cmd_commit(&store, task.as_deref(), &paths, force),
+        Command::Diff { task, paths, stat, all } => cmd_diff(&store, task.as_deref(), &paths, stat, all),
+        Command::Commit { task, paths, force, all } => cmd_commit(&store, task.as_deref(), &paths, force, all),
         Command::Rollback { task, paths } => cmd_rollback(&store, task.as_deref(), &paths),
         Command::Log { task, json } => cmd_log(&store, task.as_deref(), json),
         Command::Doctor => cmd_doctor(&store),
@@ -198,13 +215,20 @@ fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
         Some(t) => format!("{}: {t}", profile.name),
         None => format!("{} (interactive)", profile.name),
     };
+    let net = args.net.unwrap_or(profile.net);
+    if net != Net::Proxy && !args.grants.allow.is_empty() {
+        bail!("--allow only applies to the agent's default, proxied network; drop --net {net}");
+    }
+    let mut allow: Vec<String> = profile.allow.iter().map(|h| h.to_string()).collect();
+    allow.extend(args.grants.allow.iter().cloned());
     execute(
         store,
         Plan {
             title: Some(title),
             argv: profile.argv,
             grants: args.grants,
-            net: args.net.unwrap_or(profile.net),
+            net,
+            allow,
             install: profile.install,
             profile_env: profile.env,
             pass_env: profile.pass_env,
@@ -217,13 +241,20 @@ fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
 
 fn cmd_run(store: &Store, args: RunArgs) -> Result<i32> {
     let argv = args.command;
+    let net = match (args.grants.allow.is_empty(), args.net) {
+        (true, net) => net,
+        (false, Net::Host) => bail!("--allow and --net host contradict each other: --allow means only those hosts"),
+        (false, _) => Net::Proxy,
+    };
+    let allow = args.grants.allow.clone();
     let code = execute(
         store,
         Plan {
             title: None,
             argv: argv.clone(),
             grants: args.grants,
-            net: args.net,
+            net,
+            allow,
             install: Vec::new(),
             profile_env: Vec::new(),
             pass_env: Vec::new(),
@@ -297,6 +328,8 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             grants.push(Grant { path: path.clone(), access: Access::Ro, layer: None });
         }
     }
+    let allow = if plan.net == Net::Proxy { plan.allow } else { Vec::new() };
+    let allowlist = Allowlist::parse(&allow)?;
     let hidden = plan
         .grants
         .hide
@@ -326,6 +359,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         grants,
         hidden,
         net: plan.net,
+        allow,
         env: env_names,
     })?;
     env.push(("AGENTOS_TASK".into(), task.id().to_string()));
@@ -340,12 +374,23 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             "grants": task.meta.grants,
             "hidden": task.meta.hidden,
             "net": task.meta.net,
+            "allow": task.meta.allow,
             "env": task.meta.env,
         }),
     )?;
 
     let err = Paint::stderr();
     eprintln!("{}", render::banner(err, &task));
+    // The proxy's socket must exist before the sandbox mounts it, but its
+    // threads may only start once the sandbox has been forked.
+    let (proxy_socket, mut proxy_listener) = if task.meta.net == Net::Proxy {
+        let path = task.dir.join("net.sock");
+        let listener = proxy::bind(&path)?;
+        (Some(path), Some(listener))
+    } else {
+        (None, None)
+    };
+    let blocked = Arc::new(AtomicUsize::new(0));
     let spec = sandbox::Spec {
         rootfs: task.rootfs_dir(),
         grants: task
@@ -362,7 +407,8 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             .collect(),
         hide: task.meta.hidden.clone(),
         mask: vec![store.root().to_path_buf()],
-        isolate_net: task.meta.net == Net::None,
+        isolate_net: task.meta.net != Net::Host,
+        proxy: proxy_socket.clone(),
         hostname: format!("agent-{}", task.id()),
         home,
         home_source,
@@ -380,6 +426,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     };
     let mut setup_error = None;
     let mut outcome = None;
+    let mut proxy_handle = None;
     let result = sandbox::run(&spec, stdout_tx, |report| {
         let kind = if report.error.is_some() { "sandbox.failed" } else { "sandbox.ready" };
         if let Err(e) = journal.append(kind, json!(report)) {
@@ -389,6 +436,9 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             eprintln!("{} {w}", err.yellow("agent: warning:"));
         }
         setup_error = report.error.clone();
+        if let Some(listener) = proxy_listener.take() {
+            proxy_handle = Some(proxy::serve(listener, allowlist, net_sink(journal.clone(), blocked.clone(), err)));
+        }
         if let Some(rx) = stdout_rx {
             outcome = follow_agent(rx, &journal, &cwd);
         }
@@ -400,6 +450,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             125
         }
     };
+    if let Some(handle) = proxy_handle {
+        handle.drain(Duration::from_secs(2));
+    }
+    if let Some(path) = &proxy_socket {
+        let _ = fs::remove_file(path);
+    }
 
     let summary = Summary::of(&changes::scan(&task.layers())?);
     let ended = util::now_ms();
@@ -414,8 +470,28 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     if let Some(e) = setup_error {
         bail!("sandbox setup failed: {e}\n(run `agent doctor` to check this machine)");
     }
-    eprintln!("{}", render::exit_summary(err, &task, &summary, outcome.as_ref()));
+    eprintln!("{}", render::exit_summary(err, &task, &summary, outcome.as_ref(), blocked.load(Ordering::SeqCst)));
     Ok(exit_code)
+}
+
+/// Records each connection through the egress proxy and says so, live,
+/// when one is refused.
+fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, err: Paint) -> proxy::Sink {
+    Arc::new(move |event: NetEvent| {
+        let _ = journal.append("net.connect", json!(event));
+        if !event.allowed {
+            blocked.fetch_add(1, Ordering::SeqCst);
+            let target = format!("{}:{}", event.host, event.port);
+            let why = event.reason.as_deref().unwrap_or("refused");
+            let hint = if why == "not in the allowlist" {
+                let host = if event.port == 443 { event.host.clone() } else { target.clone() };
+                format!(" (allow it with --allow {host})")
+            } else {
+                String::new()
+            };
+            eprintln!("{} {target}: {why}{hint}", err.yellow("agent: blocked"));
+        }
+    })
 }
 
 /// Shows an agent's structured output as it works and records the
@@ -424,7 +500,14 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 fn follow_agent(rx: OwnedFd, journal: &Journal, cwd: &Path) -> Option<AgentEvent> {
     let (out, err) = (Paint::stdout(), Paint::stderr());
     let mut done = None;
-    let mut last_text = String::new();
+    // Narration is shown one event late: the agent's last message is also its
+    // result, which is printed in full, so it shouldn't appear twice.
+    let mut narration: Option<String> = None;
+    let flush = |narration: &mut Option<String>| {
+        if let Some(text) = narration.take() {
+            eprintln!("  {}", err.dim(render::first_line(&text, 110)));
+        }
+    };
     let mut recognized = false;
     let mut unrecognized: Vec<String> = Vec::new();
     let mut journal_ok = true;
@@ -447,14 +530,17 @@ fn follow_agent(rx: OwnedFd, journal: &Journal, cwd: &Path) -> Option<AgentEvent
         };
         recognized = true;
         for event in events {
+            if !matches!(event, AgentEvent::Text(_) | AgentEvent::Done { .. }) {
+                flush(&mut narration);
+            }
             match &event {
                 AgentEvent::Session { model } => {
                     record("agent.session", json!({ "model": model }));
                     eprintln!("  {}", err.dim(format!("model {model}")));
                 }
                 AgentEvent::Text(text) => {
-                    eprintln!("  {}", err.dim(render::first_line(text, 110)));
-                    last_text = text.clone();
+                    flush(&mut narration);
+                    narration = Some(text.clone());
                 }
                 AgentEvent::Tool { name, target } => {
                     record("agent.tool", json!({ "name": name, "target": target }));
@@ -463,9 +549,12 @@ fn follow_agent(rx: OwnedFd, journal: &Journal, cwd: &Path) -> Option<AgentEvent
                 }
                 AgentEvent::Done { text, is_error, turns, cost_usd } => {
                     record("agent.result", json!({ "is_error": is_error, "turns": turns, "cost_usd": cost_usd }));
+                    if narration.as_deref().map(str::trim) == Some(text.trim()) {
+                        narration = None;
+                    }
+                    flush(&mut narration);
                     if *is_error {
-                        let detail = if *text == last_text { String::new() } else { format!(" {text}") };
-                        eprintln!("{}{detail}", err.red("agent reported an error"));
+                        eprintln!("{} {text}", err.red("agent reported an error:"));
                         if text.contains("/login") {
                             eprintln!(
                                 "{} log the agent in once: run `agent do` (interactive) and type /login.\n      Or export ANTHROPIC_API_KEY before running.",
@@ -481,6 +570,7 @@ fn follow_agent(rx: OwnedFd, journal: &Journal, cwd: &Path) -> Option<AgentEvent
             }
         }
     }
+    flush(&mut narration);
     if !recognized && !unrecognized.is_empty() {
         eprintln!("{} unrecognized agent output, shown as-is:", err.yellow("agent: warning:"));
         for line in unrecognized {
@@ -540,19 +630,30 @@ fn open_task(store: &Store, selector: Option<&str>) -> Result<Task> {
     Ok(task)
 }
 
-fn cmd_diff(store: &Store, selector: Option<&str>, paths: &[PathBuf], stat: bool) -> Result<i32> {
+fn cmd_diff(store: &Store, selector: Option<&str>, paths: &[PathBuf], stat: bool, all: bool) -> Result<i32> {
     let task = store.resolve(selector)?;
     let changes = changes::select(changes::scan(&task.layers())?, &absolutize_all(paths)?);
-    print!("{}", render::diff(Paint::stdout(), &task, &changes, stat));
+    print!("{}", render::diff(Paint::stdout(), &task, &changes, stat, all));
     Ok(0)
 }
 
-fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: bool) -> Result<i32> {
+fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: bool, all: bool) -> Result<i32> {
     let mut task = open_task(store, selector)?;
     let layers = task.layers();
-    let selected = changes::select(changes::scan(&layers)?, &absolutize_all(paths)?);
+    let mut selected = changes::select(changes::scan(&layers)?, &absolutize_all(paths)?);
+    // Naming paths explicitly includes ignored changes under them.
+    let skipped = if paths.is_empty() && !all {
+        let before = selected.len();
+        selected.retain(|c| !c.ignored);
+        before - selected.len()
+    } else {
+        0
+    };
     if selected.is_empty() {
-        println!("nothing to commit");
+        match skipped {
+            0 => println!("nothing to commit"),
+            n => println!("nothing to commit ({} ignored; `agent commit --all` includes them)", plural(n, "change")),
+        }
         return Ok(0);
     }
     if !force {
@@ -571,8 +672,12 @@ fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: b
         }),
     )?;
     let remaining = changes::scan(&layers)?;
-    print!("{}", render::committed(Paint::stdout(), &task, &selected, remaining.len()));
-    if remaining.is_empty() {
+    let pending = remaining.iter().filter(|c| !c.ignored).count();
+    print!("{}", render::committed(Paint::stdout(), &task, &selected, pending));
+    if pending == 0 {
+        if !remaining.is_empty() {
+            println!("{}", Paint::stdout().dim(format!("left out {}", render::ignored_summary(&remaining))));
+        }
         task.meta.status = Status::Committed;
         task.save()?;
         task.release_storage()?;
@@ -586,24 +691,25 @@ fn cmd_rollback(store: &Store, selector: Option<&str>, paths: &[PathBuf]) -> Res
     let pending = changes::scan(&layers)?;
     let journal = task.journal();
     let committed_before = journal.read()?.iter().any(|e| e.kind == "commit");
+    let counted = |changes: &[changes::Change]| changes.iter().filter(|c| !c.ignored).count();
     let remaining = if paths.is_empty() {
         journal.append("rollback", json!({ "all": true, "changes": Summary::of(&pending) }))?;
+        let n = plural(counted(&pending), "change");
         if committed_before {
-            println!("rolled back the remaining {} from task {}", plural(pending.len(), "change"), task.id());
+            println!("rolled back the remaining {n} from task {}", task.id());
         } else {
-            println!("rolled back {} from task {}; your files are as they were", plural(pending.len(), "change"), task.id());
+            println!("rolled back {n} from task {}; your files are as they were", task.id());
         }
         0
     } else {
         let targets = absolutize_all(paths)?;
         changes::rollback(&layers, &pending, &targets)?;
         journal.append("rollback", json!({ "paths": targets }))?;
-        let left = changes::scan(&layers)?.len();
+        let left = counted(&changes::scan(&layers)?);
         println!(
-            "rolled back {} from task {}; {} still pending",
-            plural(pending.len().saturating_sub(left), "change"),
+            "rolled back {} from task {}; {left} still pending",
+            plural(counted(&pending).saturating_sub(left), "change"),
             task.id(),
-            left
         );
         left
     };

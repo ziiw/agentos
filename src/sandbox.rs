@@ -4,6 +4,7 @@
 //! supervisor (agent run)      stays on the host, writes the journal
 //!  └─ A  new user/mount/pid/ipc/uts(/net) namespaces, uid/gid maps
 //!      └─ B  pid 1: assembles the root, pivots, applies Landlock, reaps
+//!          ├─ F  (with --allow) relays 127.0.0.1 to the egress proxy socket
 //!          └─ C  execs the agent command
 //! ```
 //!
@@ -26,11 +27,18 @@ use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, execve, fork, pipe2, pivot_r
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::fs;
+use crate::proxy;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
+use std::thread;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+
+/// Where the egress proxy's socket appears inside the sandbox.
+const PROXY_SOCKET: &str = "/run/agentos/proxy.sock";
 
 /// Host directories every agent can read (never write).
 const SYSTEM_DIRS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix", "/sys"];
@@ -57,6 +65,9 @@ pub struct Spec {
     /// Like `hide`, but silent: the task store must never be visible.
     pub mask: Vec<PathBuf>,
     pub isolate_net: bool,
+    /// Host path of the egress proxy's unix socket. When set, the agent's
+    /// only way out is through it (see `proxy.rs`).
+    pub proxy: Option<PathBuf>,
     pub hostname: String,
     pub home: PathBuf,
     /// Directory mounted read-write as $HOME (an agent's persistent home).
@@ -74,6 +85,8 @@ pub struct Report {
     pub proc: String,
     pub devpts: bool,
     pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,11 +202,37 @@ fn sandbox_init(spec: &Spec, warnings: Vec<String>, report_tx: OwnedFd, stdout: 
     };
     report.cwd = cwd.display().to_string();
     report.landlock = apply_landlock(spec);
+
+    let mut proxy_env = Vec::new();
+    if spec.proxy.is_some() {
+        match TcpListener::bind("127.0.0.1:0").and_then(|l| Ok((l.local_addr()?.port(), l))) {
+            Ok((port, listener)) => match unsafe { fork() } {
+                Ok(ForkResult::Child) => {
+                    // Hold nothing the supervisor waits on to reach EOF.
+                    drop(report_tx);
+                    drop(stdout);
+                    forward(listener)
+                }
+                Ok(ForkResult::Parent { .. }) => {
+                    report.proxy_port = Some(port);
+                    let url = format!("http://127.0.0.1:{port}");
+                    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+                        proxy_env.push((name.to_string(), url.clone()));
+                    }
+                    for name in ["NO_PROXY", "no_proxy"] {
+                        proxy_env.push((name.to_string(), "localhost,127.0.0.1,::1".to_string()));
+                    }
+                }
+                Err(e) => report.warnings.push(format!("proxy forwarder: {e}")),
+            },
+            Err(e) => report.warnings.push(format!("proxy forwarder: {e}")),
+        }
+    }
     send_report(&report_tx, &report);
     drop(report_tx);
 
     match unsafe { fork() } {
-        Ok(ForkResult::Child) => exec_agent(spec, &cwd, stdout.as_ref()),
+        Ok(ForkResult::Child) => exec_agent(spec, &cwd, stdout.as_ref(), &proxy_env),
         Ok(ForkResult::Parent { child }) => {
             drop(stdout);
             reap_until(child)
@@ -258,6 +297,11 @@ fn build_root(spec: &Spec, report: &mut Report) -> Result<()> {
     fs::set_permissions(&var_tmp, fs::Permissions::from_mode(0o1777))?;
     if Path::new("/run/systemd/resolve").is_dir() {
         bind_ro(Path::new("/run/systemd/resolve"), &dir("/run/systemd/resolve")?)?;
+    }
+    if let Some(sock) = &spec.proxy {
+        let target = dir("/run/agentos")?.join("proxy.sock");
+        fs::File::create(&target)?;
+        bind(sock, &target).context("proxy socket")?;
     }
 
     // $HOME starts empty; grants are mounted shallowest-first so nested
@@ -438,8 +482,21 @@ fn apply_landlock(spec: &Spec) -> String {
     }
 }
 
+/// Process F, inside the sandbox: relays 127.0.0.1 connections to the
+/// egress proxy's socket. Dies with the sandbox.
+fn forward(listener: TcpListener) -> ! {
+    for tcp in listener.incoming().flatten() {
+        thread::spawn(move || {
+            if let Ok(unix) = UnixStream::connect(PROXY_SOCKET) {
+                proxy::pump(tcp, unix);
+            }
+        });
+    }
+    unsafe { libc::_exit(0) }
+}
+
 /// Process C: becomes the agent.
-fn exec_agent(spec: &Spec, cwd: &Path, stdout: Option<&OwnedFd>) -> ! {
+fn exec_agent(spec: &Spec, cwd: &Path, stdout: Option<&OwnedFd>, extra_env: &[(String, String)]) -> ! {
     if let Some(fd) = stdout {
         unsafe { libc::dup2(fd.as_raw_fd(), 1) };
     }
@@ -457,7 +514,7 @@ fn exec_agent(spec: &Spec, cwd: &Path, stdout: Option<&OwnedFd>) -> ! {
     let program = resolve_program(&spec.argv[0], path_var);
     let to_c = |s: &str| CString::new(s).unwrap_or_default();
     let argv: Vec<CString> = spec.argv.iter().map(|a| to_c(a)).collect();
-    let env: Vec<CString> = spec.env.iter().map(|(k, v)| to_c(&format!("{k}={v}"))).collect();
+    let env: Vec<CString> = spec.env.iter().chain(extra_env).map(|(k, v)| to_c(&format!("{k}={v}"))).collect();
     let err = execve(&CString::new(program.as_os_str().as_bytes()).unwrap_or_default(), &argv, &env).unwrap_err();
     eprintln!("agent: {}: {}", spec.argv[0], if err == Errno::ENOENT { "command not found in the sandbox".to_string() } else { err.to_string() });
     unsafe { libc::_exit(if err == Errno::ENOENT { 127 } else { 126 }) }

@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # Real Ubuntu 24.04 kernels: Landlock is enforced here (Docker Desktop's
+    # kernel doesn't have it), and AppArmor restricts unprivileged user
+    # namespaces, so the install instructions in README.md get exercised too.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustc --version
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - name: Install agent, with the AppArmor profile from README.md
+        run: |
+          sudo install -m 0755 target/release/agent /usr/local/bin/agent
+          sudo tee /etc/apparmor.d/agentos >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile agentos /usr/local/bin/agent flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/agentos
+
+      - name: agent doctor
+        run: agent doctor
+
+      - name: End-to-end tests
+        run: REQUIRE_LANDLOCK=1 bash tests/e2e.sh

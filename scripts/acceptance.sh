@@ -17,6 +17,7 @@ pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; failed=1; }
 ask()  { read -rp "  $1 [y/N] " answer; if [[ $answer == [yY]* ]]; then pass "$1"; else fail "$1"; fi; }
 
+echo "testing $(agent --version)"
 rm -rf "$APP" && mkdir -p "$APP" && cd "$APP" || exit 1
 cat > greet.py <<'EOF'
 def greet(name):

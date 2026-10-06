@@ -41,8 +41,11 @@ pub struct Grant {
 pub enum Net {
     /// Private network namespace with only loopback.
     None,
-    /// Share the host network (Phase 1 replaces this with a policy proxy).
+    /// Share the host network.
     Host,
+    /// Private namespace whose only way out is the egress proxy, which
+    /// lets through the task's allowlist (`--allow`).
+    Proxy,
 }
 
 impl FromStr for Net {
@@ -51,7 +54,7 @@ impl FromStr for Net {
         match s {
             "none" => Ok(Net::None),
             "host" => Ok(Net::Host),
-            _ => Err(format!("unknown network mode '{s}' (expected none or host)")),
+            _ => Err(format!("unknown network mode '{s}' (expected none or host; use --allow HOST for an allowlist)")),
         }
     }
 }
@@ -61,6 +64,7 @@ impl fmt::Display for Net {
         f.write_str(match self {
             Net::None => "none",
             Net::Host => "host",
+            Net::Proxy => "proxy",
         })
     }
 }
@@ -94,6 +98,9 @@ pub struct TaskMeta {
     #[serde(default)]
     pub hidden: Vec<PathBuf>,
     pub net: Net,
+    /// Hosts the egress proxy lets through (`Net::Proxy`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
     /// Names of environment variables passed in. Values are never stored.
     pub env: Vec<String>,
     pub status: Status,
@@ -111,6 +118,7 @@ pub struct NewTask {
     pub grants: Vec<Grant>,
     pub hidden: Vec<PathBuf>,
     pub net: Net,
+    pub allow: Vec<String>,
     pub env: Vec<String>,
 }
 
@@ -266,6 +274,7 @@ impl Store {
                 grants,
                 hidden: new.hidden,
                 net: new.net,
+                allow: new.allow,
                 env: new.env,
                 status: Status::Running,
                 started_at_ms: now_ms(),
