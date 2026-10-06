@@ -240,13 +240,14 @@ impl Asker {
         }
         if let Some(t) = tty.as_mut() {
             let elsewhere = if self.web { " (or answer in agentd)" } else { "" };
-            let _ = write!(
-                t,
+            // One write, so it can't interleave with the agent's own output.
+            let question = format!(
                 "\n{} the agent wants to reach {} · [y] this task · [a] always, in {} · [N] deny{elsewhere} › ",
                 paint("agent ▸"),
                 key,
                 display_path(&self.project)
             );
+            let _ = t.write_all(question.as_bytes());
             let _ = t.flush();
         }
 

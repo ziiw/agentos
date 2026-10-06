@@ -850,6 +850,14 @@ fn cmd_approvals(store: &Store, revoke: Option<String>) -> Result<i32> {
     Ok(0)
 }
 
+/// Prints a line to stderr in one write, so it can't interleave with output
+/// the agent writes to the same terminal at the same moment (eprintln! may
+/// write a formatted line in pieces).
+fn say(line: String) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+}
+
 /// Records each connection through the egress proxy and says so, live,
 /// when one is refused.
 fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(&'static str, &'static str)>, err: Paint) -> proxy::Sink {
@@ -867,7 +875,7 @@ fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(&'static
         if let Some(why) = expected_why {
             // Deliberately closed: say why once, don't count it as a problem.
             if explained.lock().is_ok_and(|mut seen| seen.insert(event.host.clone())) {
-                eprintln!("  {}", err.dim(format!("{} stays closed: {why} (--allow {} opens it)", event.host, event.host)));
+                say(format!("  {}", err.dim(format!("{} stays closed: {why} (--allow {} opens it)", event.host, event.host))));
             }
         } else if !event.allowed {
             blocked.fetch_add(1, Ordering::SeqCst);
@@ -879,9 +887,9 @@ fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(&'static
             } else {
                 String::new()
             };
-            eprintln!("{} {target}: {why}{hint}", err.yellow("agent: blocked"));
+            say(format!("{} {target}: {why}{hint}", err.yellow("agent: blocked")));
         } else if let Some(reason) = &event.reason {
-            eprintln!("{} {}:{}: {reason}", err.yellow("agent: warning:"), event.host, event.port);
+            say(format!("{} {}:{}: {reason}", err.yellow("agent: warning:"), event.host, event.port));
         }
     })
 }
