@@ -2,8 +2,8 @@ name: disk
 
 # A bootable agentos disk image (qcow2) for a VM or cloud, on demand:
 # Actions → disk → Run workflow. Builds it, boots it in QEMU, logs in over
-# SSH and runs agentos inside the booted system, then uploads the disk
-# (~1.2 GB) as an artifact.
+# SSH and runs the whole e2e suite inside the booted system, then uploads
+# the disk (~1.2 GB) as an artifact.
 on:
   workflow_dispatch:
 
@@ -61,8 +61,11 @@ jobs:
           vm true || { echo "never came up over SSH"; tail -50 serial.log; exit 1; }
           vm 'grep PRETTY_NAME /etc/os-release; agent --version; sudo bootc status --format=humanreadable 2>/dev/null | head -5 || true'
           vm agent doctor
-          vm 'mkdir -p ~/app && cd ~/app && echo one > notes.txt && agent run -- sh -c "echo two >> notes.txt" && agent diff && test "$(cat notes.txt)" = one && agent commit && test "$(tail -1 notes.txt)" = two && echo "BOOTED SYSTEM: transaction committed"'
           vm 'cat /usr/lib/motd.d/agentos | head -3'
+          # The whole end-to-end suite, inside the booted system: a real
+          # login session, so systemd user scopes (resource limits) too.
+          scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i boot-test-key -P 2222 -r tests ci@127.0.0.1:
+          vm 'E2E_DIR=/var/tmp REQUIRE_LANDLOCK=1 bash tests/e2e.sh'
 
       - uses: actions/upload-artifact@v4
         with:

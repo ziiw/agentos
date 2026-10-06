@@ -515,6 +515,11 @@ fn describe(p: Paint, e: &Event) -> String {
         "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
         "login.sealed" => format!("{} tokens moved to the vault", d["tokens"]),
+        "task.limits" => {
+            let l: agentos::limits::Limits = serde_json::from_value(d["limits"].clone()).unwrap_or_default();
+            format!("{} ({})", l.describe(), s(&d["scope"]))
+        }
+        "task.oom" => p.red(format!("out of memory: the kernel killed {} process(es)", d["kills"])),
         "task.stopped" => match d["reason"].as_str() {
             Some("timeout") => p.yellow("timed out (--timeout)"),
             _ => p.yellow("stopped"),

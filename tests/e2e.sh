@@ -105,8 +105,10 @@ cd "$PROJ"
 "$AGENT" run --ro "$PROJ" -- sh -c "echo x > '$PROJ/notes.txt'" 2>/dev/null
 check "read-only grant cannot be written" test $? -ne 0
 check "agent is not pid 1 but sees few processes" "$AGENT" run -- sh -c 'test $$ -eq 2'
-check "no network by default (only loopback)" "$AGENT" run -- sh -c '! grep -q eth0 /proc/net/dev && grep -q "lo:" /proc/net/dev'
-check "--net host shares the network" "$AGENT" run --net host -- sh -c 'grep -q eth0 /proc/net/dev'
+# Routes out, whatever the interfaces are called (eth0, enp0s2, …); some
+# kernels also put inert tunnel devices in every network namespace.
+check "no network by default (no route out)" "$AGENT" run -- sh -c 'test "$(wc -l < /proc/net/route)" -le 1'
+check "--net host shares the network" "$AGENT" run --net host -- sh -c 'test "$(wc -l < /proc/net/route)" -gt 1'
 check "own hostname" "$AGENT" run -- sh -c 'case "$(cat /proc/sys/kernel/hostname)" in agent-*) ;; *) exit 1;; esac'
 check "--hide masks a granted subpath" "$AGENT" run --ro "$PROJ" --hide "$PROJ/old" -- sh -c "test ! -e '$PROJ/old/a'"
 check "store invisible through a read-only grant" "$AGENT" run --ro "$WORK" -- sh -c "test ! -e '$AGENTOS_HOME/tasks'"
@@ -296,6 +298,23 @@ started=$(date +%s)
 "$AGENT" run --timeout 2s -- sleep 30 >/dev/null 2>&1
 check "--timeout stops a task that runs too long" test "$(( $(date +%s) - started ))" -lt 10
 check "...and it shows as timed out" grep -q 'timed out' <<<"$("$AGENT" ls | sed -n 2p)"
+
+section "resource limits"
+reset_proj
+cd "$PROJ"
+check "a malformed limit is rejected" bash -c "! '$AGENT' run --memory lots -- true 2>/dev/null"
+if systemd-run --user --scope --quiet --collect true 2>/dev/null; then
+  "$AGENT" run --memory 64M -- python3 -c 'b = bytearray(512 * 1024 * 1024)' >/dev/null 2>&1
+  check "--memory stops a task that needs more" test $? -ne 0
+  check "...the out-of-memory kill is journaled" grep -q '"kind":"task.oom"' "$(latest_task_dir)/events.jsonl"
+  check "...and so are the limits" grep -q '"kind":"task.limits".*"memory":"64M"' "$(latest_task_dir)/events.jsonl"
+  check "--pids caps processes and threads" bash -c "! '$AGENT' run --pids 30 -- python3 -c 'import threading, time; [threading.Thread(target=time.sleep, args=(2,)).start() for _ in range(100)]' >/dev/null 2>&1"
+  check "a task within its limits runs normally" "$AGENT" run --memory 256M --cpus 1 --pids 100 -- python3 -c 'print(sum(range(10**6)))'
+else
+  out="$("$AGENT" run --memory 1G -- true 2>&1)"
+  check "asking for limits where they can't be enforced fails, and says why" grep -q 'need a systemd user session' <<<"$out"
+  skip "limit enforcement needs a systemd user session (the booted-VM test covers it)"
+fi
 
 section "git push outbox"
 if command -v git >/dev/null; then

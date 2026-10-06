@@ -4,6 +4,7 @@ use agentos::changes::{self, Summary};
 use agentos::config;
 use agentos::doctor::{self, Level};
 use agentos::journal::{Integrity, Journal};
+use agentos::limits::{self, Limits};
 use agentos::outbox;
 use agentos::profiles::{self, AgentEvent, Output};
 use agentos::proxy::{self, Allowlist, NetEvent};
@@ -211,6 +212,45 @@ struct Mode {
     /// Stop the task after this long (e.g. 90s, 30m, 2h)
     #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
     timeout: Option<Duration>,
+    /// Memory limit for the task, e.g. 4G (needs a systemd user session)
+    #[arg(long, value_name = "SIZE")]
+    memory: Option<String>,
+    /// CPU limit, in CPUs (e.g. 2 or 0.5)
+    #[arg(long, value_name = "N")]
+    cpus: Option<f32>,
+    /// Limit on processes and threads
+    #[arg(long, value_name = "N")]
+    pids: Option<u32>,
+}
+
+impl Mode {
+    /// Re-runs this command inside a systemd scope carrying the resource
+    /// limits (flags over config), unless that's already done. Returns only
+    /// when there are no limits to apply (or none can be, from config).
+    fn apply_limits(&self, store: &Store) -> Result<()> {
+        if limits::current().is_some() {
+            return Ok(());
+        }
+        let asked = Limits { memory: self.memory.clone(), cpus: self.cpus, pids: self.pids };
+        let explicit = !asked.is_empty();
+        let configured = config::load(store.root(), &std::env::current_dir()?, &home_dir()?)?.limits;
+        let wanted = asked.or(&configured);
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        wanted.validate()?;
+        if limits::available() {
+            limits::reexec_in_scope(&wanted)?;
+        }
+        if explicit {
+            bail!("--memory/--cpus/--pids need a systemd user session (systemd-run --user), which isn't available here");
+        }
+        eprintln!(
+            "{} the [limits] in your config aren't enforced: no systemd user session here",
+            Paint::stderr().yellow("agent: warning:")
+        );
+        Ok(())
+    }
 }
 
 #[derive(Args)]
@@ -451,6 +491,7 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         }
         return launch_background(store);
     }
+    args.mode.apply_limits(store)?;
     if task.is_none() && !std::io::stdin().is_terminal() {
         bail!("give the agent a task: agent do \"…\"");
     }
@@ -519,6 +560,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     if args.mode.bg {
         return launch_background(store);
     }
+    args.mode.apply_limits(store)?;
     let argv = args.command;
     let (config_allow, config_secrets) = apply_config(store, &mut args.grants)?;
     let mut secrets = parse_secrets(&args.grants.secret)?;
@@ -728,6 +770,10 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         journal.append("outbox.ready", json!({ "remotes": o.remotes }))?;
     }
     eprintln!("{}", render::banner(err, &task, outbox.is_some(), plan.login.as_ref().is_some_and(|l| l.brokered)));
+    if let Some(l) = limits::current() {
+        eprintln!("  {}", err.dim(format!("limits: {}", l.describe())));
+        journal.append("task.limits", json!({ "limits": l, "scope": limits::scope_name() }))?;
+    }
     // The proxy's socket must exist before the sandbox mounts it, but its
     // threads may only start once the sandbox has been forked.
     let (proxy_socket, mut proxy_listener) = if task.meta.net == Net::Proxy {
@@ -850,6 +896,11 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     }
     let summary = Summary::of(&changes::scan(&task.layers())?);
     let ended = util::now_ms();
+    let oom = if limits::current().is_some() { limits::oom_kills() } else { 0 };
+    if oom > 0 {
+        journal.append("task.oom", json!({ "kills": oom }))?;
+        eprintln!("{} the task ran out of memory ({}): the kernel killed {oom} process{}", err.yellow("agent ▸"), limits::current().and_then(|l| l.memory).unwrap_or_default(), if oom == 1 { "" } else { "es" });
+    }
     if let Some(why) = sandbox::stopped() {
         let (reason, text) = match why {
             sandbox::Stop::Timeout => ("timeout", format!("stopped after {} (--timeout)", util::duration(ended - task.meta.started_at_ms))),

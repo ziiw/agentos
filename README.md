@@ -167,6 +167,14 @@ agent do --bg --timeout 30m "find and fix the flaky test"
 
 `--bg` gives you the terminal back and prints the task id. The task keeps what it prints (`agent logs -f`). Its questions go to agentd's console, since there's no terminal to ask at; without agentd running, hosts outside the allowlist are refused. `agent wait` blocks until a task ends and exits with its code. `agent stop` ends it early. `--timeout` stops a task that runs too long. Either way, what it did up to that point is held for review like any other task. A task whose terminal closes is stopped the same way.
 
+## Resource limits
+
+```bash
+agent do --bg --memory 4G --cpus 2 --pids 1024 "run the full test suite and fix failures"
+```
+
+The kernel enforces them (cgroup v2). The task runs inside a transient systemd scope that carries the limits (`systemd-run --user --scope`). That needs a systemd user session: a normal login has one, the agentos distro does, a container usually doesn't. `agent doctor` tells you. Asking for limits where they can't be enforced is an error, not a silent no-op. Defaults for every task can go in your config (`[limits]`). A task that runs out of memory gets killed by the kernel, and the journal says so.
+
 ## agentd: the console
 
 ```bash
@@ -192,6 +200,10 @@ ro = ["~/.cargo"]
 
 [secrets]                             # your file only
 GITHUB_TOKEN = "api.github.com"       # header defaults to authorization (Bearer)
+
+[limits]                              # defaults for every task
+memory = "8G"
+cpus = 4
 ```
 
 - **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`; they're brokered whenever the variable is set in your environment and the task uses the allowlist network.

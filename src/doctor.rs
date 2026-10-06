@@ -37,7 +37,7 @@ pub fn run(store_root: &Path) -> Vec<Check> {
         sandbox(store_root)
     };
     let userns = userns_policy(sandbox.level == Level::Ok);
-    vec![kernel(), user(), userns, store, sandbox, landlock(), seccomp()]
+    vec![kernel(), user(), userns, store, sandbox, landlock(), seccomp(), limits()]
 }
 
 fn kernel() -> Check {
@@ -137,6 +137,14 @@ fn sandbox(root: &Path) -> Check {
         11 => check(name, Level::Fail, "can't mount overlayfs in a user namespace (kernel 5.11+, store on ext4/xfs/btrfs)"),
         12 => check(name, Level::Fail, "overlay mounted but writes fail"),
         _ => check(name, Level::Fail, format!("probe failed (code {code})")),
+    }
+}
+
+fn limits() -> Check {
+    if crate::limits::available() {
+        check("limits", Level::Ok, "--memory/--cpus/--pids through systemd user scopes")
+    } else {
+        check("limits", Level::Warn, "no systemd user session: --memory/--cpus/--pids can't be enforced here")
     }
 }
 

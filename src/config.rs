@@ -18,6 +18,11 @@
 //! [secrets]                               # your file only: a cloned repo must never
 //! GITHUB_TOKEN = "api.github.com"         # decide where your tokens go
 //! OPENAI_API_KEY = "api.openai.com/authorization"
+//!
+//! [limits]                                # defaults for every task
+//! memory = "8G"
+//! cpus = 4
+//! pids = 4096
 //! ```
 
 use crate::util::hex;
@@ -39,6 +44,8 @@ struct ConfigFile {
     files: Files,
     #[serde(default)]
     secrets: BTreeMap<String, String>,
+    #[serde(default)]
+    limits: crate::limits::Limits,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -68,6 +75,8 @@ pub struct Settings {
     pub secrets: Vec<(String, String)>,
     /// Things to tell you before the task starts (e.g. an untrusted project file).
     pub notes: Vec<String>,
+    /// Default resource limits (a project's override yours).
+    pub limits: crate::limits::Limits,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -154,6 +163,9 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         let p = resolve(entry)?;
         s.ro.push(fs::canonicalize(&p).with_context(|| format!("{shown}: ro {entry}: no such file or directory"))?);
     }
+
+    file.limits.validate().with_context(|| format!("{shown}: [limits]"))?;
+    s.limits = file.limits.or(&s.limits);
 
     if project.is_some() && !file.secrets.is_empty() {
         bail!("{shown}: [secrets] only belongs in your own config, never in a project's");

@@ -129,6 +129,7 @@ It's verified at three levels:
 | M9: login brokering: OAuth tokens sealed in a vault; placeholders in the sandbox; token endpoint rewritten both ways | ✅ CI green; real Claude verified with fake tokens (API + refresh paths) |
 | M10: agentd console: tasks, diffs, commit/push/rollback and approvals in a browser; first answer wins; push notifications | ✅ CI green + checked in a browser |
 | M12: background tasks: --bg, logs/wait/stop, --timeout; agentd shows live progress and notifies on completion | ✅ automated |
+| M13: resource limits: --memory/--cpus/--pids via transient systemd scopes (cgroup v2); OOM kills journaled | ✅ automated; enforcement in the booted VM |
 | M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and runs doctor + run/diff/commit |
 
 ### Phase 1 backlog, in order
@@ -138,7 +139,7 @@ It's verified at three levels:
 3. **Credential broker.** ✅ Per-task CA, TLS termination for brokered hosts only, placeholder → real value in one header. ✅ OAuth logins (M9): tokens sealed in a vault, the token endpoint rewritten both ways so even `/login` in the sandbox yields placeholders. Next: keys from the OS keychain instead of the environment.
 4. **Effects outbox.** ✅ `git push` (M8): each remote gets a bare outbox repo in the task, git in the sandbox pushes there (`GIT_CONFIG_*`), `agent commit` replays from your own git. Next: HTTP writes to APIs, policy auto-release.
 5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
-6. **cgroups.** CPU, memory and pid limits through a systemd transient scope. Token/$ budgets through the model gateway.
+6. **cgroups.** ✅ CPU, memory and pid limits through a systemd transient scope (M13). Next: token/$ budgets through the model gateway.
 7. **agentd + API.** ✅ `agent serve` (M10): token-protected web console and JSON API; approvals reach you away from the terminal, with optional push notifications. Next: run tasks *from* agentd, accounts for teams. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
 8. **MCP gateway.** System services exposed as typed tools, governed by the same policy.
 
