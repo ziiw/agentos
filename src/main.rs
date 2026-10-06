@@ -1,3 +1,4 @@
+use agentos::broker::{self, Broker, Secret};
 use agentos::changes::{self, Summary};
 use agentos::doctor::{self, Level};
 use agentos::journal::{Integrity, Journal};
@@ -122,6 +123,11 @@ struct GrantArgs {
     /// *.DOMAIN or HOST:PORT; port 443 by default). Nothing else is reachable.
     #[arg(long, value_name = "HOST")]
     allow: Vec<String>,
+    /// Broker a credential: the agent sees a placeholder in $NAME, and the
+    /// proxy puts the real value (from your environment) into HEADER of
+    /// requests to HOST, and nowhere else. HEADER defaults to authorization.
+    #[arg(long, value_name = "NAME=HOST[/HEADER]")]
+    secret: Vec<String>,
 }
 
 #[derive(Args)]
@@ -163,6 +169,8 @@ struct Plan {
     net: Net,
     /// Hosts reachable through the egress proxy (`Net::Proxy`).
     allow: Vec<String>,
+    /// Credentials the broker adds on the wire.
+    secrets: Vec<Secret>,
     /// Read-only grants for the agent's own installation.
     install: Vec<PathBuf>,
     profile_env: Vec<(String, String)>,
@@ -204,6 +212,16 @@ fn home_dir() -> Result<PathBuf> {
     Ok(fs::canonicalize(&home).unwrap_or(home))
 }
 
+fn parse_secrets(specs: &[String]) -> Result<Vec<Secret>> {
+    let secrets = specs.iter().map(|s| Secret::parse(s)).collect::<Result<Vec<_>>>()?;
+    for (i, s) in secrets.iter().enumerate() {
+        if secrets[..i].iter().any(|o| o.env == s.env) {
+            bail!("--secret {}: given twice", s.env);
+        }
+    }
+    Ok(secrets)
+}
+
 fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
     let task = (!args.task.is_empty()).then(|| args.task.join(" "));
     if task.is_none() && !std::io::stdin().is_terminal() {
@@ -221,6 +239,18 @@ fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
     }
     let mut allow: Vec<String> = profile.allow.iter().map(|h| h.to_string()).collect();
     allow.extend(args.grants.allow.iter().cloned());
+    let mut secrets = parse_secrets(&args.grants.secret)?;
+    if net == Net::Proxy {
+        for (var, host, header) in &profile.brokered {
+            if let Ok(value) = std::env::var(var) {
+                if !secrets.iter().any(|s| s.env == *var) {
+                    secrets.push(Secret::new(var, host, header, value));
+                }
+            }
+        }
+    } else if !secrets.is_empty() {
+        bail!("--secret needs the agent's default, proxied network; drop --net {net}");
+    }
     execute(
         store,
         Plan {
@@ -229,6 +259,7 @@ fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
             grants: args.grants,
             net,
             allow,
+            secrets,
             install: profile.install,
             profile_env: profile.env,
             pass_env: profile.pass_env,
@@ -241,9 +272,10 @@ fn cmd_do(store: &Store, args: DoArgs) -> Result<i32> {
 
 fn cmd_run(store: &Store, args: RunArgs) -> Result<i32> {
     let argv = args.command;
-    let net = match (args.grants.allow.is_empty(), args.net) {
+    let secrets = parse_secrets(&args.grants.secret)?;
+    let net = match (args.grants.allow.is_empty() && secrets.is_empty(), args.net) {
         (true, net) => net,
-        (false, Net::Host) => bail!("--allow and --net host contradict each other: --allow means only those hosts"),
+        (false, Net::Host) => bail!("--allow/--secret and --net host contradict each other: they mean only those hosts"),
         (false, _) => Net::Proxy,
     };
     let allow = args.grants.allow.clone();
@@ -255,6 +287,7 @@ fn cmd_run(store: &Store, args: RunArgs) -> Result<i32> {
             grants: args.grants,
             net,
             allow,
+            secrets,
             install: Vec::new(),
             profile_env: Vec::new(),
             pass_env: Vec::new(),
@@ -328,7 +361,13 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             grants.push(Grant { path: path.clone(), access: Access::Ro, layer: None });
         }
     }
-    let allow = if plan.net == Net::Proxy { plan.allow } else { Vec::new() };
+    let mut allow = if plan.net == Net::Proxy { plan.allow } else { Vec::new() };
+    // A brokered credential's host is reachable by definition.
+    for secret in &plan.secrets {
+        if !allow.contains(&secret.host) {
+            allow.push(secret.host.clone());
+        }
+    }
     let allowlist = Allowlist::parse(&allow)?;
     let hidden = plan
         .grants
@@ -338,7 +377,17 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         .collect::<Result<Vec<_>>>()?;
 
     let mut env = build_env(&plan.grants.env, &home)?;
-    for (k, v) in plan.profile_env {
+    let brokered_env = plan.secrets.iter().map(|s| (s.env.clone(), s.placeholder.clone()));
+    let ca_env = (!plan.secrets.is_empty())
+        .then(|| {
+            // Node and Bun add to their roots; curl, Python, git and OpenSSL
+            // read a whole bundle (system roots + the task CA).
+            [("NODE_EXTRA_CA_CERTS", "ca.pem"), ("SSL_CERT_FILE", "ca-bundle.pem"), ("CURL_CA_BUNDLE", "ca-bundle.pem"), ("REQUESTS_CA_BUNDLE", "ca-bundle.pem"), ("GIT_SSL_CAINFO", "ca-bundle.pem")]
+                .map(|(k, f)| (k.to_string(), format!("/run/agentos/{f}")))
+        })
+        .into_iter()
+        .flatten();
+    for (k, v) in plan.profile_env.into_iter().chain(brokered_env).chain(ca_env) {
         env.retain(|(name, _)| *name != k);
         env.push((k, v));
     }
@@ -360,6 +409,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         hidden,
         net: plan.net,
         allow,
+        secrets: plan.secrets.iter().map(|s| s.env.clone()).collect(),
         env: env_names,
     })?;
     env.push(("AGENTOS_TASK".into(), task.id().to_string()));
@@ -375,6 +425,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             "hidden": task.meta.hidden,
             "net": task.meta.net,
             "allow": task.meta.allow,
+            "secrets": plan.secrets.iter().map(|s| json!({ "env": s.env, "host": s.host, "header": s.header })).collect::<Vec<_>>(),
             "env": task.meta.env,
         }),
     )?;
@@ -391,6 +442,17 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         (None, None)
     };
     let blocked = Arc::new(AtomicUsize::new(0));
+    // The CA's private key never leaves this process; only its certificate
+    // is written out for the sandbox to trust.
+    let (broker, run_files) = if plan.secrets.is_empty() {
+        (None, Vec::new())
+    } else {
+        let broker = Broker::new(plan.secrets)?;
+        let (ca, bundle) = (task.dir.join("ca.pem"), task.dir.join("ca-bundle.pem"));
+        fs::write(&ca, broker.ca_pem())?;
+        fs::write(&bundle, broker::ca_bundle(broker.ca_pem()))?;
+        (Some(Arc::new(broker)), vec![(ca, "ca.pem".to_string()), (bundle, "ca-bundle.pem".to_string())])
+    };
     let spec = sandbox::Spec {
         rootfs: task.rootfs_dir(),
         grants: task
@@ -409,6 +471,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         mask: vec![store.root().to_path_buf()],
         isolate_net: task.meta.net != Net::Host,
         proxy: proxy_socket.clone(),
+        run_files,
         hostname: format!("agent-{}", task.id()),
         home,
         home_source,
@@ -437,7 +500,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
         setup_error = report.error.clone();
         if let Some(listener) = proxy_listener.take() {
-            proxy_handle = Some(proxy::serve(listener, allowlist, net_sink(journal.clone(), blocked.clone(), err)));
+            proxy_handle = Some(proxy::serve(listener, allowlist, broker, net_sink(journal.clone(), blocked.clone(), err)));
         }
         if let Some(rx) = stdout_rx {
             outcome = follow_agent(rx, &journal, &cwd);
@@ -490,6 +553,8 @@ fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, err: Paint) -> proxy::S
                 String::new()
             };
             eprintln!("{} {target}: {why}{hint}", err.yellow("agent: blocked"));
+        } else if let Some(reason) = &event.reason {
+            eprintln!("{} {}:{}: {reason}", err.yellow("agent: warning:"), event.host, event.port);
         }
     })
 }

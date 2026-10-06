@@ -22,7 +22,7 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Local changes are reversible | A task ends as a diff you merge or throw away | overlayfs upper dirs, read-only base | ● |
 | Network is an allowlist | No direct network, not even DNS; an egress proxy outside the sandbox lets through allowed hosts only and journals every connection | private netns + unix-socket proxy | ● |
 | External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | egress proxy + effects broker | ○ Phase 1 |
-| Secrets never reach the model | The agent sees placeholders; real credentials are added at the proxy | credential broker, keystore/TPM | ◐ env scrubbing |
+| Secrets never reach the model | The agent sees placeholders; real credentials are added at the proxy | credential broker, keystore/TPM | ● API keys brokered (header-only, per-host); logins not yet |
 | Taint tracking | Once a session reads untrusted input, its risky actions need approval | policy engine (Cedar) | ○ Phase 1 |
 | Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, cost |
 | Tokens are a budgeted resource | $/token/time budgets per task | model gateway | ○ Phase 1 |
@@ -121,13 +121,14 @@ It's verified at three levels:
 | M1: `agent do`, current folder granted by default, hint for tasks passed to `agent run` | ✅ |
 | M2: Claude Code profile, per-agent persistent home, streamed progress, tool calls and cost journaled | ✅ accepted with real Claude (2026-10-06) |
 | M3: egress proxy with an allowlist, replacing `net host`; ignored files left out of commits | ✅ automated; real Claude verified through the proxy (free 401 check); human acceptance pending |
-| M4: CI on ubuntu-24.04 (x86_64 + arm64): Landlock enforced, AppArmor path | workflow written; runs once pushed to GitHub |
+| M4: CI on ubuntu-24.04 (x86_64 + arm64): Landlock enforced, AppArmor path | ✅ green on GitHub Actions |
+| M5: credential broker: the agent holds a placeholder, the proxy adds the real key on the wire | ✅ automated (echo server proves header-only injection) |
 
 ### Phase 1 backlog, in order
 
 1. **Profiles.** Claude Code is built in (`src/profiles.rs`). Next: profiles as files (grants, env, network policy, budget) and verified recipes for Codex and Aider.
 2. **Egress proxy.** ✅ Done without veth or root: the sandbox has only loopback, and a forwarder inside relays to the proxy through a unix socket. Next: presets (`--allow @pypi`), upstream corporate proxies.
-3. **Credential broker.** Secrets live in the broker. The agent gets placeholder tokens, and the proxy swaps them in on the wire for the allowed host only.
+3. **Credential broker.** ✅ Per-task CA, TLS termination for brokered hosts only, placeholder → real value in one header. Next: OAuth logins (keep refresh tokens outside), keys from the OS keychain instead of the environment.
 4. **Effects outbox.** `git push`, mail and API writes are held as pending effects next to the file diff. `agent commit` releases them, or policy auto-releases low-risk ones.
 5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
 6. **cgroups.** CPU, memory and pid limits through a systemd transient scope. Token/$ budgets through the model gateway.

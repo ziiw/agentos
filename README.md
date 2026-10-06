@@ -122,6 +122,20 @@ agent: blocked pypi.org:443: not in the allowlist (allow it with --allow pypi.or
 
 `agent log` lists every connection: `✓ api.anthropic.com:443 · ↑1.9 kB ↓4.8 kB · 228ms`.
 
+## Credentials
+
+The agent never holds your real API key. With `ANTHROPIC_API_KEY` set, `agent do` gives Claude a placeholder instead. The proxy terminates Claude's connections to `api.anthropic.com` with a certificate from a CA created for this task only and trusted only inside its sandbox. It replaces the placeholder in the `x-api-key` header with your key, then forwards over normal, verified TLS. The CA's private key never leaves the `agent` process.
+
+Only that header, only on that host. A placeholder pasted into a request body, another header, or a request to another host stays a placeholder. Otherwise an agent could have the real key echoed back to it, or put it in front of the model.
+
+Any command can use it:
+
+```bash
+agent run --secret GITHUB_TOKEN=api.github.com -- my-script
+```
+
+The script sees a placeholder in `$GITHUB_TOKEN`, and the proxy adds `Authorization: Bearer <your token>` on requests to `api.github.com`. Inside the sandbox, Node and Bun (`NODE_EXTRA_CA_CERTS`), and curl, Python, git and OpenSSL (`SSL_CERT_FILE` and friends) trust the task CA automatically.
+
 ## Agents
 
 `agent do` uses Claude Code ([install it](https://claude.ai/install.sh) as usual). agentos finds the installation and grants it read-only. Claude then runs in its own home, so it needs one login of its own:
@@ -140,7 +154,8 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 
 - **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
 - **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
-- **Credentials are visible to the agent**: the API key it's given, or its login in its own home. The credential broker fixes this.
+- **A Claude *login* (as opposed to an API key) is still visible to the agent**: it lives in the agent's own home. API keys are brokered; logins aren't yet.
+- **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
 - **The syscall filter is a denylist** (seccomp): it blocks typing into your terminal (TIOCSTI), new namespaces, mounts, kernel modules, bpf, io_uring, keyrings and userfaultfd. Kernel bugs reachable through the remaining syscalls are out of scope until the microVM tier.
 - **Only your own uid is mapped.** Files in a writable grant owned by another user (e.g. root-owned build output) can be read but not modified.

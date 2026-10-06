@@ -101,6 +101,10 @@ pub struct TaskMeta {
     /// Hosts the egress proxy lets through (`Net::Proxy`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    /// Variables the credential broker fills in on the wire; the agent only
+    /// sees placeholders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     /// Names of environment variables passed in. Values are never stored.
     pub env: Vec<String>,
     pub status: Status,
@@ -119,6 +123,7 @@ pub struct NewTask {
     pub hidden: Vec<PathBuf>,
     pub net: Net,
     pub allow: Vec<String>,
+    pub secrets: Vec<String>,
     pub env: Vec<String>,
 }
 
@@ -275,6 +280,7 @@ impl Store {
                 hidden: new.hidden,
                 net: new.net,
                 allow: new.allow,
+                secrets: new.secrets,
                 env: new.env,
                 status: Status::Running,
                 started_at_ms: now_ms(),

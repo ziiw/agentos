@@ -162,6 +162,26 @@ check "wildcards cover subdomains" "$AGENT" run --allow '*.anthropic.com' -- cur
 check "allowed names that resolve to local addresses are refused" grep -q '"reason":"resolves only to private or local addresses"' "$(latest_task_dir)/events.jsonl"
 check "--allow with --net host is rejected" bash -c "! '$AGENT' run --net host --allow x.com -- true 2>/dev/null"
 
+section "credential broker"
+# postman-echo.com echoes back the headers and body it received, which shows
+# what actually went over the wire.
+export AGENTOS_E2E_TOKEN=real-secret-e2e-value
+SECRET=AGENTOS_E2E_TOKEN=postman-echo.com/x-test-token
+lacks() { ! grep -q -- "$1" <<<"$2"; }
+out="$("$AGENT" run --secret "$SECRET" -- sh -c 'echo "token=$AGENTOS_E2E_TOKEN"' 2>&1)"
+check "the agent only sees a placeholder" grep -q 'token=agentos-placeholder-agentos-e2e-token-' <<<"$out"
+check "the real value is nowhere in the sandbox" lacks real-secret-e2e-value "$out"
+out="$("$AGENT" run --secret "$SECRET" -- sh -c 'curl -sS -m 20 -H "x-test-token: $AGENTOS_E2E_TOKEN" https://postman-echo.com/headers' 2>&1)"
+check "the proxy puts the real value in the header, on the wire" grep -Eq '"x-test-token": *"real-secret-e2e-value"' <<<"$out"
+check "the agent's TLS client trusted the task CA (no cert errors)" lacks 'SSL certificate problem' "$out"
+check "the injection is journaled" grep -q '"kind":"net.connect".*"brokered":true.*"injected":1' "$(latest_task_dir)/events.jsonl"
+out="$("$AGENT" run --secret "$SECRET" -- sh -c 'curl -sS -m 20 -H "x-other: $AGENTOS_E2E_TOKEN" --data-raw "body=$AGENTOS_E2E_TOKEN" https://postman-echo.com/post' 2>&1)"
+check "a placeholder in another header stays a placeholder" grep -Eq '"x-other": *"agentos-placeholder-' <<<"$out"
+check "a placeholder in the body stays a placeholder" lacks real-secret-e2e-value "$out"
+check "the value never reaches the journal" bash -c "! grep -rq real-secret-e2e-value '$AGENTOS_HOME/tasks'"
+check "--secret with --net host is rejected" bash -c "! '$AGENT' run --net host --secret '$SECRET' -- true 2>/dev/null"
+unset AGENTOS_E2E_TOKEN
+
 section "ignored changes (.gitignore, __pycache__)"
 reset_proj
 echo "build/" > "$PROJ/.gitignore"
@@ -213,7 +233,8 @@ check "the final message isn't printed twice" test "$(grep -c "I'll add a test f
 "$AGENT" do again >/dev/null 2>&1
 check "agent home persists between tasks" test "$(cat "$AGENT_STATE/runs")" = 2
 ANTHROPIC_API_KEY=sk-test-0123456789 "$AGENT" do use the key >/dev/null 2>&1
-check "API key is passed to the agent when set" grep -qx 'api-key: set' "$AGENT_STATE/observations"
+check "the agent gets a placeholder, not your API key" grep -qx 'api-key: placeholder' "$AGENT_STATE/observations"
+check "the key is brokered" grep -q '"secrets":\[{"env":"ANTHROPIC_API_KEY","header":"x-api-key","host":"api.anthropic.com"}\]' "$(latest_task_dir)/events.jsonl"
 check "API key value never journaled" bash -c "! grep -rq sk-test-0123456789 '$AGENTOS_HOME/tasks'"
 cd "$HOME"
 "$AGENT" do something >/dev/null 2>&1

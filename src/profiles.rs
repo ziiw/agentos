@@ -33,6 +33,8 @@ pub struct Profile {
     pub net: Net,
     /// Hosts the agent needs, for `Net::Proxy`.
     pub allow: Vec<&'static str>,
+    /// Credentials brokered when set in your environment: (variable, host, header).
+    pub brokered: Vec<(&'static str, &'static str, &'static str)>,
     pub output: Output,
 }
 
@@ -71,7 +73,12 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile>
             ("DISABLE_AUTOUPDATER".into(), "1".into()),
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()),
         ],
-        pass_env: vec!["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"],
+        pass_env: vec!["ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"],
+        // The agent gets placeholders; the proxy adds the real values on the wire.
+        brokered: vec![
+            ("ANTHROPIC_API_KEY", "api.anthropic.com", "x-api-key"),
+            ("ANTHROPIC_AUTH_TOKEN", "api.anthropic.com", "authorization"),
+        ],
         net: Net::Proxy,
         // The API, plus what logging in and refreshing a login talk to.
         // Anything else shows up as "blocked" in the output and the journal.

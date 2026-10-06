@@ -11,6 +11,7 @@
 //!                       (forwarder, inside)                      sandbox│      (allowlist, journal)
 //! ```
 
+use crate::broker::Broker;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::io::{self, Read, Write};
@@ -82,6 +83,14 @@ pub struct NetEvent {
     pub bytes_out: u64,
     pub bytes_in: u64,
     pub ms: u64,
+    /// Relayed by the credential broker rather than tunneled.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub brokered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests: Option<u64>,
+    /// Requests the broker added a credential to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub injected: Option<u64>,
 }
 
 pub type Sink = Arc<dyn Fn(NetEvent) + Send + Sync>;
@@ -108,17 +117,18 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
 }
 
 /// Serves connections on background threads, reporting each one to `sink`.
+/// Hosts the `broker` holds credentials for are relayed through it.
 /// Threads must only be started after the sandbox has been forked.
-pub fn serve(listener: UnixListener, allow: Allowlist, sink: Sink) -> Handle {
+pub fn serve(listener: UnixListener, allow: Allowlist, broker: Option<Arc<Broker>>, sink: Sink) -> Handle {
     let active = Arc::new(AtomicUsize::new(0));
     let allow = Arc::new(allow);
     let counter = active.clone();
     thread::spawn(move || {
         for client in listener.incoming().flatten() {
             counter.fetch_add(1, Ordering::SeqCst);
-            let (allow, sink, counter) = (allow.clone(), sink.clone(), counter.clone());
+            let (allow, broker, sink, counter) = (allow.clone(), broker.clone(), sink.clone(), counter.clone());
             thread::spawn(move || {
-                if let Some(event) = handle(client, &allow) {
+                if let Some(event) = handle(client, &allow, broker.as_deref()) {
                     sink(event);
                 }
                 counter.fetch_sub(1, Ordering::SeqCst);
@@ -128,12 +138,23 @@ pub fn serve(listener: UnixListener, allow: Allowlist, sink: Sink) -> Handle {
     Handle { active }
 }
 
-fn handle(mut client: UnixStream, allow: &Allowlist) -> Option<NetEvent> {
+fn handle(mut client: UnixStream, allow: &Allowlist, broker: Option<&Broker>) -> Option<NetEvent> {
     let start = Instant::now();
     let head = read_head(&mut client).ok()?;
     let mut words = head.lines().next().unwrap_or_default().split_whitespace();
     let (method, target) = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
-    let mut event = NetEvent { host: String::new(), port: 0, allowed: false, reason: None, bytes_out: 0, bytes_in: 0, ms: 0 };
+    let mut event = NetEvent {
+        host: String::new(),
+        port: 0,
+        allowed: false,
+        reason: None,
+        bytes_out: 0,
+        bytes_in: 0,
+        ms: 0,
+        brokered: false,
+        requests: None,
+        injected: None,
+    };
     let mut refuse = |status: &str, reason: &str, mut event: NetEvent| {
         let _ = write!(client, "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nagentos: {reason}\n");
         event.reason = Some(reason.to_string());
@@ -167,7 +188,20 @@ fn handle(mut client: UnixStream, allow: &Allowlist) -> Option<NetEvent> {
         return None;
     }
     event.allowed = true;
-    (event.bytes_out, event.bytes_in) = pump(client, upstream);
+    match broker.filter(|b| b.brokers(&host)) {
+        Some(broker) => {
+            event.brokered = true;
+            match broker.relay(&host, client, upstream) {
+                Ok((up, down, requests, injected)) => {
+                    (event.bytes_out, event.bytes_in) = (up, down);
+                    (event.requests, event.injected) = (Some(requests), Some(injected));
+                }
+                // Typically the agent not trusting the task CA.
+                Err(e) => event.reason = Some(format!("credential relay failed: {e:#}")),
+            }
+        }
+        None => (event.bytes_out, event.bytes_in) = pump(client, upstream),
+    }
     event.ms = start.elapsed().as_millis() as u64;
     Some(event)
 }

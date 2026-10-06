@@ -1,0 +1,431 @@
+//! Credential broker: the agent never holds your real credentials.
+//!
+//! Inside the sandbox a brokered variable (say `ANTHROPIC_API_KEY`) holds a
+//! placeholder. Connections to the credential's host are terminated by the
+//! egress proxy with a certificate from a per-task CA that only the sandbox
+//! trusts; the proxy swaps the placeholder for the real value in the one
+//! request header it belongs in, and forwards over real, verified TLS.
+//!
+//! Only that header, only on that host: a placeholder pasted into a request
+//! body, or sent to any other host, stays a placeholder. Otherwise an agent
+//! could get the real key echoed back, or put it in front of the model.
+
+use anyhow::{Context, Result, bail};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+use std::collections::HashMap;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+
+/// A credential the proxy adds on the agent's behalf.
+#[derive(Clone)]
+pub struct Secret {
+    /// Environment variable the agent sees (holding the placeholder).
+    pub env: String,
+    pub host: String,
+    /// Header that carries it, lowercase: `x-api-key`, or `authorization` (as `Bearer …`).
+    pub header: String,
+    pub placeholder: String,
+    pub value: String,
+}
+
+impl Secret {
+    /// `spec` is `NAME=HOST/HEADER` (header defaults to `authorization`); the
+    /// real value comes from `NAME` in your environment.
+    pub fn parse(spec: &str) -> Result<Secret> {
+        let (env, rest) = spec.split_once('=').with_context(|| format!("--secret {spec}: expected NAME=HOST[/HEADER]"))?;
+        let (host, header) = rest.split_once('/').unwrap_or((rest, "authorization"));
+        if env.is_empty() || host.is_empty() || header.is_empty() || host.contains(':') {
+            bail!("--secret {spec}: expected NAME=HOST[/HEADER], e.g. ANTHROPIC_API_KEY=api.anthropic.com/x-api-key");
+        }
+        let value = std::env::var(env).with_context(|| format!("--secret {spec}: {env} is not set in your environment"))?;
+        Ok(Secret::new(env, host, header, value))
+    }
+
+    pub fn new(env: &str, host: &str, header: &str, value: String) -> Secret {
+        let suffix = crate::util::random_hex(12).unwrap_or_else(|_| "000000000000".into());
+        Secret {
+            env: env.to_string(),
+            host: host.to_ascii_lowercase(),
+            header: header.to_ascii_lowercase(),
+            placeholder: format!("agentos-placeholder-{}-{suffix}", env.to_ascii_lowercase().replace('_', "-")),
+            value,
+        }
+    }
+
+    /// Replaces the placeholder in this header, if this is the header and it
+    /// holds exactly the placeholder (or `Bearer <placeholder>`).
+    fn inject(&self, name: &str, value: &mut String) -> bool {
+        if !name.eq_ignore_ascii_case(&self.header) {
+            return false;
+        }
+        if *value == self.placeholder {
+            *value = self.value.clone();
+        } else if value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")) == Some(&self.placeholder) {
+            *value = format!("Bearer {}", self.value);
+        } else {
+            return false;
+        }
+        true
+    }
+}
+
+/// The per-task CA and TLS settings for brokered hosts.
+pub struct Broker {
+    secrets: Vec<Secret>,
+    servers: HashMap<String, Arc<ServerConfig>>,
+    client: Arc<ClientConfig>,
+    ca_pem: String,
+}
+
+impl Broker {
+    pub fn new(secrets: Vec<Secret>) -> Result<Broker> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let ca_key = KeyPair::generate()?;
+        let mut ca = CertificateParams::new(Vec::<String>::new())?;
+        ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca.distinguished_name.push(DnType::CommonName, "agentos task CA (this sandbox only)");
+        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_cert = ca.self_signed(&ca_key)?;
+
+        let mut servers = HashMap::new();
+        for host in secrets.iter().map(|s| s.host.clone()) {
+            if servers.contains_key(&host) {
+                continue;
+            }
+            let key = KeyPair::generate()?;
+            let leaf = CertificateParams::new(vec![host.clone()])?.signed_by(&key, &ca_cert, &ca_key)?;
+            let mut config = ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![leaf.der().clone(), ca_cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                )?;
+            // One request at a time is all the relay understands.
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            servers.insert(host, Arc::new(config));
+        }
+
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut client = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        Ok(Broker { secrets, servers, client: Arc::new(client), ca_pem: ca_cert.pem() })
+    }
+
+    /// The CA certificate (public) the sandbox must trust.
+    pub fn ca_pem(&self) -> &str {
+        &self.ca_pem
+    }
+
+    pub fn brokers(&self, host: &str) -> bool {
+        self.servers.contains_key(&host.to_ascii_lowercase())
+    }
+
+    /// Relays HTTP/1.1 between the agent and `host`, injecting credentials.
+    /// Returns (bytes up, bytes down, requests, credentials injected).
+    pub fn relay(&self, host: &str, client: UnixStream, upstream: TcpStream) -> Result<(u64, u64, u64, u64)> {
+        let server_config = self.servers.get(host).context("host is not brokered")?.clone();
+        let agent = StreamOwned::new(ServerConnection::new(server_config)?, client);
+        let name = ServerName::try_from(host.to_string())?;
+        let remote = StreamOwned::new(ClientConnection::new(self.client.clone(), name)?, upstream);
+        let secrets: Vec<&Secret> = self.secrets.iter().filter(|s| s.host == host).collect();
+        relay_http(agent, remote, &secrets)
+    }
+}
+
+/// Bundle of the system's CAs plus the task CA, for clients that read a
+/// single file (curl, Python, git, OpenSSL).
+pub fn ca_bundle(task_ca: &str) -> String {
+    let system = ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    format!("{system}\n{task_ca}")
+}
+
+struct Head {
+    start: String,
+    headers: Vec<(String, String)>,
+}
+
+impl Head {
+    fn parse(raw: &str) -> Head {
+        let mut lines = raw.split("\r\n").filter(|l| !l.is_empty());
+        let start = lines.next().unwrap_or_default().to_string();
+        let headers = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(n, v)| (n.trim().to_string(), v.trim().to_string()))
+            .collect();
+        Head { start, headers }
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+
+    fn has_token(&self, name: &str, token: &str) -> bool {
+        self.get(name).is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+    }
+
+    fn serialize(&self) -> String {
+        let mut s = format!("{}\r\n", self.start);
+        for (n, v) in &self.headers {
+            s.push_str(&format!("{n}: {v}\r\n"));
+        }
+        s.push_str("\r\n");
+        s
+    }
+}
+
+enum Body {
+    None,
+    Length(u64),
+    Chunked,
+    UntilClose,
+}
+
+fn read_head(r: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line)? == 0 {
+            return if head.is_empty() { Ok(None) } else { Err(io::ErrorKind::UnexpectedEof.into()) };
+        }
+        if head.len() + line.len() > 64 * 1024 {
+            return Err(io::Error::other("header section too large"));
+        }
+        let end = line == "\r\n" || line == "\n";
+        head.push_str(&line);
+        if end && head.trim().len() > 0 {
+            return Ok(Some(head));
+        }
+        if end {
+            head.clear(); // stray blank line between messages
+        }
+    }
+}
+
+/// Copies exactly `n` bytes.
+fn copy_exact(r: &mut impl Read, w: &mut impl Write, n: u64) -> io::Result<u64> {
+    let copied = io::copy(&mut r.take(n), w)?;
+    if copied < n {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(copied)
+}
+
+/// Copies a chunked body, flushing per chunk so streamed responses stay live.
+fn copy_chunked(r: &mut impl BufRead, w: &mut impl Write) -> io::Result<u64> {
+    let mut total = 0;
+    loop {
+        let mut line = String::new();
+        r.read_line(&mut line)?;
+        w.write_all(line.as_bytes())?;
+        let size = u64::from_str_radix(line.trim().split(';').next().unwrap_or_default().trim(), 16)
+            .map_err(|_| io::Error::other("bad chunk size"))?;
+        if size == 0 {
+            loop {
+                let mut trailer = String::new();
+                r.read_line(&mut trailer)?;
+                w.write_all(trailer.as_bytes())?;
+                if trailer.trim().is_empty() {
+                    break;
+                }
+            }
+            w.flush()?;
+            return Ok(total);
+        }
+        total += copy_exact(r, w, size + 2)?;
+        w.flush()?;
+    }
+}
+
+fn copy_body(body: Body, r: &mut impl BufRead, w: &mut impl Write) -> io::Result<u64> {
+    let n = match body {
+        Body::None => 0,
+        Body::Length(n) => copy_exact(r, w, n)?,
+        Body::Chunked => copy_chunked(r, w)?,
+        Body::UntilClose => io::copy(r, w)?,
+    };
+    w.flush()?;
+    Ok(n)
+}
+
+fn request_body(h: &Head) -> Body {
+    if h.has_token("transfer-encoding", "chunked") {
+        Body::Chunked
+    } else {
+        match h.get("content-length").and_then(|v| v.parse().ok()) {
+            Some(0) | None => Body::None,
+            Some(n) => Body::Length(n),
+        }
+    }
+}
+
+fn response_body(method: &str, status: u16, h: &Head) -> Body {
+    if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 || (100..200).contains(&status) {
+        Body::None
+    } else if h.has_token("transfer-encoding", "chunked") {
+        Body::Chunked
+    } else {
+        match h.get("content-length").and_then(|v| v.parse().ok()) {
+            Some(n) => Body::Length(n),
+            None => Body::UntilClose,
+        }
+    }
+}
+
+/// HTTP/1.1, one exchange at a time: parse each request head (to inject
+/// credentials) and frame bodies so the next head can be found; stream the
+/// responses back as they arrive.
+fn relay_http<A: Read + Write, B: Read + Write>(agent: A, remote: B, secrets: &[&Secret]) -> Result<(u64, u64, u64, u64)> {
+    let mut agent = BufReader::new(agent);
+    let mut remote = BufReader::new(remote);
+    let (mut up, mut down, mut requests, mut injected) = (0, 0, 0, 0);
+    let result = (|| -> io::Result<()> {
+        while let Some(raw) = read_head(&mut agent)? {
+            let mut req = Head::parse(&raw);
+            for (name, value) in req.headers.iter_mut() {
+                if secrets.iter().any(|s| s.inject(name, value)) {
+                    injected += 1;
+                }
+            }
+            // We answer 100-continue ourselves, so the agent sends its body now.
+            if req.has_token("expect", "100-continue") {
+                req.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("expect"));
+                agent.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                agent.get_mut().flush()?;
+            }
+            let method = req.start.split_whitespace().next().unwrap_or_default().to_string();
+            let head = req.serialize();
+            remote.get_mut().write_all(head.as_bytes())?;
+            up += head.len() as u64 + copy_body(request_body(&req), &mut agent, remote.get_mut())?;
+            requests += 1;
+
+            let mut close = req.has_token("connection", "close");
+            loop {
+                let Some(raw) = read_head(&mut remote)? else { return Ok(()) };
+                let resp = Head::parse(&raw);
+                let status: u16 = resp.start.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                agent.get_mut().write_all(raw.as_bytes())?;
+                let body = response_body(&method, status, &resp);
+                close |= matches!(body, Body::UntilClose) || resp.has_token("connection", "close") || status == 101;
+                down += raw.len() as u64 + copy_body(body, &mut remote, agent.get_mut())?;
+                if !(100..200).contains(&status) || status == 101 {
+                    break;
+                }
+            }
+            if close {
+                return Ok(());
+            }
+        }
+        Ok(())
+    })();
+    // An agent hanging up mid-exchange is normal; anything else is worth knowing.
+    match result {
+        Ok(()) => Ok((up, down, requests, injected)),
+        Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset) => {
+            Ok((up, down, requests, injected))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// An in-memory duplex: reads from `input`, records writes.
+    struct Pipe {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn pipe(input: &str) -> Pipe {
+        Pipe { input: Cursor::new(input.as_bytes().to_vec()), output: Vec::new() }
+    }
+
+    fn secret() -> Secret {
+        let mut s = Secret::new("API_KEY", "api.example.com", "x-api-key", "real-key".into());
+        s.placeholder = "PLACEHOLDER".into();
+        s
+    }
+
+    fn run(requests: &str, responses: &str) -> (String, String, u64, u64) {
+        let s = secret();
+        let mut agent = pipe(requests);
+        let mut remote = pipe(responses);
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s]).unwrap();
+        (String::from_utf8(remote.output).unwrap(), String::from_utf8(agent.output).unwrap(), n, injected)
+    }
+
+    #[test]
+    fn injects_in_the_header_only() {
+        let body = r#"{"note":"PLACEHOLDER"}"#;
+        let req = format!("POST /v1/messages HTTP/1.1\r\nHost: api.example.com\r\nx-api-key: PLACEHOLDER\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let (sent, got, n, injected) = run(&req, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        assert!(sent.contains("x-api-key: real-key\r\n"));
+        assert!(sent.ends_with(r#"{"note":"PLACEHOLDER"}"#), "body must not be rewritten: {sent}");
+        assert_eq!(sent.matches("real-key").count(), 1);
+        assert!(got.ends_with("\r\n\r\nok"));
+        assert_eq!((n, injected), (1, 1));
+    }
+
+    #[test]
+    fn other_headers_and_values_are_left_alone() {
+        let req = "GET / HTTP/1.1\r\nx-api-key: something-else\r\nx-other: PLACEHOLDER\r\n\r\n";
+        let (sent, _, _, injected) = run(req, "HTTP/1.1 204 No Content\r\n\r\n");
+        assert!(!sent.contains("real-key"));
+        assert_eq!(injected, 0);
+    }
+
+    #[test]
+    fn bearer_tokens_and_keep_alive_with_chunked_responses() {
+        let mut s = secret();
+        s.header = "authorization".into();
+        let reqs = "GET /a HTTP/1.1\r\nAuthorization: Bearer PLACEHOLDER\r\n\r\nGET /b HTTP/1.1\r\nAuthorization: Bearer PLACEHOLDER\r\n\r\n";
+        let resps = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye";
+        let mut agent = pipe(reqs);
+        let mut remote = pipe(resps);
+        let (_, _, n, injected) = relay_http(&mut agent, &mut remote, &[&s]).unwrap();
+        let sent = String::from_utf8(remote.output).unwrap();
+        assert_eq!(sent.matches("Authorization: Bearer real-key\r\n").count(), 2);
+        assert_eq!((n, injected), (2, 2));
+        let got = String::from_utf8(agent.output).unwrap();
+        assert!(got.contains("5\r\nhello\r\n0\r\n\r\n") && got.ends_with("bye"));
+    }
+
+    #[test]
+    fn secret_specs() {
+        // SAFETY: tests in this module don't read this variable concurrently.
+        unsafe { std::env::set_var("AGENTOS_TEST_TOKEN", "tok") };
+        let s = Secret::parse("AGENTOS_TEST_TOKEN=api.example.com/x-api-key").unwrap();
+        assert_eq!((s.host.as_str(), s.header.as_str(), s.value.as_str()), ("api.example.com", "x-api-key", "tok"));
+        assert!(s.placeholder.starts_with("agentos-placeholder-"));
+        assert_eq!(Secret::parse("AGENTOS_TEST_TOKEN=api.example.com").unwrap().header, "authorization");
+        assert!(Secret::parse("AGENTOS_TEST_TOKEN").is_err());
+        assert!(Secret::parse("AGENTOS_UNSET_VAR=x.com").is_err());
+    }
+}

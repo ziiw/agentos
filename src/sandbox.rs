@@ -68,6 +68,8 @@ pub struct Spec {
     /// Host path of the egress proxy's unix socket. When set, the agent's
     /// only way out is through it (see `proxy.rs`).
     pub proxy: Option<PathBuf>,
+    /// Host files exposed read-only as /run/agentos/<name> (e.g. the task CA).
+    pub run_files: Vec<(PathBuf, String)>,
     pub hostname: String,
     pub home: PathBuf,
     /// Directory mounted read-write as $HOME (an agent's persistent home).
@@ -311,6 +313,11 @@ fn build_root(spec: &Spec, report: &mut Report) -> Result<()> {
         let target = dir("/run/agentos")?.join("proxy.sock");
         fs::File::create(&target)?;
         bind(sock, &target).context("proxy socket")?;
+    }
+    for (src, name) in &spec.run_files {
+        let target = dir("/run/agentos")?.join(name);
+        fs::File::create(&target)?;
+        bind_ro(src, &target).with_context(|| format!("/run/agentos/{name}"))?;
     }
 
     // $HOME starts empty; grants are mounted shallowest-first so nested

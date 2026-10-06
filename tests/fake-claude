@@ -10,7 +10,11 @@ runs=$(cat "$state/runs" 2>/dev/null || echo 0)
 echo $((runs + 1)) > "$state/runs"
 {
   if [ -e "$state/host-secret" ]; then echo "host-secret: visible"; else echo "host-secret: hidden"; fi
-  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then echo "api-key: set"; else echo "api-key: unset"; fi
+  case "${ANTHROPIC_API_KEY:-}" in
+    "") echo "api-key: unset" ;;
+    agentos-placeholder-*) echo "api-key: placeholder" ;;
+    *) echo "api-key: real" ;;
+  esac
   if [ -n "${HTTPS_PROXY:-}" ]; then echo "proxy: set"; else echo "proxy: unset"; fi
 } > "$state/observations"
 

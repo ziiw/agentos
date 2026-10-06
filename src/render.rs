@@ -99,6 +99,9 @@ pub fn banner(p: Paint, task: &Task) -> String {
         parts.push(format!("{} {}", p.dim(label), display_path(&g.path)));
     }
     parts.push(format!("{} {}", p.dim("net"), net_label(&task.meta.net, &task.meta.allow)));
+    if !task.meta.secrets.is_empty() {
+        parts.push(format!("{} {}", p.dim("brokered"), task.meta.secrets.join(",")));
+    }
     format!("{} {}", p.cyan("agent ▸"), parts.join("  "))
 }
 
@@ -384,12 +387,33 @@ fn describe(p: Paint, e: &Event) -> String {
                 Some(hosts) if !hosts.is_empty() => parts.push(format!("net only {}", list(&d["allow"]))),
                 _ => parts.push(format!("net {}", s(&d["net"]))),
             }
+            let secrets: Vec<String> = d["secrets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|x| format!("{}→{}", s(&x["env"]), s(&x["host"])))
+                .collect();
+            if !secrets.is_empty() {
+                parts.push(format!("brokered {}", secrets.join(",")));
+            }
             parts.push(format!("env {}", list(&d["env"])));
             parts.join(" · ")
         }
         "net.connect" => {
             let target = format!("{}:{}", s(&d["host"]), d["port"]);
-            if d["allowed"].as_bool() == Some(true) {
+            if d["brokered"].as_bool() == Some(true) && d["reason"].is_string() {
+                format!("{} {target} · {}", p.red("✗"), s(&d["reason"]))
+            } else if d["brokered"].as_bool() == Some(true) {
+                format!(
+                    "{} {target} · {} requests, credential added to {} · ↑{} ↓{} · {}",
+                    p.green("✓"),
+                    d["requests"],
+                    d["injected"],
+                    bytes(d["bytes_out"].as_u64().unwrap_or(0)),
+                    bytes(d["bytes_in"].as_u64().unwrap_or(0)),
+                    util::duration(d["ms"].as_u64().unwrap_or(0))
+                )
+            } else if d["allowed"].as_bool() == Some(true) {
                 format!(
                     "{} {target} · ↑{} ↓{} · {}",
                     p.green("✓"),
