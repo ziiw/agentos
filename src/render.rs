@@ -1,0 +1,389 @@
+//! Human-readable output for the CLI.
+
+use agentos::changes::{self, Change, Entry, Kind, Summary};
+use agentos::journal::Event;
+use agentos::profiles::AgentEvent;
+use agentos::store::{Access, Task};
+use agentos::util::{self, display_path};
+use serde_json::Value;
+use similar::{ChangeTag, TextDiff};
+use std::fmt::{Display, Write};
+use std::fs;
+use std::io::IsTerminal;
+use std::path::Path;
+
+const MAX_DIFF_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub struct Paint(bool);
+
+impl Paint {
+    pub fn stdout() -> Self {
+        Paint(std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+    }
+    pub fn stderr() -> Self {
+        Paint(std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none())
+    }
+    fn wrap(self, code: &str, s: impl Display) -> String {
+        if self.0 { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
+    }
+    pub fn bold(self, s: impl Display) -> String {
+        self.wrap("1", s)
+    }
+    pub fn dim(self, s: impl Display) -> String {
+        self.wrap("2", s)
+    }
+    pub fn red(self, s: impl Display) -> String {
+        self.wrap("31", s)
+    }
+    pub fn green(self, s: impl Display) -> String {
+        self.wrap("32", s)
+    }
+    pub fn yellow(self, s: impl Display) -> String {
+        self.wrap("33", s)
+    }
+    pub fn cyan(self, s: impl Display) -> String {
+        self.wrap("36", s)
+    }
+}
+
+pub fn command_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || "'\"$`\\;&|<>(){}*?!".contains(c)) {
+                format!("'{}'", a.replace('\'', r"'\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How to name a task: its title, or the command it ran.
+pub fn title(task: &Task) -> String {
+    task.meta.title.clone().unwrap_or_else(|| command_line(&task.meta.command))
+}
+
+pub fn first_line(s: &str, max: usize) -> String {
+    truncate(s.lines().find(|l| !l.trim().is_empty()).unwrap_or(""), max)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max { flat } else { format!("{}…", flat.chars().take(max - 1).collect::<String>()) }
+}
+
+fn summary_short(p: Paint, s: &Summary) -> String {
+    if s.total() == 0 {
+        return p.dim("none");
+    }
+    format!("{} {} {}", p.green(format!("+{}", s.added)), p.yellow(format!("~{}", s.modified)), p.red(format!("-{}", s.deleted)))
+}
+
+pub fn banner(p: Paint, task: &Task) -> String {
+    let mut parts = vec![format!("task {}", p.bold(task.id()))];
+    if let Some(t) = &task.meta.title {
+        parts.push(p.bold(truncate(t, 60)));
+    }
+    for g in &task.meta.grants {
+        let label = if g.access == Access::Rw { "rw" } else { "ro" };
+        parts.push(format!("{} {}", p.dim(label), display_path(&g.path)));
+    }
+    parts.push(format!("{} {}", p.dim("net"), task.meta.net));
+    format!("{} {}", p.cyan("agent ▸"), parts.join("  "))
+}
+
+pub fn exit_summary(p: Paint, task: &Task, s: &Summary, outcome: Option<&AgentEvent>) -> String {
+    let id = task.id();
+    let took = util::duration(task.meta.ended_at_ms.unwrap_or(0).saturating_sub(task.meta.started_at_ms));
+    let mut head = format!("{} task {} exited {} in {took}", p.cyan("agent ▸"), p.bold(id), task.meta.exit_code.unwrap_or(-1));
+    if let Some(AgentEvent::Done { turns, cost_usd, .. }) = outcome {
+        if let Some(cost) = cost_usd {
+            let _ = write!(head, " · ${cost:.2}");
+        }
+        if let Some(n) = turns {
+            let _ = write!(head, " · {n} turn{}", if *n == 1 { "" } else { "s" });
+        }
+    }
+    if s.total() == 0 {
+        return format!("{head} · no changes");
+    }
+    let n = s.total();
+    let mut out = format!(
+        "{head} · {} held for review ({})",
+        if n == 1 { "1 change".to_string() } else { format!("{n} changes") },
+        summary_short(p, s),
+    );
+    let hints = [("diff", "review"), ("commit", "apply to your files"), ("rollback", "discard")];
+    let width = hints.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+    for (cmd, what) in hints {
+        let _ = write!(out, "\n        {}  {what}", p.bold(format!("agent {cmd:<width$} {id}")));
+    }
+    out
+}
+
+pub fn task_table(p: Paint, tasks: &[Task]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", p.dim(format!("{:<10}{:<12}{:<10}{:<14}{}", "ID", "STATUS", "STARTED", "CHANGES", "COMMAND")));
+    // Pad on the visible width; color codes would throw off {:<n}.
+    let pad = |s: String, visible: usize, width: usize| format!("{s}{}", " ".repeat(width.saturating_sub(visible)));
+    for t in tasks.iter().rev() {
+        let summary = if t.is_open() { changes::scan(&t.layers()).ok().map(|c| Summary::of(&c)) } else { None };
+        let (changes, visible_changes) = match &summary {
+            Some(s) => (summary_short(p, s), summary_short(Paint(false), s).chars().count()),
+            None => (p.dim("-"), 1),
+        };
+        let status = t.status_label();
+        let _ = writeln!(
+            out,
+            "{:<10}{}{:<10}{}{}",
+            t.id(),
+            pad(status_color(p, &status), status.len(), 12),
+            util::ago(t.meta.started_at_ms),
+            pad(changes, visible_changes, 14),
+            truncate(&title(t), 60)
+        );
+    }
+    out
+}
+
+fn status_color(p: Paint, status: &str) -> String {
+    match status {
+        "running" => p.cyan(status),
+        "committed" => p.green(status),
+        "discarded" => p.dim(status),
+        "crashed" | "failed" => p.red(status),
+        _ => p.yellow(status),
+    }
+}
+
+fn text(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if meta.len() > MAX_DIFF_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.iter().take(8000).any(|&b| b == 0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Old and new text for a file change, or None if either side isn't text.
+fn texts(c: &Change) -> Option<(String, String)> {
+    if c.entry != Entry::File {
+        return None;
+    }
+    let old = if c.kind == Kind::Added { String::new() } else { text(&c.path)? };
+    let new = if c.kind == Kind::Deleted { String::new() } else { text(&c.upper)? };
+    Some((old, new))
+}
+
+fn detail(p: Paint, c: &Change) -> String {
+    match (c.kind, c.entry) {
+        (Kind::Deleted, Entry::Dir) => p.dim(match changes::count_files(&c.path) {
+            1 => "1 file".to_string(),
+            n => format!("{n} files"),
+        }),
+        (_, Entry::Dir) => String::new(),
+        (Kind::Deleted, _) => String::new(),
+        (_, Entry::Symlink) => p.dim(format!("→ {}", fs::read_link(&c.upper).map(|t| t.display().to_string()).unwrap_or_default())),
+        (_, Entry::Other) => p.dim("special file"),
+        (_, Entry::File) => match texts(c) {
+            Some((old, new)) => {
+                let diff = TextDiff::from_lines(&old, &new);
+                let (mut add, mut del) = (0, 0);
+                for ch in diff.iter_all_changes() {
+                    match ch.tag() {
+                        ChangeTag::Insert => add += 1,
+                        ChangeTag::Delete => del += 1,
+                        ChangeTag::Equal => {}
+                    }
+                }
+                format!("{} {}", p.green(format!("+{add}")), p.red(format!("-{del}")))
+            }
+            None => p.dim("binary or large"),
+        },
+    }
+}
+
+fn change_path(c: &Change) -> String {
+    let mut s = display_path(&c.path);
+    if c.entry == Entry::Dir {
+        s.push('/');
+    }
+    s
+}
+
+fn kind_mark(p: Paint, k: Kind) -> String {
+    match k {
+        Kind::Added => p.green("A"),
+        Kind::Modified => p.yellow("M"),
+        Kind::Deleted => p.red("D"),
+    }
+}
+
+pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool) -> String {
+    let mut out = String::new();
+    let state = if task.is_live() { p.cyan("running") } else { p.dim(task.status_label()) };
+    let _ = writeln!(
+        out,
+        "{} {} · {} · {}",
+        p.bold("task"),
+        p.bold(task.id()),
+        truncate(&title(task), 60),
+        state
+    );
+    if changes.is_empty() {
+        let _ = writeln!(out, "{}", p.dim("no pending changes"));
+        return out;
+    }
+    let width = changes.iter().map(|c| change_path(c).chars().count()).max().unwrap_or(0).min(70);
+    out.push('\n');
+    for c in changes {
+        let path = change_path(c);
+        let pad = " ".repeat(width.saturating_sub(path.chars().count()));
+        let _ = writeln!(out, "  {}  {path}{pad}  {}", kind_mark(p, c.kind), detail(p, c));
+    }
+    if stat_only {
+        return out;
+    }
+    for c in changes {
+        let Some((old, new)) = texts(c) else { continue };
+        let shown = display_path(&c.path);
+        let (a, b) = match c.kind {
+            Kind::Added => ("/dev/null".to_string(), format!("b/{shown}")),
+            Kind::Deleted => (format!("a/{shown}"), "/dev/null".to_string()),
+            Kind::Modified => (format!("a/{shown}"), format!("b/{shown}")),
+        };
+        out.push('\n');
+        let unified = TextDiff::from_lines(&old, &new).unified_diff().context_radius(3).header(&a, &b).to_string();
+        for line in unified.lines() {
+            let painted = if line.starts_with("+++") || line.starts_with("---") {
+                p.bold(line)
+            } else if line.starts_with('+') {
+                p.green(line)
+            } else if line.starts_with('-') {
+                p.red(line)
+            } else if line.starts_with("@@") {
+                p.cyan(line)
+            } else {
+                line.to_string()
+            };
+            let _ = writeln!(out, "{painted}");
+        }
+    }
+    out
+}
+
+pub fn conflicts(p: Paint, task: &Task, conflicts: &[&Change]) -> String {
+    let mut out = format!(
+        "{} these files changed on your side while task {} was running:\n",
+        p.red("conflict:"),
+        task.id()
+    );
+    for c in conflicts {
+        let _ = writeln!(out, "  {}  {}", kind_mark(p, c.kind), change_path(c));
+    }
+    let _ = writeln!(
+        out,
+        "nothing was committed. Review with `agent diff {}`, then commit other paths, or overwrite with --force.",
+        task.id()
+    );
+    out
+}
+
+pub fn committed(p: Paint, task: &Task, applied: &[Change], remaining: usize) -> String {
+    let mut out = String::new();
+    for c in applied {
+        let _ = writeln!(out, "  {}  {}", kind_mark(p, c.kind), change_path(c));
+    }
+    let n = applied.len();
+    let _ = write!(
+        out,
+        "{} committed {} from task {}",
+        p.green("✓"),
+        if n == 1 { "1 change".to_string() } else { format!("{n} changes") },
+        task.id()
+    );
+    if remaining > 0 {
+        let _ = write!(out, "; {remaining} still pending");
+    }
+    out.push('\n');
+    out
+}
+
+pub fn log(p: Paint, task: &Task, events: &[Event]) -> String {
+    let mut out = format!(
+        "{} {} · {}\n",
+        p.bold("task"),
+        p.bold(task.id()),
+        truncate(&title(task), 70)
+    );
+    for e in events {
+        let _ = writeln!(out, "  {}  {:<15} {}", p.dim(util::rfc3339(e.ts_ms)), e.kind, describe(p, e));
+    }
+    out
+}
+
+fn describe(p: Paint, e: &Event) -> String {
+    let d = &e.data;
+    let s = |v: &Value| v.as_str().unwrap_or("").to_string();
+    let list = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+    match e.kind.as_str() {
+        "task.created" => {
+            let mut parts: Vec<String> = d["grants"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|g| format!("{} {}", s(&g["access"]), display_path(Path::new(&s(&g["path"])))))
+                .collect();
+            parts.push(format!("net {}", s(&d["net"])));
+            parts.push(format!("env {}", list(&d["env"])));
+            parts.join(" · ")
+        }
+        "sandbox.ready" => format!("landlock {} · proc {}", s(&d["landlock"]), s(&d["proc"])),
+        "agent.session" => format!("model {}", s(&d["model"])),
+        "agent.tool" => format!("{} {}", s(&d["name"]), truncate(&s(&d["target"]), 80)),
+        "agent.result" => {
+            let mut parts = vec![if d["is_error"].as_bool() == Some(true) { p.red("error") } else { "ok".into() }];
+            if let Some(n) = d["turns"].as_u64() {
+                parts.push(format!("{n} turns"));
+            }
+            if let Some(c) = d["cost_usd"].as_f64() {
+                parts.push(format!("${c:.4}"));
+            }
+            parts.join(" · ")
+        }
+        "sandbox.failed" => p.red(s(&d["error"])),
+        "task.exited" => format!(
+            "exit {} · {} · +{} ~{} -{}",
+            d["exit_code"],
+            util::duration(d["duration_ms"].as_u64().unwrap_or(0)),
+            d["changes"]["added"],
+            d["changes"]["modified"],
+            d["changes"]["deleted"]
+        ),
+        "commit" => {
+            let changes = d["changes"].as_array().cloned().unwrap_or_default();
+            let first: Vec<String> = changes.iter().take(3).map(|c| display_path(Path::new(&s(&c["path"])))).collect();
+            let more = if changes.len() > 3 { format!(" +{} more", changes.len() - 3) } else { String::new() };
+            let forced = if d["forced"].as_bool() == Some(true) { " (forced)" } else { "" };
+            let n = if changes.len() == 1 { "1 change".to_string() } else { format!("{} changes", changes.len()) };
+            format!("{n}: {}{more}{forced}", first.join(", "))
+        }
+        "rollback" if d["all"].as_bool() == Some(true) => format!(
+            "all pending (+{} ~{} -{})",
+            d["changes"]["added"], d["changes"]["modified"], d["changes"]["deleted"]
+        ),
+        "rollback" => d["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|v| display_path(Path::new(&s(v))))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => truncate(&d.to_string(), 100),
+    }
+}

@@ -1,0 +1,550 @@
+//! The process sandbox.
+//!
+//! ```text
+//! supervisor (agent run)      stays on the host, writes the journal
+//!  └─ A  new user/mount/pid/ipc/uts(/net) namespaces, uid/gid maps
+//!      └─ B  pid 1: assembles the root, pivots, applies Landlock, reaps
+//!          └─ C  execs the agent command
+//! ```
+//!
+//! The agent's root is an empty tmpfs that gets: read-only system dirs, a
+//! private /dev, /proc, /tmp, a private empty $HOME, and only the paths it was
+//! granted. Writable grants are overlayfs mounts whose upper dir lives in the
+//! task store, so nothing the agent writes touches the real tree until it is
+//! committed. Everything runs unprivileged via user namespaces.
+
+use anyhow::{Context, Result, bail};
+use nix::errno::Errno;
+use nix::fcntl::OFlag;
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::sched::{CloneFlags, unshare};
+use nix::sys::prctl;
+use nix::sys::signal::{SigHandler, Signal, signal};
+use nix::sys::statvfs::{FsFlags, statvfs};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, execve, fork, pipe2, pivot_root, sethostname};
+use serde::{Deserialize, Serialize};
+use std::ffi::CString;
+use std::fs;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+
+/// Host directories every agent can read (never write).
+const SYSTEM_DIRS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt", "/nix", "/sys"];
+const DEV_NODES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
+
+pub enum Mount {
+    /// Writable, transactional: writes go to `upper`, `source` is never touched.
+    Overlay { upper: PathBuf, work: PathBuf },
+    ReadOnly,
+}
+
+pub struct GrantMount {
+    /// Canonical host path, mounted at the same path inside the sandbox.
+    pub path: PathBuf,
+    pub kind: Mount,
+}
+
+pub struct Spec {
+    /// Empty directory used as the sandbox root mount point.
+    pub rootfs: PathBuf,
+    pub grants: Vec<GrantMount>,
+    /// Paths to blank out even though a grant would expose them.
+    pub hide: Vec<PathBuf>,
+    /// Like `hide`, but silent: the task store must never be visible.
+    pub mask: Vec<PathBuf>,
+    pub isolate_net: bool,
+    pub hostname: String,
+    pub home: PathBuf,
+    /// Directory mounted read-write as $HOME (an agent's persistent home).
+    /// Without one, $HOME is an empty tmpfs.
+    pub home_source: Option<PathBuf>,
+    pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
+    pub argv: Vec<String>,
+}
+
+/// What the sandbox actually achieved, sent back to the supervisor for the journal.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Report {
+    pub landlock: String,
+    pub proc: String,
+    pub devpts: bool,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Whether `path` is under a system dir every sandbox already sees read-only.
+pub fn is_system_path(path: &Path) -> bool {
+    SYSTEM_DIRS.iter().any(|d| path.starts_with(d))
+}
+
+/// Runs `spec.argv` in the sandbox, with its stdout redirected to `stdout`
+/// if given. `on_ready` is called once setup has finished (or failed), while
+/// the agent runs; the call returns the agent's exit status.
+pub fn run(spec: &Spec, stdout: Option<OwnedFd>, on_ready: impl FnOnce(&Report)) -> Result<i32> {
+    if spec.argv.is_empty() {
+        bail!("no command to run");
+    }
+    let (uid, gid) = (Uid::current(), Gid::current());
+    if uid.is_root() {
+        bail!("refusing to run an agent as root; agentos sandboxes are built on unprivileged user namespaces");
+    }
+    let (report_rx, report_tx) = pipe2(OFlag::O_CLOEXEC)?;
+
+    // Ctrl-C belongs to the agent; the supervisor must survive it to record the outcome.
+    let prev_int = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn)? };
+    let prev_quit = unsafe { signal(Signal::SIGQUIT, SigHandler::SigIgn)? };
+
+    let result = match unsafe { fork() }? {
+        ForkResult::Child => {
+            drop(report_rx);
+            let code = namespace_parent(spec, uid, gid, report_tx, stdout);
+            unsafe { libc::_exit(code) }
+        }
+        ForkResult::Parent { child } => {
+            drop(report_tx);
+            drop(stdout);
+            let mut raw = String::new();
+            let _ = fs::File::from(report_rx).read_to_string(&mut raw);
+            let report = serde_json::from_str(raw.trim()).unwrap_or_else(|_| Report {
+                error: Some("sandbox exited before finishing setup".into()),
+                ..Default::default()
+            });
+            on_ready(&report);
+            wait_for(child)
+        }
+    };
+
+    unsafe {
+        signal(Signal::SIGINT, prev_int)?;
+        signal(Signal::SIGQUIT, prev_quit)?;
+    }
+    result
+}
+
+/// Enters a new user namespace (plus `flags`) mapping only the caller's own
+/// uid/gid — no setuid helpers, no subordinate id ranges.
+pub fn enter_user_namespace(flags: CloneFlags, uid: Uid, gid: Gid) -> Result<()> {
+    unshare(flags | CloneFlags::CLONE_NEWUSER)
+        .context("unshare: unprivileged user namespaces unavailable (run `agent doctor`)")?;
+    fs::write("/proc/self/setgroups", "deny").context("write setgroups")?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1\n")).context("write uid_map")?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1\n")).context("write gid_map")?;
+    Ok(())
+}
+
+/// Process A: creates the namespaces, then forks pid 1 of the new pid namespace.
+fn namespace_parent(spec: &Spec, uid: Uid, gid: Gid, report_tx: OwnedFd, stdout: Option<OwnedFd>) -> i32 {
+    let _ = prctl::set_pdeathsig(Signal::SIGKILL);
+    let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWIPC | CloneFlags::CLONE_NEWUTS;
+    if spec.isolate_net {
+        flags |= CloneFlags::CLONE_NEWNET;
+    }
+    if let Err(e) = enter_user_namespace(flags, uid, gid) {
+        return send_failure(&report_tx, e);
+    }
+    let mut warnings = Vec::new();
+    if let Err(e) = sethostname(&spec.hostname) {
+        warnings.push(format!("hostname: {e}"));
+    }
+    if spec.isolate_net {
+        if let Err(e) = bring_up_loopback() {
+            warnings.push(format!("loopback: {e:#}"));
+        }
+    }
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            let code = sandbox_init(spec, warnings, report_tx, stdout);
+            unsafe { libc::_exit(code) }
+        }
+        Ok(ForkResult::Parent { child }) => {
+            drop(report_tx);
+            drop(stdout);
+            wait_for(child).unwrap_or(125)
+        }
+        Err(e) => send_failure(&report_tx, e.into()),
+    }
+}
+
+/// Process B (pid 1): builds the root, applies Landlock, runs the agent and
+/// reaps orphans. When B exits the kernel kills everything left in the namespace.
+fn sandbox_init(spec: &Spec, warnings: Vec<String>, report_tx: OwnedFd, stdout: Option<OwnedFd>) -> i32 {
+    let _ = prctl::set_pdeathsig(Signal::SIGKILL);
+    let mut report = Report { warnings, ..Default::default() };
+    if let Err(e) = build_root(spec, &mut report) {
+        return send_failure_with(&report_tx, report, e);
+    }
+    let cwd = if spec.cwd.is_dir() {
+        spec.cwd.clone()
+    } else {
+        report.warnings.push(format!("{} is not granted; starting in $HOME", spec.cwd.display()));
+        spec.home.clone()
+    };
+    report.cwd = cwd.display().to_string();
+    report.landlock = apply_landlock(spec);
+    send_report(&report_tx, &report);
+    drop(report_tx);
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => exec_agent(spec, &cwd, stdout.as_ref()),
+        Ok(ForkResult::Parent { child }) => {
+            drop(stdout);
+            reap_until(child)
+        }
+        Err(e) => {
+            eprintln!("agent: fork: {e}");
+            125
+        }
+    }
+}
+
+fn build_root(spec: &Spec, report: &mut Report) -> Result<()> {
+    let root = spec.rootfs.as_path();
+    let inside = |p: &Path| root.join(p.strip_prefix("/").unwrap_or(p));
+    let dir = |p: &str| -> Result<PathBuf> {
+        let d = inside(Path::new(p));
+        fs::create_dir_all(&d).with_context(|| format!("mkdir {}", d.display()))?;
+        Ok(d)
+    };
+
+    mount(None::<&str>, "/", None::<&str>, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None::<&str>).context("make mounts private")?;
+    tmpfs(root, "0755").context("root tmpfs")?;
+
+    for sys in SYSTEM_DIRS {
+        let src = Path::new(sys);
+        match fs::symlink_metadata(src) {
+            Ok(m) if m.file_type().is_symlink() => symlink(fs::read_link(src)?, inside(src))?,
+            Ok(m) if m.is_dir() => bind_ro(src, &dir(sys)?)?,
+            _ => {}
+        }
+    }
+
+    // A private /dev with just the safe nodes.
+    let dev = dir("/dev")?;
+    tmpfs(&dev, "0755")?;
+    for node in DEV_NODES {
+        let target = dev.join(node);
+        fs::File::create(&target)?;
+        if let Err(e) = bind(&Path::new("/dev").join(node), &target) {
+            report.warnings.push(format!("/dev/{node}: {e:#}"));
+        }
+    }
+    fs::create_dir(dev.join("pts"))?;
+    match mount(Some("devpts"), &dev.join("pts"), Some("devpts"), MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC, Some("newinstance,ptmxmode=0666,mode=0620")) {
+        Ok(()) => {
+            symlink("pts/ptmx", dev.join("ptmx"))?;
+            report.devpts = true;
+        }
+        Err(e) => report.warnings.push(format!("devpts: {e}")),
+    }
+    fs::create_dir(dev.join("shm"))?;
+    tmpfs(&dev.join("shm"), "1777")?;
+    for (name, target) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
+        symlink(target, dev.join(name))?;
+    }
+
+    // Scratch space: private, empty and thrown away with the sandbox.
+    tmpfs(&dir("/tmp")?, "1777")?;
+    tmpfs(&dir("/run")?, "0755")?;
+    tmpfs(&dir("/var")?, "0755")?;
+    let var_tmp = dir("/var/tmp")?;
+    fs::set_permissions(&var_tmp, fs::Permissions::from_mode(0o1777))?;
+    if Path::new("/run/systemd/resolve").is_dir() {
+        bind_ro(Path::new("/run/systemd/resolve"), &dir("/run/systemd/resolve")?)?;
+    }
+
+    // $HOME starts empty; grants are mounted shallowest-first so nested
+    // grants (and grants inside $HOME) land on top of their parents.
+    enum Step<'a> {
+        Home,
+        Grant(&'a GrantMount),
+    }
+    let mut steps: Vec<(&Path, Step)> = spec.grants.iter().map(|g| (g.path.as_path(), Step::Grant(g))).collect();
+    if !spec.grants.iter().any(|g| g.path == spec.home) {
+        steps.push((spec.home.as_path(), Step::Home));
+    }
+    steps.sort_by_key(|(p, _)| p.components().count());
+    for (path, step) in steps {
+        let target = inside(path);
+        match step {
+            Step::Home => {
+                fs::create_dir_all(&target)?;
+                match &spec.home_source {
+                    Some(src) => bind(src, &target).context("agent home")?,
+                    None => tmpfs(&target, "0700").context("home tmpfs")?,
+                }
+            }
+            Step::Grant(g) => mount_grant(g, &target).with_context(|| format!("grant {}", g.path.display()))?,
+        }
+    }
+
+    for path in &spec.hide {
+        if let Err(e) = blank_out(&inside(path)) {
+            report.warnings.push(format!("hide {}: {e:#}", path.display()));
+        }
+    }
+    for path in &spec.mask {
+        if inside(path).exists() {
+            blank_out(&inside(path)).with_context(|| format!("mask {}", path.display()))?;
+        }
+    }
+
+    // /proc for the new pid namespace. Mounting it needs an unobstructed
+    // /proc elsewhere in the namespace (unprivileged containers mask theirs),
+    // so fall back to the host's, which is weaker: it shows host processes.
+    let proc_dir = dir("/proc")?;
+    let pflags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+    match mount(Some("proc"), &proc_dir, Some("proc"), pflags, None::<&str>) {
+        Ok(()) => report.proc = "private".into(),
+        Err(e) => {
+            mount(Some("/proc"), &proc_dir, None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, None::<&str>).context("bind /proc")?;
+            report.proc = "host".into();
+            report.warnings.push(format!("private /proc unavailable ({e}); host processes are visible"));
+        }
+    }
+
+    chdir(root)?;
+    fs::create_dir(".oldroot")?;
+    pivot_root(".", ".oldroot").context("pivot_root")?;
+    chdir("/")?;
+    umount2("/.oldroot", MntFlags::MNT_DETACH).context("detach old root")?;
+    fs::remove_dir("/.oldroot")?;
+    if let Err(e) = mount(None::<&str>, "/", None::<&str>, MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY, None::<&str>) {
+        report.warnings.push(format!("read-only root: {e}"));
+    }
+    Ok(())
+}
+
+fn mount_grant(g: &GrantMount, target: &Path) -> Result<()> {
+    if g.path.is_dir() {
+        fs::create_dir_all(target)?;
+    } else {
+        fs::create_dir_all(target.parent().context("grant has no parent")?)?;
+        fs::File::create(target)?;
+    }
+    match &g.kind {
+        Mount::ReadOnly => bind_ro(&g.path, target),
+        Mount::Overlay { upper, work } => {
+            for p in [&g.path, upper, work] {
+                if p.as_os_str().as_bytes().iter().any(|b| matches!(b, b',' | b':' | b'\\')) {
+                    bail!("{}: paths containing ',', ':' or '\\' can't be overlay-mounted yet", p.display());
+                }
+            }
+            // userxattr: unprivileged overlay keeps its metadata in user.overlay.* xattrs.
+            let opts = format!("lowerdir={},upperdir={},workdir={},userxattr", g.path.display(), upper.display(), work.display());
+            mount(Some("overlay"), target, Some("overlay"), MsFlags::empty(), Some(opts.as_str())).context("mount overlay")?;
+            Ok(())
+        }
+    }
+}
+
+fn tmpfs(target: &Path, mode: &str) -> Result<()> {
+    mount(Some("tmpfs"), target, Some("tmpfs"), MsFlags::MS_NOSUID | MsFlags::MS_NODEV, Some(format!("mode={mode}").as_str()))
+        .with_context(|| format!("tmpfs {}", target.display()))?;
+    Ok(())
+}
+
+fn bind(src: &Path, dst: &Path) -> Result<()> {
+    mount(Some(src), dst, None::<&str>, MsFlags::MS_BIND | MsFlags::MS_REC, None::<&str>)
+        .with_context(|| format!("bind {} -> {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+fn bind_ro(src: &Path, dst: &Path) -> Result<()> {
+    bind(src, dst)?;
+    make_readonly(dst).with_context(|| format!("make {} read-only", dst.display()))
+}
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+const MOUNT_ATTR_RDONLY: u64 = 0x1;
+const AT_RECURSIVE: libc::c_uint = 0x8000;
+
+fn make_readonly(path: &Path) -> Result<()> {
+    // mount_setattr(2) (Linux 5.12+) makes the whole subtree read-only at once.
+    let c = CString::new(path.as_os_str().as_bytes())?;
+    let attr = MountAttr { attr_set: MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
+    let rc = unsafe {
+        libc::syscall(libc::SYS_mount_setattr, libc::AT_FDCWD, c.as_ptr(), AT_RECURSIVE, &attr as *const MountAttr, size_of::<MountAttr>())
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    // Older kernels: remount the top mount only, keeping the flags the kernel
+    // locked when the mount crossed into our user namespace.
+    let st = statvfs(path)?;
+    let mut flags = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY;
+    for (have, want) in [
+        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
+        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+    ] {
+        if st.flags().contains(have) {
+            flags |= want;
+        }
+    }
+    mount(None::<&str>, path, None::<&str>, flags, None::<&str>)?;
+    Ok(())
+}
+
+/// Covers a dir with an empty read-only tmpfs, or a file with /dev/null.
+fn blank_out(target: &Path) -> Result<()> {
+    let m = fs::symlink_metadata(target).context("not visible in the sandbox")?;
+    if m.is_dir() {
+        let flags = MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        mount(Some("tmpfs"), target, Some("tmpfs"), flags, Some("mode=0755,size=0")).context("tmpfs")?;
+    } else {
+        bind_ro(Path::new("/dev/null"), target)?;
+    }
+    Ok(())
+}
+
+fn apply_landlock(spec: &Spec) -> String {
+    use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules};
+    let abi = ABI::V5;
+    let mut writable: Vec<PathBuf> = ["/tmp", "/var/tmp", "/dev", "/proc", "/run"].iter().map(PathBuf::from).collect();
+    writable.push(spec.home.clone());
+    writable.extend(spec.grants.iter().filter(|g| matches!(g.kind, Mount::Overlay { .. })).map(|g| g.path.clone()));
+    writable.retain(|p| p.exists());
+
+    let status = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .and_then(|r| r.create())
+        .and_then(|r| r.add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi))))
+        .and_then(|r| r.add_rules(path_beneath_rules(&writable, AccessFs::from_all(abi))))
+        .and_then(|r| r.restrict_self());
+    match status {
+        Ok(s) => match s.ruleset {
+            RulesetStatus::FullyEnforced => "enforced".into(),
+            RulesetStatus::PartiallyEnforced => "partially enforced (older kernel ABI)".into(),
+            RulesetStatus::NotEnforced => "unavailable (kernel without Landlock)".into(),
+        },
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// Process C: becomes the agent.
+fn exec_agent(spec: &Spec, cwd: &Path, stdout: Option<&OwnedFd>) -> ! {
+    if let Some(fd) = stdout {
+        unsafe { libc::dup2(fd.as_raw_fd(), 1) };
+    }
+    unsafe {
+        // Ignored signals survive execve; give the agent normal defaults
+        // (Rust's runtime ignores SIGPIPE, which would break shell pipelines).
+        for sig in [Signal::SIGINT, Signal::SIGQUIT, Signal::SIGPIPE] {
+            let _ = signal(sig, SigHandler::SigDfl);
+        }
+    }
+    let _ = prctl::set_no_new_privs();
+    let _ = chdir(cwd);
+
+    let path_var = spec.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_str()).unwrap_or("/usr/bin:/bin");
+    let program = resolve_program(&spec.argv[0], path_var);
+    let to_c = |s: &str| CString::new(s).unwrap_or_default();
+    let argv: Vec<CString> = spec.argv.iter().map(|a| to_c(a)).collect();
+    let env: Vec<CString> = spec.env.iter().map(|(k, v)| to_c(&format!("{k}={v}"))).collect();
+    let err = execve(&CString::new(program.as_os_str().as_bytes()).unwrap_or_default(), &argv, &env).unwrap_err();
+    eprintln!("agent: {}: {}", spec.argv[0], if err == Errno::ENOENT { "command not found in the sandbox".to_string() } else { err.to_string() });
+    unsafe { libc::_exit(if err == Errno::ENOENT { 127 } else { 126 }) }
+}
+
+fn resolve_program(name: &str, path_var: &str) -> PathBuf {
+    if name.contains('/') {
+        return PathBuf::from(name);
+    }
+    path_var
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join(name))
+        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn bring_up_loopback() -> Result<()> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(Errno::last()).context("socket");
+        }
+        let mut ifr: libc::ifreq = std::mem::zeroed();
+        for (i, b) in b"lo".iter().enumerate() {
+            ifr.ifr_name[i] = *b as libc::c_char;
+        }
+        let res = if libc::ioctl(fd, libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
+            Err(Errno::last()).context("SIOCGIFFLAGS")
+        } else {
+            ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
+            if libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &ifr) < 0 { Err(Errno::last()).context("SIOCSIFFLAGS") } else { Ok(()) }
+        };
+        libc::close(fd);
+        res
+    }
+}
+
+fn exit_code(status: WaitStatus) -> Option<i32> {
+    match status {
+        WaitStatus::Exited(_, code) => Some(code),
+        WaitStatus::Signaled(_, sig, _) => Some(128 + sig as i32),
+        _ => None,
+    }
+}
+
+fn wait_for(pid: Pid) -> Result<i32> {
+    loop {
+        match waitpid(pid, None) {
+            Ok(status) => {
+                if let Some(code) = exit_code(status) {
+                    return Ok(code);
+                }
+            }
+            Err(Errno::EINTR) => continue,
+            Err(e) => return Err(e).context("waitpid"),
+        }
+    }
+}
+
+/// As pid 1, reap every orphan, but return as soon as the agent itself exits.
+fn reap_until(main: Pid) -> i32 {
+    loop {
+        match waitpid(None::<Pid>, None) {
+            Ok(status) if status.pid() == Some(main) => {
+                if let Some(code) = exit_code(status) {
+                    return code;
+                }
+            }
+            Ok(_) | Err(Errno::EINTR) => continue,
+            Err(_) => return 125,
+        }
+    }
+}
+
+fn send_report(tx: &OwnedFd, report: &Report) {
+    if let Ok(json) = serde_json::to_string(report) {
+        let _ = fs::File::from(tx.try_clone().expect("dup report pipe")).write_all(json.as_bytes());
+    }
+}
+
+fn send_failure(tx: &OwnedFd, err: anyhow::Error) -> i32 {
+    send_failure_with(tx, Report::default(), err)
+}
+
+fn send_failure_with(tx: &OwnedFd, mut report: Report, err: anyhow::Error) -> i32 {
+    report.error = Some(format!("{err:#}"));
+    send_report(tx, &report);
+    125
+}

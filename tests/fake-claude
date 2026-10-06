@@ -1,0 +1,26 @@
+#!/bin/sh
+# Stand-in for Claude Code in tests. Records how it was invoked and what it
+# could see (in its own persistent home), then behaves like
+# `claude -p TASK --output-format stream-json --verbose`: narrates, writes a
+# test file, runs a "command", and reports a result with a cost.
+state="$HOME/.claude"
+mkdir -p "$state"
+printf '%s\n' "$@" > "$state/last-argv"
+runs=$(cat "$state/runs" 2>/dev/null || echo 0)
+echo $((runs + 1)) > "$state/runs"
+{
+  if [ -e "$state/host-secret" ]; then echo "host-secret: visible"; else echo "host-secret: hidden"; fi
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then echo "api-key: set"; else echo "api-key: unset"; fi
+} > "$state/observations"
+
+echo "plain line from the agent"
+cat <<EOF
+{"type":"system","subtype":"init","session_id":"fake","model":"fake-model-1","tools":["Write","Bash"]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"I'll add a test for greet."},{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"$PWD/test_greet.py","content":"..."}}]}}
+EOF
+printf 'def test_greet():\n    assert True\n' > test_greet.py
+cat <<EOF
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"python3 -m pytest -q","description":"Run the tests"}}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"Added test_greet.py with a test for greet.","session_id":"fake","total_cost_usd":0.0421}
+EOF

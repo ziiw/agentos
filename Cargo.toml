@@ -1,0 +1,32 @@
+[package]
+name = "agentos"
+version = "0.0.1"
+edition = "2024"
+description = "Transactional, capability-scoped runtime for AI agents on Linux"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+humantime = "2"
+landlock = "0.4"
+libc = "0.2"
+nix = { version = "0.30", features = ["feature", "fs", "hostname", "mount", "process", "sched", "signal", "user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+similar = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
