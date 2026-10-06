@@ -188,7 +188,9 @@ mkdir -p "$HOME/.claude" && echo real > "$HOME/.claude/host-secret"
 reset_proj
 cd "$PROJ"
 out="$("$AGENT" do add a test for greet 2>&1)"
-check "agent do succeeds" test $? -eq 0
+status=$?
+check "agent do succeeds" test $status -eq 0
+[ $status -eq 0 ] || sed 's/^/      | /' <<<"$out"
 check "agent got the task" grep -qx 'add a test for greet' "$AGENT_STATE/last-argv"
 check "agent runs headless (-p)" grep -qx -- '-p' "$AGENT_STATE/last-argv"
 check "agent's own permission prompts are off" grep -qx -- '--dangerously-skip-permissions' "$AGENT_STATE/last-argv"
