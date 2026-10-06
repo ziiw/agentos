@@ -4,9 +4,10 @@ use agentos::changes::{self, Summary};
 use agentos::config;
 use agentos::doctor::{self, Level};
 use agentos::journal::{Integrity, Journal};
+use agentos::outbox;
 use agentos::profiles::{self, AgentEvent, Output};
 use agentos::proxy::{self, Allowlist, NetEvent};
-use agentos::sandbox::{self, GrantMount, Mount};
+use agentos::sandbox::{self, GrantMount, Mount, RunMount};
 use agentos::store::{Access, Grant, Net, NewTask, Status, Store, Task};
 use agentos::util::{self, display_path};
 use anyhow::{Context, Result, bail};
@@ -82,6 +83,17 @@ enum Command {
         /// Include ignored changes (.gitignore, __pycache__, …)
         #[arg(long)]
         all: bool,
+        /// Apply the file changes but keep the agent's git pushes held
+        #[arg(long)]
+        no_push: bool,
+    },
+    /// Send a task's held git pushes, with your own git and credentials
+    Push {
+        /// Task id or prefix (default: the latest task)
+        task: Option<String>,
+        /// Overwrite the remote even if it moved since (git push --force)
+        #[arg(long)]
+        force: bool,
     },
     /// Discard a task's changes (all of them, or only those under PATHs)
     #[command(alias = "discard")]
@@ -226,7 +238,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Run(args) => cmd_run(&store, args),
         Command::Ls => cmd_ls(&store),
         Command::Diff { task, paths, stat, all } => cmd_diff(&store, task.as_deref(), &paths, stat, all),
-        Command::Commit { task, paths, force, all } => cmd_commit(&store, task.as_deref(), &paths, force, all),
+        Command::Commit { task, paths, force, all, no_push } => cmd_commit(&store, task.as_deref(), &paths, force, all, no_push),
+        Command::Push { task, force } => cmd_push(&store, task.as_deref(), force),
         Command::Rollback { task, paths } => cmd_rollback(&store, task.as_deref(), &paths),
         Command::Log { task, json } => cmd_log(&store, task.as_deref(), json),
         Command::Doctor => cmd_doctor(&store),
@@ -526,7 +539,24 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     )?;
 
     let err = Paint::stderr();
-    eprintln!("{}", render::banner(err, &task));
+    // A writable grant that's a git repository gets an outbox for its pushes.
+    let outbox = match task.meta.grants.iter().find(|g| g.access == Access::Rw && g.path.join(".git").is_dir()) {
+        Some(g) => outbox::prepare(&task.dir, &g.path).unwrap_or_else(|e| {
+            eprintln!("{} git outbox unavailable: {e:#}", err.yellow("agent: warning:"));
+            None
+        }),
+        None => None,
+    };
+    let mut run_mounts = Vec::new();
+    if let Some(o) = &outbox {
+        env.extend(o.env.iter().cloned());
+        run_mounts.extend(o.mounts.iter().map(|(src, name, writable)| RunMount { src: src.clone(), name: name.clone(), writable: *writable }));
+        for w in &o.warnings {
+            eprintln!("{} {w}", err.yellow("agent: warning:"));
+        }
+        journal.append("outbox.ready", json!({ "remotes": o.remotes }))?;
+    }
+    eprintln!("{}", render::banner(err, &task, outbox.is_some()));
     // The proxy's socket must exist before the sandbox mounts it, but its
     // threads may only start once the sandbox has been forked.
     let (proxy_socket, mut proxy_listener) = if task.meta.net == Net::Proxy {
@@ -541,14 +571,17 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     let ask = plan.ask;
     // The CA's private key never leaves this process; only its certificate
     // is written out for the sandbox to trust.
-    let (broker, run_files) = if plan.secrets.is_empty() {
-        (None, Vec::new())
+    let broker = if plan.secrets.is_empty() {
+        None
     } else {
         let broker = Broker::new(plan.secrets)?;
         let (ca, bundle) = (task.dir.join("ca.pem"), task.dir.join("ca-bundle.pem"));
         fs::write(&ca, broker.ca_pem())?;
         fs::write(&bundle, broker::ca_bundle(broker.ca_pem()))?;
-        (Some(Arc::new(broker)), vec![(ca, "ca.pem".to_string()), (bundle, "ca-bundle.pem".to_string())])
+        for (src, name) in [(ca, "ca.pem"), (bundle, "ca-bundle.pem")] {
+            run_mounts.push(RunMount { src, name: name.into(), writable: false });
+        }
+        Some(Arc::new(broker))
     };
     let spec = sandbox::Spec {
         rootfs: task.rootfs_dir(),
@@ -568,7 +601,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         mask: vec![store.root().to_path_buf()],
         isolate_net: task.meta.net != Net::Host,
         proxy: proxy_socket.clone(),
-        run_files,
+        run_mounts,
         hostname: format!("agent-{}", task.id()),
         home,
         home_source,
@@ -619,6 +652,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         let _ = fs::remove_file(path);
     }
 
+    outbox::seal(&task.dir)?;
+    let pushes = outbox::pending(&task.dir)?;
+    if !pushes.is_empty() {
+        let held: Vec<_> = pushes.iter().map(|p| json!({ "remote": p.remote, "ref": p.refname, "sha": p.sha })).collect();
+        journal.append("outbox.held", json!({ "pushes": held }))?;
+    }
     let summary = Summary::of(&changes::scan(&task.layers())?);
     let ended = util::now_ms();
     task.meta.status = if setup_error.is_some() { Status::Failed } else { Status::Exited };
@@ -632,7 +671,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     if let Some(e) = setup_error {
         bail!("sandbox setup failed: {e}\n(run `agent doctor` to check this machine)");
     }
-    eprintln!("{}", render::exit_summary(err, &task, &summary, outcome.as_ref(), blocked.load(Ordering::SeqCst)));
+    eprintln!("{}", render::exit_summary(err, &task, &summary, &pushes, outcome.as_ref(), blocked.load(Ordering::SeqCst)));
     Ok(exit_code)
 }
 
@@ -850,11 +889,23 @@ fn open_task(store: &Store, selector: Option<&str>) -> Result<Task> {
 fn cmd_diff(store: &Store, selector: Option<&str>, paths: &[PathBuf], stat: bool, all: bool) -> Result<i32> {
     let task = store.resolve(selector)?;
     let changes = changes::select(changes::scan(&task.layers())?, &absolutize_all(paths)?);
-    print!("{}", render::diff(Paint::stdout(), &task, &changes, stat, all));
+    let pushes = if paths.is_empty() { held_pushes(&task)? } else { Vec::new() };
+    print!("{}", render::diff(Paint::stdout(), &task, &changes, &pushes, stat, all));
     Ok(0)
 }
 
-fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: bool, all: bool) -> Result<i32> {
+/// Held pushes with their commit subject and how many commits they add.
+fn held_pushes(task: &Task) -> Result<Vec<render::HeldPush>> {
+    Ok(outbox::pending(&task.dir)?
+        .into_iter()
+        .map(|p| {
+            let (subject, new_commits) = outbox::describe(&task.dir, &p);
+            render::HeldPush { push: p, subject, new_commits }
+        })
+        .collect())
+}
+
+fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: bool, all: bool, no_push: bool) -> Result<i32> {
     let mut task = open_task(store, selector)?;
     let layers = task.layers();
     let mut selected = changes::select(changes::scan(&layers)?, &absolutize_all(paths)?);
@@ -866,40 +917,98 @@ fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: b
     } else {
         0
     };
-    if selected.is_empty() {
+    // Naming paths means files only; pushes go with a plain commit.
+    let pushes = if paths.is_empty() && !no_push { outbox::pending(&task.dir)? } else { Vec::new() };
+    if selected.is_empty() && pushes.is_empty() {
         match skipped {
             0 => println!("nothing to commit"),
             n => println!("nothing to commit ({} ignored; `agent commit --all` includes them)", plural(n, "change")),
         }
         return Ok(0);
     }
-    if !force {
-        let conflicts = changes::conflicts(&selected, task.meta.started_at_ms);
-        if !conflicts.is_empty() {
-            eprint!("{}", render::conflicts(Paint::stderr(), &task, &conflicts));
-            return Ok(1);
+    if !selected.is_empty() {
+        if !force {
+            let conflicts = changes::conflicts(&selected, task.meta.started_at_ms);
+            if !conflicts.is_empty() {
+                eprint!("{}", render::conflicts(Paint::stderr(), &task, &conflicts));
+                return Ok(1);
+            }
+        }
+        changes::commit(&layers, &selected)?;
+        task.journal().append(
+            "commit",
+            json!({
+                "forced": force,
+                "changes": selected.iter().map(|c| json!({ "kind": c.kind, "path": c.path })).collect::<Vec<_>>(),
+            }),
+        )?;
+        let pending = changes::scan(&layers)?.iter().filter(|c| !c.ignored).count();
+        print!("{}", render::committed(Paint::stdout(), &task, &selected, pending));
+    }
+    let failed = send_pushes(&task, &pushes, false)?;
+    finish_if_done(&mut task)?;
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+fn cmd_push(store: &Store, selector: Option<&str>, force: bool) -> Result<i32> {
+    let mut task = open_task(store, selector)?;
+    let pushes = outbox::pending(&task.dir)?;
+    if pushes.is_empty() {
+        println!("nothing to push");
+        return Ok(0);
+    }
+    let failed = send_pushes(&task, &pushes, force)?;
+    finish_if_done(&mut task)?;
+    Ok(if failed > 0 { 1 } else { 0 })
+}
+
+/// Replays held pushes from outside the sandbox. Returns how many failed
+/// (those stay held).
+fn send_pushes(task: &Task, pushes: &[outbox::Push], force: bool) -> Result<usize> {
+    let (out, err) = (Paint::stdout(), Paint::stderr());
+    let journal = task.journal();
+    let mut failed = 0;
+    for p in pushes {
+        let what = json!({ "remote": p.remote, "ref": p.refname, "sha": p.sha, "forced": force });
+        match outbox::send(p, force) {
+            Ok(()) => {
+                journal.append("outbox.pushed", what)?;
+                println!("  {} pushed {} to {} {}", out.green("↑"), &p.sha[..p.sha.len().min(7)], p.remote, p.short_ref());
+            }
+            Err(e) => {
+                failed += 1;
+                let mut what = what;
+                what["error"] = json!(format!("{e:#}"));
+                journal.append("outbox.failed", what)?;
+                eprintln!("  {} {} {}: {e:#}", err.red("✗ push to"), p.remote, p.short_ref());
+            }
         }
     }
-    changes::commit(&layers, &selected)?;
-    task.journal().append(
-        "commit",
-        json!({
-            "forced": force,
-            "changes": selected.iter().map(|c| json!({ "kind": c.kind, "path": c.path })).collect::<Vec<_>>(),
-        }),
-    )?;
-    let remaining = changes::scan(&layers)?;
-    let pending = remaining.iter().filter(|c| !c.ignored).count();
-    print!("{}", render::committed(Paint::stdout(), &task, &selected, pending));
-    if pending == 0 {
-        if !remaining.is_empty() {
-            println!("{}", Paint::stdout().dim(format!("left out {}", render::ignored_summary(&remaining))));
-        }
-        task.meta.status = Status::Committed;
-        task.save()?;
-        task.release_storage()?;
+    if failed > 0 {
+        eprintln!(
+            "{} {} still held. Once you've sorted it out: `agent push {}` (--force overwrites the remote)",
+            err.yellow("agent:"),
+            plural(failed, "push"),
+            task.id()
+        );
     }
-    Ok(0)
+    Ok(failed)
+}
+
+/// Closes the task once nothing is left: no file changes (ignored ones are
+/// dropped) and no held pushes.
+fn finish_if_done(task: &mut Task) -> Result<()> {
+    let files = changes::scan(&task.layers())?;
+    if files.iter().any(|c| !c.ignored) || !outbox::pending(&task.dir)?.is_empty() {
+        return Ok(());
+    }
+    if !files.is_empty() {
+        println!("{}", Paint::stdout().dim(format!("left out {}", render::ignored_summary(&files))));
+    }
+    let applied = task.journal().read()?.iter().any(|e| e.kind == "commit" || e.kind == "outbox.pushed");
+    task.meta.status = if applied { Status::Committed } else { Status::Discarded };
+    task.save()?;
+    task.release_storage()
 }
 
 fn cmd_rollback(store: &Store, selector: Option<&str>, paths: &[PathBuf]) -> Result<i32> {
@@ -907,34 +1016,36 @@ fn cmd_rollback(store: &Store, selector: Option<&str>, paths: &[PathBuf]) -> Res
     let layers = task.layers();
     let pending = changes::scan(&layers)?;
     let journal = task.journal();
-    let committed_before = journal.read()?.iter().any(|e| e.kind == "commit");
     let counted = |changes: &[changes::Change]| changes.iter().filter(|c| !c.ignored).count();
-    let remaining = if paths.is_empty() {
-        journal.append("rollback", json!({ "all": true, "changes": Summary::of(&pending) }))?;
-        let n = plural(counted(&pending), "change");
-        if committed_before {
-            println!("rolled back the remaining {n} from task {}", task.id());
-        } else {
-            println!("rolled back {n} from task {}; your files are as they were", task.id());
+    if paths.is_empty() {
+        let pushes = outbox::pending(&task.dir)?;
+        let held: Vec<_> = pushes.iter().map(|p| json!({ "remote": p.remote, "ref": p.refname, "sha": p.sha })).collect();
+        journal.append("rollback", json!({ "all": true, "changes": Summary::of(&pending), "pushes": held }))?;
+        let committed_before = journal.read()?.iter().any(|e| e.kind == "commit" || e.kind == "outbox.pushed");
+        let mut what = plural(counted(&pending), "change");
+        if !pushes.is_empty() {
+            what = format!("{what} and {}", plural(pushes.len(), "held push"));
         }
-        0
-    } else {
-        let targets = absolutize_all(paths)?;
-        changes::rollback(&layers, &pending, &targets)?;
-        journal.append("rollback", json!({ "paths": targets }))?;
-        let left = counted(&changes::scan(&layers)?);
-        println!(
-            "rolled back {} from task {}; {left} still pending",
-            plural(counted(&pending).saturating_sub(left), "change"),
-            task.id(),
-        );
-        left
-    };
-    if remaining == 0 {
+        if committed_before {
+            println!("rolled back the remaining {what} from task {}", task.id());
+        } else {
+            println!("rolled back {what} from task {}; your files and remotes are as they were", task.id());
+        }
         task.meta.status = if committed_before { Status::Committed } else { Status::Discarded };
         task.save()?;
         task.release_storage()?;
+        return Ok(0);
     }
+    let targets = absolutize_all(paths)?;
+    changes::rollback(&layers, &pending, &targets)?;
+    journal.append("rollback", json!({ "paths": targets }))?;
+    let left = counted(&changes::scan(&layers)?);
+    println!(
+        "rolled back {} from task {}; {left} still pending",
+        plural(counted(&pending).saturating_sub(left), "change"),
+        task.id(),
+    );
+    finish_if_done(&mut task)?;
     Ok(0)
 }
 

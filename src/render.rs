@@ -2,6 +2,7 @@
 
 use agentos::changes::{self, Change, Entry, Kind, Summary};
 use agentos::journal::Event;
+use agentos::outbox::Push;
 use agentos::profiles::AgentEvent;
 use agentos::store::{Access, Net, Task};
 use agentos::util::{self, display_path};
@@ -68,6 +69,14 @@ fn bytes(n: u64) -> String {
     }
 }
 
+/// A held git push, described for review.
+pub struct HeldPush {
+    pub push: Push,
+    pub subject: String,
+    /// Commits it adds over what you last fetched, when known.
+    pub new_commits: Option<usize>,
+}
+
 /// How to name a task: its title, or the command it ran.
 pub fn title(task: &Task) -> String {
     task.meta.title.clone().unwrap_or_else(|| command_line(&task.meta.command))
@@ -89,7 +98,7 @@ fn summary_short(p: Paint, s: &Summary) -> String {
     format!("{} {} {}", p.green(format!("+{}", s.added)), p.yellow(format!("~{}", s.modified)), p.red(format!("-{}", s.deleted)))
 }
 
-pub fn banner(p: Paint, task: &Task) -> String {
+pub fn banner(p: Paint, task: &Task, outbox: bool) -> String {
     let mut parts = vec![format!("task {}", p.bold(task.id()))];
     if let Some(t) = &task.meta.title {
         parts.push(p.bold(truncate(t, 60)));
@@ -106,6 +115,9 @@ pub fn banner(p: Paint, task: &Task) -> String {
     if !task.meta.secrets.is_empty() {
         parts.push(format!("{} {}", p.dim("brokered"), task.meta.secrets.join(",")));
     }
+    if outbox {
+        parts.push(format!("{} held", p.dim("git push")));
+    }
     format!("{} {}", p.cyan("agent ▸"), parts.join("  "))
 }
 
@@ -119,7 +131,7 @@ fn net_label(net: &Net, allow: &[String]) -> String {
     }
 }
 
-pub fn exit_summary(p: Paint, task: &Task, s: &Summary, outcome: Option<&AgentEvent>, blocked: usize) -> String {
+pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome: Option<&AgentEvent>, blocked: usize) -> String {
     let id = task.id();
     let took = util::duration(task.meta.ended_at_ms.unwrap_or(0).saturating_sub(task.meta.started_at_ms));
     let mut head = format!("{} task {} exited {} in {took}", p.cyan("agent ▸"), p.bold(id), task.meta.exit_code.unwrap_or(-1));
@@ -135,15 +147,20 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, outcome: Option<&AgentEv
         let _ = write!(head, " · {}", p.yellow(format!("{blocked} connection{} blocked", if blocked == 1 { "" } else { "s" })));
     }
     let ignored = if s.ignored > 0 { p.dim(format!(" · {} ignored", s.ignored)) } else { String::new() };
-    if s.total() == 0 {
+    if s.total() == 0 && pushes.is_empty() {
         return format!("{head} · no changes{ignored}");
     }
     let n = s.total();
-    let mut out = format!(
-        "{head} · {} held for review ({}){ignored}",
-        if n == 1 { "1 change".to_string() } else { format!("{n} changes") },
-        summary_short(p, s),
-    );
+    let mut held = Vec::new();
+    if n > 0 {
+        held.push(format!("{} ({})", if n == 1 { "1 change".to_string() } else { format!("{n} changes") }, summary_short(p, s)));
+    }
+    if !pushes.is_empty() {
+        let targets: Vec<String> = pushes.iter().map(|x| format!("{} {}", x.remote, x.short_ref())).collect();
+        let what = if pushes.len() == 1 { "1 git push".to_string() } else { format!("{} git pushes", pushes.len()) };
+        held.push(format!("{what} ({})", targets.join(", ")));
+    }
+    let mut out = format!("{head} · {} held for review{ignored}", held.join(" and "));
     let hints = [("diff", "review"), ("commit", "apply to your files"), ("rollback", "discard")];
     let width = hints.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
     for (cmd, what) in hints {
@@ -159,10 +176,16 @@ pub fn task_table(p: Paint, tasks: &[Task]) -> String {
     let pad = |s: String, visible: usize, width: usize| format!("{s}{}", " ".repeat(width.saturating_sub(visible)));
     for t in tasks.iter().rev() {
         let summary = if t.is_open() { changes::scan(&t.layers()).ok().map(|c| Summary::of(&c)) } else { None };
-        let (changes, visible_changes) = match &summary {
+        let pushes = if t.is_open() { agentos::outbox::pending(&t.dir).map(|v| v.len()).unwrap_or(0) } else { 0 };
+        let (mut changes, mut visible_changes) = match &summary {
             Some(s) => (summary_short(p, s), summary_short(Paint(false), s).chars().count()),
             None => (p.dim("-"), 1),
         };
+        if pushes > 0 {
+            let extra = format!(" ↑{pushes}");
+            visible_changes += extra.chars().count();
+            changes.push_str(&p.cyan(extra));
+        }
         let status = t.status_label();
         let _ = writeln!(
             out,
@@ -266,7 +289,7 @@ pub fn ignored_summary(changes: &[Change]) -> String {
     format!("{n} ignored change{}: {}{more}", if n == 1 { "" } else { "s" }, roots.iter().take(3).cloned().collect::<Vec<_>>().join(", "))
 }
 
-pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool, show_ignored: bool) -> String {
+pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], stat_only: bool, show_ignored: bool) -> String {
     let mut out = String::new();
     let state = if task.is_live() { p.cyan("running") } else { p.dim(task.status_label()) };
     let _ = writeln!(
@@ -279,9 +302,9 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool, show_ign
     );
     let shown: Vec<&Change> = changes.iter().filter(|c| show_ignored || !c.ignored).collect();
     let hidden = changes.len() - shown.len();
-    if shown.is_empty() {
+    if shown.is_empty() && pushes.is_empty() {
         let _ = writeln!(out, "{}", p.dim("no pending changes"));
-    } else {
+    } else if !shown.is_empty() {
         let width = shown.iter().map(|c| change_path(c).chars().count()).max().unwrap_or(0).min(70);
         out.push('\n');
         for c in &shown {
@@ -293,6 +316,26 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], stat_only: bool, show_ign
     }
     if hidden > 0 {
         let _ = writeln!(out, "  {}", p.dim(format!("+ {}, not committed (--all to see and include them)", ignored_summary(changes))));
+    }
+    if !pushes.is_empty() {
+        let _ = writeln!(out, "\n  {}", p.bold("held git pushes (sent by `agent commit` or `agent push`)"));
+        for h in pushes {
+            let count = match h.new_commits {
+                Some(1) => " · 1 new commit".to_string(),
+                Some(n) => format!(" · {n} new commits"),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "  {}  {} {}  {} {}{}",
+                p.cyan("↑"),
+                h.push.remote,
+                p.bold(h.push.short_ref()),
+                p.yellow(&h.push.sha[..h.push.sha.len().min(7)]),
+                truncate(&h.subject, 60),
+                p.dim(count)
+            );
+        }
     }
     if shown.iter().any(|c| c.path.file_name().is_some_and(|n| n == agentos::config::PROJECT_FILE)) {
         let _ = writeln!(
@@ -441,6 +484,29 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
+        "outbox.ready" => {
+            let remotes: Vec<String> = d["remotes"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+            format!("git pushes to {} are held", remotes.join(", "))
+        }
+        "outbox.held" | "outbox.pushed" | "outbox.failed" => {
+            let items: Vec<&Value> = match d["pushes"].as_array() {
+                Some(a) => a.iter().collect(),
+                None => vec![d],
+            };
+            let list: Vec<String> = items
+                .iter()
+                .map(|x| {
+                    let sha = s(&x["sha"]);
+                    let r = s(&x["ref"]);
+                    format!("{} {} {}", s(&x["remote"]), r.strip_prefix("refs/heads/").unwrap_or(&r), &sha[..sha.len().min(7)])
+                })
+                .collect();
+            match e.kind.as_str() {
+                "outbox.held" => format!("{} {}", p.cyan("↑ held"), list.join(", ")),
+                "outbox.pushed" => format!("{} {}", p.green("↑ pushed"), list.join(", ")),
+                _ => format!("{} {} · {}", p.red("✗ push failed"), list.join(", "), truncate(&s(&d["error"]), 80)),
+            }
+        }
         "net.approval" => {
             let target = format!("{}:{}", s(&d["host"]), d["port"]);
             match d["decision"].as_str().unwrap_or_default() {

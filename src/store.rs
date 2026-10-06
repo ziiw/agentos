@@ -208,6 +208,7 @@ impl Task {
     pub fn release_storage(&self) -> Result<()> {
         util::force_remove_dir_all(&self.layers_dir())?;
         util::force_remove_dir_all(&self.rootfs_dir())?;
+        util::force_remove_dir_all(&self.dir.join("outbox"))?;
         Ok(())
     }
 }

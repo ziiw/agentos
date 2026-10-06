@@ -235,6 +235,43 @@ fi
 out="$("$AGENT" run --ask -- $GET 2>&1 </dev/null)"
 check "without a terminal nobody is asked, the host is refused" grep -q 'blocked example.com:443' <<<"$out"
 
+section "git push outbox"
+if command -v git >/dev/null; then
+  # The remote is a bare repo outside the sandbox: the agent can't reach it,
+  # so anything that lands there went through agentos.
+  REMOTE="$WORK/remote.git"
+  me() { git -c user.name=me -c user.email=me@example.com "$@"; }
+  AGIT='git -c user.name=agent -c user.email=agent@example.com'
+  rm -rf "$REMOTE" "$PROJ" && git init -q --bare "$REMOTE"
+  mkdir -p "$PROJ" && cd "$PROJ" && git init -q -b main && git remote add origin "$REMOTE"
+  echo one > a.txt && git add a.txt && me commit -qm one && git push -q origin main
+  on_remote() { git --git-dir="$REMOTE" rev-parse -q --verify "$1" 2>/dev/null; }
+
+  out="$("$AGENT" run -- sh -c "echo two > a.txt && $AGIT commit -qam two && git push -q origin HEAD:refs/heads/feature && echo PUSHED" 2>&1)"
+  check "the agent's git push works inside the sandbox" grep -q PUSHED <<<"$out"
+  check "...but nothing reached the remote" test -z "$(on_remote refs/heads/feature)"
+  check "the push is held for review" grep -q '1 git push (origin feature)' <<<"$out"
+  check "diff shows it with its commit" grep -Eq 'origin feature  [0-9a-f]{7} two' <<<"$("$AGENT" diff)"
+  check "ls counts it" grep -q '↑1' <<<"$("$AGENT" ls)"
+  "$AGENT" commit >/dev/null
+  check "commit sends it, with your own git" test "$(on_remote refs/heads/feature)" = "$(git rev-parse HEAD)"
+  check "...and applies the agent's commit locally" grep -qx two a.txt
+  check "the push is journaled" grep -q '"kind":"outbox.pushed"' "$(latest_task_dir)/events.jsonl"
+
+  "$AGENT" run -- sh -c "$AGIT commit -q --allow-empty -m three && git push -q origin HEAD:refs/heads/other" >/dev/null 2>&1
+  "$AGENT" rollback >/dev/null
+  check "rollback discards held pushes" test -z "$(on_remote refs/heads/other)"
+
+  "$AGENT" run -- sh -c "$AGIT commit -q --allow-empty -m four && git push -q origin HEAD:main" >/dev/null 2>&1
+  (cd "$WORK" && rm -rf other && git clone -q -b main "$REMOTE" other && cd other && me commit -q --allow-empty -m theirs && git push -q origin main)
+  "$AGENT" push >/dev/null 2>&1
+  check "a push the remote rejects (it moved) fails..." test $? -eq 1
+  check "...and stays held" grep -q 'origin main' <<<"$("$AGENT" diff)"
+  check "agent push sends without committing files (the outbox is self-contained)" "$AGENT" push --force
+  check "--force overwrote the remote" test "$(git --git-dir="$REMOTE" log -1 --format=%s main)" = four
+  "$AGENT" rollback >/dev/null
+fi
+
 section "ignored changes (.gitignore, __pycache__)"
 reset_proj
 echo "build/" > "$PROJ/.gitignore"

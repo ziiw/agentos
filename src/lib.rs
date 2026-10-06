@@ -11,6 +11,7 @@ pub mod changes;
 pub mod config;
 pub mod doctor;
 pub mod journal;
+pub mod outbox;
 pub mod profiles;
 pub mod proxy;
 pub mod sandbox;

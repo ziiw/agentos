@@ -76,7 +76,8 @@ scripts/dev.sh shell
 | `agent run [GRANTS] [--net none\|host] -- CMD…` | Run any command as a sandboxed task |
 | `agent ls` | List tasks and their pending changes |
 | `agent diff [TASK] [PATH…] [--stat]` | Show what a task changed |
-| `agent commit [TASK] [PATH…] [--force]` | Apply changes to your files (all, or under PATHs) |
+| `agent commit [TASK] [PATH…] [--force] [--no-push]` | Apply changes to your files (all, or under PATHs) and send held git pushes |
+| `agent push [TASK] [--force]` | Send only the held git pushes |
 | `agent rollback [TASK] [PATH…]` | Discard changes (all, or under PATHs) |
 | `agent log [TASK] [--json]` | Show the journal and verify its hash chain |
 | `agent doctor` | Check this machine |
@@ -133,6 +134,20 @@ agent ▸ the agent wants to reach pypi.org · [y] this task · [a] always, in ~
 Some hosts an agent reaches for stay closed on purpose. Claude, when logged in with a claude.ai account, tries `mcp-proxy.anthropic.com` for its remote MCP connectors, which can reach your other accounts. agentos explains that once per task, journals it, and doesn't count it as a problem.
 
 `agent log` lists every connection: `✓ api.anthropic.com:443 · ↑1.9 kB ↓4.8 kB · 228ms`.
+
+## Git pushes wait in an outbox
+
+In a git repository with remotes, the agent's `git push` works, but nothing leaves your machine. Each remote gets an outbox inside the task, and git in the sandbox is configured to push there. The push shows up with the rest of the changes:
+
+```console
+$ agent diff
+  M  ~/app/a.txt  +1 -1
+
+  held git pushes (sent by `agent commit` or `agent push`)
+  ↑  origin feature  3f2a9c1 Add a test for greet · 1 new commit
+```
+
+`agent commit` applies the files, then sends the pushes from **your** git, outside the sandbox, with your usual SSH keys or credential helper. The agent never needs push rights. `agent push` sends only the pushes, `agent commit --no-push` only the files, and `agent rollback` drops both. If the remote moved in the meantime, git rejects the push as usual, and it stays held until you sort it out (`agent push --force` overwrites).
 
 ## Configuration
 
@@ -195,6 +210,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **Writable grants must be directories**, and their paths can't contain `,` `:` or `\`.
 - **Conflict detection uses mtimes.** If you *delete* a file on the host that the agent modified, commit recreates it without warning.
 - **Only the top-level `.gitignore` of a grant is read**, not nested ones.
+- **The outbox covers remotes that exist when the task starts.** A remote the agent adds itself has no outbox, and pushing to it fails for lack of network. Deleting a remote branch isn't held yet either.
 - **`agent trust` records what you saw, not what you understood.** Read the file it prints.
 - **The journal is tamper-evident against the agent, not against you.** Anchoring its head (TPM, remote witness) is a later phase.
 - **Landlock is best-effort.** It's used when the kernel has it (`agent doctor` tells you). Namespaces do the isolation either way.

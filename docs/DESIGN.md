@@ -21,7 +21,7 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Explicit grants, no inherited access | The agent gets *this folder* and *this API with these scopes*, nothing else | mount namespaces, Landlock, seccomp | ● filesystem + syscalls; per-host network |
 | Local changes are reversible | A task ends as a diff you merge or throw away | overlayfs upper dirs, read-only base | ● |
 | Network is an allowlist | No direct network, not even DNS; an egress proxy outside the sandbox lets through allowed hosts only and journals every connection | private netns + unix-socket proxy | ● |
-| External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | egress proxy + effects broker | ○ Phase 1 |
+| External actions wait in an outbox | Pushes, emails, API writes are held until policy or a human releases them | per-remote bare repos + your git; egress proxy for HTTP later | ◐ git pushes (M8) |
 | Secrets never reach the model | The agent sees placeholders; real credentials are added at the proxy | credential broker, keystore/TPM | ● API keys brokered (header-only, per-host); logins not yet |
 | Taint tracking | Once a session reads untrusted input, its risky actions need approval | policy engine (Cedar) | ○ Phase 1 |
 | Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, cost |
@@ -124,14 +124,15 @@ It's verified at three levels:
 | M4: CI on ubuntu-24.04 (x86_64 + arm64): Landlock enforced, AppArmor path | ✅ green on GitHub Actions |
 | M5: credential broker: the agent holds a placeholder, the proxy adds the real key on the wire | ✅ CI green; real Claude Code verified (13/13 requests injected, free 401 check) |
 | M6: configuration: host presets, your config + project config with `agent trust`, expected denials | ✅ CI green |
-| M7: live approvals: unlisted hosts are asked about at the terminal while the connection waits; "always" remembered per project | ✅ automated (pseudo-terminal tests) |
+| M7: live approvals: unlisted hosts are asked about at the terminal while the connection waits; "always" remembered per project | ✅ CI green |
+| M8: git push outbox: pushes held per remote, replayed from your own git on commit | ✅ automated |
 
 ### Phase 1 backlog, in order
 
 1. **Profiles and configuration.** Claude Code is built in (`src/profiles.rs`). ✅ Config files: `~/.config/agentos/config.toml` and trust-on-review `.agentos.toml` (M6). Next: agent profiles as files, verified recipes for Codex and Aider, budgets.
 2. **Egress proxy.** ✅ Done without veth or root: the sandbox has only loopback, and a forwarder inside relays to the proxy through a unix socket. Next: presets (`--allow @pypi`), upstream corporate proxies.
 3. **Credential broker.** ✅ Per-task CA, TLS termination for brokered hosts only, placeholder → real value in one header. Next: OAuth logins (keep refresh tokens outside), keys from the OS keychain instead of the environment.
-4. **Effects outbox.** `git push`, mail and API writes are held as pending effects next to the file diff. `agent commit` releases them, or policy auto-releases low-risk ones.
+4. **Effects outbox.** ✅ `git push` (M8): each remote gets a bare outbox repo in the task, git in the sandbox pushes there (`GIT_CONFIG_*`), `agent commit` replays from your own git. Next: HTTP writes to APIs, policy auto-release.
 5. **seccomp profile.** ✅ Denylist: TIOCSTI/TIOCLINUX, namespace creation (unshare, setns, clone flags; clone3 → ENOSYS), mount APIs, modules, kexec, bpf, perf, io_uring, keyrings, userfaultfd. Next: an allowlist profile per agent.
 6. **cgroups.** CPU, memory and pid limits through a systemd transient scope. Token/$ budgets through the model gateway.
 7. **agentd + API.** ◐ Approvals exist at the terminal (M7); the daemon makes them reachable from elsewhere. Long-running daemon. Agents can request extra permissions mid-task, and an approval UI (terminal, desktop notification, phone) answers. Policy in Cedar.
