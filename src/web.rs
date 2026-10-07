@@ -118,6 +118,7 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         (Method::Post, ["api", "tasks"]) => start(&store, &parts.body),
         (Method::Get, ["api", "launchpad"]) => launchpad(&store),
         (Method::Get, ["api", "tasks", id]) => task(&store, id),
+        (Method::Post, ["api", "tasks", id, "revoke"]) => revoke(&store, id, &parts.body),
         (Method::Post, ["api", "tasks", id, action]) if ["commit", "push", "rollback", "stop"].contains(action) => run_cli(&store, action, id),
         (Method::Get, ["api", "approvals"]) => Ok(json!(approvals::questions(store.root()))),
         (Method::Post, ["api", "approvals", id]) => {
@@ -182,7 +183,22 @@ fn task(store: &Store, id: &str) -> Result<Value> {
     v["diff"] = json!(render::diff(Paint::plain(), &t, &changes, &pushes, false, false));
     v["log"] = json!(render::log(Paint::plain(), &t, &events));
     v["output"] = json!(output_tail(&t, 16 * 1024));
+    // What you granted while it runs, to take back.
+    if t.is_live() {
+        let socket = t.dir.join(agentos::control::OWNER_SOCKET);
+        if let Ok(reply) = agentos::control::call(&socket, &agentos::control::Call::Given) {
+            v["given"] = serde_json::from_str(&reply.text).unwrap_or(Value::Null);
+        }
+    }
     Ok(v)
+}
+
+/// Takes back a folder or host from a running task.
+fn revoke(store: &Store, id: &str, body: &str) -> Result<Value> {
+    let t = store.resolve(Some(id))?;
+    let target = serde_json::from_str::<Value>(body).ok().and_then(|v| v["target"].as_str().map(str::to_string)).context("expected {target}")?;
+    let reply = agentos::control::call(&t.dir.join(agentos::control::OWNER_SOCKET), &agentos::control::Call::Revoke { target })?;
+    Ok(json!({ "ok": reply.ok, "output": reply.text }))
 }
 
 /// The end of what a background task printed.

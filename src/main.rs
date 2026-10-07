@@ -171,6 +171,15 @@ enum Command {
         /// The file (default: the nearest .agentos.toml from here)
         path: Option<PathBuf>,
     },
+    /// Take back a folder or host you granted while a task runs (with no
+    /// TARGET: list them)
+    Revoke {
+        /// A folder (path) or a host, as listed
+        target: Option<String>,
+        /// The task (default: the latest running one)
+        #[arg(long)]
+        task: Option<String>,
+    },
     /// What agents spent on model calls: today, this week, this month, in
     /// all and in this project, against your budgets
     Spend,
@@ -430,6 +439,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
         Command::Policy { command } => cmd_policy(command),
         Command::Spend => cmd_spend(&store),
+        Command::Revoke { target, task } => cmd_revoke(&store, target, task),
         Command::Mcp { .. } => unreachable!(),
     }
 }
@@ -967,6 +977,9 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     // The agent's line to agentos (`agent mcp` inside, see control.rs).
     let control_socket = task.dir.join("control.sock");
     let mut control_listener = Some(control::bind(&control_socket)?);
+    // Yours: `agent revoke` and agentd reach the running task here.
+    let owner_socket = task.dir.join(control::OWNER_SOCKET);
+    let mut owner_listener = Some(control::bind(&owner_socket)?);
     run_mounts.push(RunMount { src: control_socket.clone(), name: "control.sock".into(), writable: true });
     run_mounts.push(RunMount { src: std::env::current_exe()?, name: "agent".into(), writable: false });
     // The proxy's socket must exist before the sandbox mounts it, but its
@@ -1052,6 +1065,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     let grants = Arc::new(Mutex::new(task.meta.grants.clone()));
     let mcp_servers = plan.mcp;
     let mut gateway_slot: Option<Arc<agentos::mcp::Gateway>> = None;
+    let given: GivenList = Arc::default();
     let live_allow = Arc::new(std::sync::RwLock::new(allowlist));
     let result = sandbox::run(&spec, stdout_tx, |report, attacher| {
         let kind = if report.error.is_some() { "sandbox.failed" } else { "sandbox.ready" };
@@ -1070,9 +1084,21 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             .flatten()
             .map(Arc::new);
         if let Some(listener) = proxy_listener.take() {
-            let gate = gate(asker.clone(), rules.clone(), journal.clone(), expected_denials.clone(), err);
+            let gate = gate(asker.clone(), rules.clone(), given.clone(), journal.clone(), expected_denials.clone(), err);
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
             proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, Some(gate), sink));
+        }
+        if let Some(listener) = owner_listener.take() {
+            let owner = Owner {
+                given: given.clone(),
+                allow: (task.meta.net == Net::Proxy).then(|| live_allow.clone()),
+                asker: asker.clone(),
+                attacher: attacher.clone(),
+                proxy: proxy_handle.clone(),
+                journal: journal.clone(),
+                err,
+            };
+            control::serve(listener, Arc::new(move |call| owner.handle(call)), Arc::new(|_, _| {}));
         }
         let gateway = Arc::new(gateway_for(
             mcp_servers.clone(),
@@ -1109,6 +1135,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
                 meter: meter.clone(),
                 outbox: outbox.is_some(),
                 mcp: mcp_servers.iter().map(|m| m.name.clone()).collect(),
+                given: given.clone(),
                 err,
             };
             let relay: control::Relay = Arc::new(move |name, conn| gateway.clone().relay(&name, conn));
@@ -1138,6 +1165,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         let _ = fs::remove_file(path);
     }
     let _ = fs::remove_file(&control_socket);
+    let _ = fs::remove_file(&owner_socket);
     if let Some(g) = &gateway_slot {
         g.stop_all();
     }
@@ -1209,8 +1237,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 /// terminal to ask at.
 /// Decides each connection through the proxy: your rules first (a forbid
 /// refuses even a listed host), then the allowlist, then you.
-fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Gate {
+fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, given: GivenList, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Gate {
     Arc::new(move |host: &str, port: u16, listed: bool| {
+        let entry = approvals::entry(host, port);
+        if taken_back(&given, "host", &entry) {
+            return Err("you took it back from this task".into());
+        }
         match rules.as_ref().map(|r| r.decide(&Question::connect(host, port))) {
             Some(Verdict::Forbid(rule)) => {
                 let (who, name) = policy::whose(&rule);
@@ -1218,6 +1250,7 @@ fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, journal: 
             }
             Some(Verdict::Permit(rule)) if !listed => {
                 let _ = journal.append("net.approval", json!({ "host": host, "port": port, "decision": "rule", "rule": rule }));
+                give(&given, "host", &entry, None);
                 return Ok(true);
             }
             _ => {}
@@ -1234,8 +1267,99 @@ fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, journal: 
         if asked {
             let _ = journal.append("net.approval", json!({ "host": host, "port": port, "decision": decision.label() }));
         }
-        if decision.allows() { Ok(true) } else { refused() }
+        if !decision.allows() {
+            return refused();
+        }
+        give(&given, "host", &entry, None);
+        Ok(true)
     })
+}
+
+/// What you granted while a task ran (folders, hosts): you can take it back.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Given {
+    /// "folder" or "host".
+    kind: String,
+    /// A folder's path, or `host` / `host:port`.
+    target: String,
+    /// "read" or "write", for a folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access: Option<String>,
+    #[serde(default)]
+    revoked: bool,
+}
+
+type GivenList = Arc<Mutex<Vec<Given>>>;
+
+fn give(given: &GivenList, kind: &str, target: &str, access: Option<&str>) {
+    if let Ok(mut g) = given.lock() {
+        if !g.iter().any(|x| x.kind == kind && x.target == target && !x.revoked) {
+            g.push(Given { kind: kind.into(), target: target.into(), access: access.map(String::from), revoked: false });
+        }
+    }
+}
+
+fn taken_back(given: &GivenList, kind: &str, target: &str) -> bool {
+    given.lock().is_ok_and(|g| g.iter().any(|x| x.kind == kind && x.target == target && x.revoked))
+}
+
+/// Your side of a running task, on its owner socket: what you granted while
+/// it ran, and taking it back.
+struct Owner {
+    given: GivenList,
+    allow: Option<proxy::LiveAllowlist>,
+    asker: Option<Arc<Asker>>,
+    attacher: Arc<sandbox::Attacher>,
+    proxy: Option<proxy::Handle>,
+    journal: Journal,
+    err: Paint,
+}
+
+impl Owner {
+    fn handle(&self, call: Call) -> Reply {
+        match call {
+            Call::Given => Reply::answer(self.given.lock().map(|g| serde_json::to_string(&*g).unwrap_or_default()).unwrap_or_default()),
+            Call::Revoke { target } => self.revoke(&target),
+            _ => Reply::error("this socket is the task owner's: given and revoke only"),
+        }
+    }
+
+    fn revoke(&self, target: &str) -> Reply {
+        let target = target.trim();
+        let target = if target.len() > 1 { target.trim_end_matches('/') } else { target };
+        let Ok(mut given) = self.given.lock() else { return Reply::error("internal: lock poisoned") };
+        let matches = |g: &Given| !g.revoked && (g.target == target || (g.kind == "host" && format!("{}:443", g.target) == target));
+        let Some(g) = given.iter_mut().find(|g| matches(g)) else {
+            return Reply::error(format!("nothing granted while the task ran matches {target} (`agent revoke` lists them)"));
+        };
+        let mut closed = 0;
+        if g.kind == "folder" {
+            if let Err(e) = self.attacher.detach(Path::new(&g.target)) {
+                return Reply::error(format!("couldn't take back {}: {e:#}", g.target));
+            }
+        } else {
+            let (host, port) = match g.target.rsplit_once(':').and_then(|(h, p)| Some((h, p.parse::<u16>().ok()?))) {
+                Some((h, p)) => (h.to_string(), p),
+                None => (g.target.clone(), 443),
+            };
+            if let Some(Ok(mut a)) = self.allow.as_ref().map(|a| a.write()) {
+                a.remove(&g.target);
+            }
+            if let Some(a) = &self.asker {
+                a.refuse(&Request::host(&host, port));
+            }
+            closed = self.proxy.as_ref().map_or(0, |p| p.close(&host, port));
+        }
+        g.revoked = true;
+        let _ = self.journal.append("grant.revoked", json!({ "kind": g.kind, "target": g.target, "closed": closed }));
+        let shown = if g.kind == "folder" { display_path(Path::new(&g.target)) } else { g.target.clone() };
+        say(format!("{} you took back {shown}", self.err.cyan("agent ▸")));
+        let also = match closed {
+            0 => String::new(),
+            n => format!(" and closed {}", plural(n, "open connection")),
+        };
+        Reply::answer(format!("took back {shown}{also}"))
+    }
 }
 
 /// The gateway to your MCP servers for this task: asks you as the proxy
@@ -1282,6 +1406,8 @@ struct Control {
     outbox: bool,
     /// Your MCP servers, reachable through agentos.
     mcp: Vec<String>,
+    /// What you granted while it ran, and what you took back.
+    given: GivenList,
     err: Paint,
 }
 
@@ -1292,12 +1418,14 @@ impl Control {
             Call::Network { host, port, reason } => self.network(&host, port.unwrap_or(443), &reason),
             Call::Path { path, write, reason } => self.path(&path, write, &reason),
             Call::Mcp { .. } => Reply::error("MCP sessions are relayed, not answered"),
+            Call::Given | Call::Revoke { .. } => Reply::error("only the user can take grants back"),
         }
     }
 
     fn info(&self) -> String {
         let mut out = vec![format!("This is agentos task {}.", self.task_id)];
-        let grants = self.grants.lock().map(|g| g.clone()).unwrap_or_default();
+        let mut grants = self.grants.lock().map(|g| g.clone()).unwrap_or_default();
+        grants.retain(|g| !taken_back(&self.given, "folder", &g.path.display().to_string()));
         let list = |access: Access| grants.iter().filter(|g| g.access == access).map(|g| g.path.display().to_string()).collect::<Vec<_>>().join(", ");
         let (rw, ro) = (list(Access::Rw), list(Access::Ro));
         if !rw.is_empty() {
@@ -1403,6 +1531,9 @@ impl Control {
         if let Err(e) = Allowlist::parse(&[entry.clone()]) {
             return Reply::error(format!("{e:#}"));
         }
+        if taken_back(&self.given, "host", &entry) {
+            return Reply::answer(format!("Not granted: the user took {entry} back from this task. Carry on without it."));
+        }
         if allow.read().is_ok_and(|a| a.allows(&host, port)) {
             return Reply::answer(format!("{entry} is already allowed: connect to it over HTTPS (through $HTTPS_PROXY)."));
         }
@@ -1411,6 +1542,7 @@ impl Control {
                 if let Ok(mut a) = allow.write() {
                     let _ = a.add(&entry);
                 }
+                give(&self.given, "host", &entry, None);
                 let always = if decision == approvals::Decision::Always { ", and for later tasks in this project" } else { "" };
                 Reply::answer(format!("Granted: you can reach {entry} now{always}."))
             }
@@ -1438,6 +1570,9 @@ impl Control {
             },
         };
         let shown = display_path(&path);
+        if taken_back(&self.given, "folder", &path.display().to_string()) {
+            return Reply::answer(format!("Not granted: the user took {} back from this task. Carry on without it.", path.display()));
+        }
         match verdict {
             Err(why) => {
                 let kind = if write { "write" } else { "read" };
@@ -1493,6 +1628,7 @@ impl Control {
         task.meta.grants = grants.clone();
         task.save()?;
         self.journal.append("grant.added", json!({ "path": path, "access": access, "layer": layer }))?;
+        give(&self.given, "folder", &path.display().to_string(), Some(if write { "write" } else { "read" }));
         say(format!("{} {} {}", self.err.cyan("agent ▸"), if write { "now read-write:" } else { "now readable:" }, display_path(path)));
         Ok(())
     }
@@ -2093,6 +2229,45 @@ fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
             }
         }
     }
+    Ok(0)
+}
+
+fn cmd_revoke(store: &Store, target: Option<String>, task: Option<String>) -> Result<i32> {
+    let task = match task {
+        Some(id) => store.resolve(Some(&id))?,
+        None => store.list()?.into_iter().rev().find(|t| t.is_live()).context("no task is running")?,
+    };
+    if !task.is_live() {
+        bail!("task {} isn't running ({}): there's nothing to take back", task.id(), task.status_label());
+    }
+    let socket = task.dir.join(control::OWNER_SOCKET);
+    let out = Paint::stdout();
+    let Some(target) = target else {
+        let reply = control::call(&socket, &Call::Given)?;
+        let given: Vec<Given> = serde_json::from_str(&reply.text).unwrap_or_default();
+        if given.is_empty() {
+            println!("task {} got nothing while it ran: nothing to take back", task.id());
+        }
+        for g in given {
+            let shown = if g.kind == "folder" { display_path(Path::new(&g.target)) } else { g.target.clone() };
+            let access = g.access.map(|a| format!(" ({a})")).unwrap_or_default();
+            let state = if g.revoked { out.dim(" taken back") } else { String::new() };
+            println!("  {:<7} {shown}{access}{state}", g.kind);
+        }
+        return Ok(0);
+    };
+    // Paths as you mean them from here; the task knows them by their real path.
+    let target = if target.contains('/') || target.starts_with('~') || target.starts_with('.') {
+        let p = control::resolve(&target, &home_dir()?, &std::env::current_dir()?)?;
+        fs::canonicalize(&p).unwrap_or(p).display().to_string()
+    } else {
+        target
+    };
+    let reply = control::call(&socket, &Call::Revoke { target })?;
+    if !reply.ok {
+        bail!("{}", reply.text);
+    }
+    println!("{} {} (task {})", out.green("✓"), reply.text, task.id());
     Ok(0)
 }
 

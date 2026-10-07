@@ -678,6 +678,12 @@ fn describe(p: Paint, e: &Event) -> String {
             let access = if d["access"].as_str() == Some("rw") { "read-write" } else { "read-only" };
             format!("{} {} {access}, while the task ran", p.green("+"), display_path(Path::new(&s(&d["path"]))))
         }
+        "grant.revoked" => {
+            let target = s(&d["target"]);
+            let shown = if d["kind"].as_str() == Some("folder") { display_path(Path::new(&target)) } else { target };
+            let closed = d["closed"].as_u64().filter(|n| *n > 0).map(|n| format!(" · closed {n} connection(s)")).unwrap_or_default();
+            p.yellow(format!("you took back {shown}{closed}"))
+        }
         "grant.failed" => p.red(format!("couldn't add {}: {}", display_path(Path::new(&s(&d["path"]))), truncate(&s(&d["error"]), 80))),
         "agent.result" => {
             let mut parts = vec![if d["is_error"].as_bool() == Some(true) { p.red("error") } else { "ok".into() }];

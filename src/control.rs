@@ -41,7 +41,16 @@ pub enum Call {
     /// Talk MCP to one of your servers: after a reply line, the connection
     /// carries the session (see `mcp::Gateway`).
     Mcp { server: String },
+    /// Yours only (the task's owner socket, never in the sandbox): what you
+    /// granted while the task ran.
+    Given,
+    /// Yours only: take back a folder or host granted while the task ran.
+    Revoke { target: String },
 }
+
+/// The task's owner socket, in its folder in the task store: how you (the
+/// CLI, agentd) reach a running task. Never mounted into the sandbox.
+pub const OWNER_SOCKET: &str = "owner.sock";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reply {

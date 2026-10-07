@@ -197,6 +197,16 @@ You're asked at the terminal or in the console, with the agent's reason. Say yes
 
 Some things are never offered, and the agent is told so without bothering you: your credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.claude`, …), your whole home, agentos's own task store and config, and anything hidden from the task. With Landlock, a folder outside your home can only be added read-only, since its write rules are fixed when a task starts. Every request, its reason and your answer are in the journal.
 
+**And you can take it back** while the task runs, from another terminal or from the task's card in the console (**Take back**):
+
+```bash
+agent revoke                      # what you granted the running task
+agent revoke ~/code/shared-lib    # unmounted from the sandbox, at once
+agent revoke pypi.org             # refused from now on; open connections closed
+```
+
+The agent is refused if it asks again, even if one of your rules would allow it. A writable folder's changes stay held for review: taking back access doesn't throw away the work. It's all in the journal.
+
 Other agents can use the same server: point their MCP configuration at `/run/agentos/agent`, with the argument `mcp`.
 
 ## Your MCP servers, through agentos
@@ -393,7 +403,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work. With a budget, that includes model APIs.
 - **Rules can't loosen the hard limits.** Credentials in your home, the task store and your config are never offered, whatever a `permit` says, and folders outside your home stay read-only mid-task when Landlock is on.
 - **The agent writes its own reasons.** An agent steered by something it read can write a convincing one. Judge the request, not the prose.
-- **A folder added mid-task stays until the task ends.**
+- **Taking a folder back unmounts it, but files a process already has open there stay open**, and a shell already inside it keeps its working directory.
 - **An MCP server marks its own tools read-only**, and agentos trusts that hint since the server is yours. If you don't, set the tool to `ask`.
 - **Budgets meter what they can read.** A Chat Completions stream without `stream_options.include_usage` reports no usage, so it isn't counted (you get a warning). The batch APIs are billed later and aren't metered. US-only inference (`inference_geo`, 1.1×) is priced at the standard rate.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.

@@ -291,6 +291,14 @@ impl Asker {
         })
     }
 
+    /// From now on in this task, `req` is refused without asking (you took
+    /// it back).
+    pub fn refuse(&self, req: &Request) {
+        if let Ok(mut answers) = self.answers.lock() {
+            answers.insert(req.key(), Decision::Deny);
+        }
+    }
+
     /// Your answer to `req`, and whether you were asked just now (rather
     /// than answered earlier in this task). Blocks until answered. "Always"
     /// only exists for hosts.

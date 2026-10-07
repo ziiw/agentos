@@ -354,6 +354,63 @@ check "with nobody to ask, the agent is told so" grep -q 'nobody can approve' <<
 check "...and so are you, and the journal" grep -q '"kind":"agent.request".*"decision":"nobody to ask"' "$(latest_task_dir)/events.jsonl"
 rm -f asks.sh
 
+section "taking back what you granted, while the task runs"
+reset_proj
+cd "$PROJ"
+mkdir -p "$ASKED/rv" "$ASKED/signal"
+echo "lent" > "$ASKED/rv/file"
+rm -f "$ASKED/signal/revoked"
+PORT=$((20000 + RANDOM % 10000))
+"$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve5.log" 2>&1 &
+SERVE_PID=$!
+for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
+TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
+CONSOLE="http://127.0.0.1:$PORT"
+( for _ in $(seq 600); do
+    id="$(api "$CONSOLE/api/approvals" | sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p')"
+    [ -n "$id" ] && api -X POST -d '{"decision":"once"}' "$CONSOLE/api/approvals/$id" >/dev/null
+    sleep 0.1
+  done ) &
+ANSWERER=$!
+cat > revoke.sh <<SH
+mcp() { printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"\$1\",\"arguments\":\$2}}" | /run/agentos/agent mcp | sed 's/.*"text":"\([^"]*\)".*/\1/'; echo; }
+mcp request_path_access '{"path":"$ASKED/rv","access":"read","reason":"r"}' >/dev/null
+echo "before: \$(cat $ASKED/rv/file 2>&1)"
+mcp request_network_access '{"host":"example.org","reason":"n"}' >/dev/null
+curl -sS -m 20 -o /dev/null -w 'before-net: HTTP%{http_code}\n' https://example.org
+for i in \$(seq 600); do [ -e $ASKED/signal/revoked ] && break; sleep 0.1; done
+echo "after: \$(cat $ASKED/rv/file 2>&1)"
+curl -sS -m 20 -o /dev/null -w 'after-net: HTTP%{http_code}\n' https://example.org 2>&1
+mcp request_path_access '{"path":"$ASKED/rv","access":"read","reason":"again"}'
+mcp request_network_access '{"host":"example.org","reason":"again"}'
+SH
+"$AGENT" run --ask --ro "$ASKED/signal" -- sh revoke.sh >"$WORK/revoke.out" 2>&1 </dev/null &
+RUN_PID=$!
+sleep 1
+TASK_DIR="$(latest_task_dir)"
+ID="$(basename "$TASK_DIR")"
+for _ in $(seq 300); do grep -q '"kind":"net.connect".*"host":"example.org"' "$TASK_DIR/events.jsonl" 2>/dev/null && break; sleep 0.1; done
+listed="$("$AGENT" revoke)"
+check "agent revoke lists what you granted while it runs" grep -q "folder  .*/rv (read)" <<<"$listed"
+check "...hosts too" grep -q 'host    example.org' <<<"$listed"
+check "taking back a folder, from the terminal" grep -q "took back" <<<"$("$AGENT" revoke "$ASKED/rv")"
+check "taking back a host, from the console" grep -q '"ok":true' <<<"$(api -X POST -d '{"target":"example.org"}' "$CONSOLE/api/tasks/$ID/revoke")"
+check "something never granted can't be taken back" bash -c '! "$@" 2>/dev/null' _ "$AGENT" revoke pypi.org
+touch "$ASKED/signal/revoked"
+wait $RUN_PID
+out="$(cat "$WORK/revoke.out")"
+check "before: the folder and host were there" grep -q 'before: lent' <<<"$out"
+check "...and reachable" grep -q 'before-net: HTTP200' <<<"$out"
+check "after: the folder is gone from the running sandbox" grep -q 'after: .*No such file' <<<"$out"
+check "...and the host is refused" grep -q 'blocked example.org:443: you took it back from this task' <<<"$out"
+check "asking again is refused, for the folder" grep -q "Not granted: the user took $ASKED/rv back" <<<"$out"
+check "...and the host" grep -q 'Not granted: the user took example.org back' <<<"$out"
+check "taking back is journaled" test "$(grep -c '"kind":"grant.revoked"' "$TASK_DIR/events.jsonl")" = 2
+check "agent log shows it" grep -q 'you took back example.org' <<<"$("$AGENT" log "$ID")"
+kill $ANSWERER 2>/dev/null; wait $ANSWERER 2>/dev/null
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+rm -f revoke.sh
+
 section "background tasks"
 reset_proj
 cd "$PROJ"

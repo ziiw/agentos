@@ -53,6 +53,7 @@
   .doing { font-family: var(--mono); font-size: 12px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
   .notice { background: var(--card); border: 1px solid var(--bad); border-radius: 12px; padding: 14px 16px; }
   .output { white-space: pre-wrap; }
+  .given { margin-top: 6px; } .given button { min-height: 32px; padding: 4px 10px; margin-left: auto; }
   pre.live { max-height: 320px; overflow-y: auto; }
   h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 0; font-weight: 600; }
   .new label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
@@ -184,7 +185,10 @@
         ${t.pushes ? `<button data-act="push" data-id="${id}">Push only</button>` : ""}
         <button class="danger" data-act="rollback" data-id="${id}">Roll back</button></div>` : "";
     const output = t.output ? `<h3>Output</h3><pre class="output live" id="live">${esc(t.output)}</pre>` : "";
-    el.innerHTML = `${actions}<div id="result"></div>${output}<h3>Changes</h3><pre>${colorDiff(t.diff)}</pre><h3>Journal</h3><pre>${esc(t.log)}</pre>`;
+    const given = (t.given || []).length ? `<h3>Granted while it runs</h3>` + t.given.map((g) => `<div class="meta given">
+        <span>${esc(g.kind)}</span><strong>${esc(g.target)}</strong>${g.access ? `<span>${esc(g.access)}</span>` : ""}
+        ${g.revoked ? `<span>taken back</span>` : `<button class="danger" data-revoke="${esc(g.target)}" data-id="${id}">Take back</button>`}</div>`).join("") : "";
+    el.innerHTML = `${actions}<div id="result"></div>${given}${output}<h3>Changes</h3><pre>${colorDiff(t.diff)}</pre><h3>Journal</h3><pre>${esc(t.log)}</pre>`;
     const live = $("live"); if (live) live.scrollTop = live.scrollHeight;
   }
 
@@ -245,6 +249,15 @@
     const b = ev.target.closest("button");
     if (b && b.dataset.new === "close") { $("new").innerHTML = ""; return; }
     if (b && b.dataset.new === "start") return startTask(b);
+    if (b && b.dataset.revoke) {
+      if (!confirm(`Take back ${b.dataset.revoke} from this task?`)) return;
+      b.disabled = true;
+      const r = await api(`/api/tasks/${b.dataset.id}/revoke`, { target: b.dataset.revoke }).catch((e) => ({ output: e.message }));
+      const res = $("result");
+      if (res) res.innerHTML = `<pre class="output">${esc(r.output || r.error || "")}</pre>`;
+      setTimeout(refresh, 500);
+      return;
+    }
     if (b && b.dataset.q) {
       b.disabled = true;
       await api("/api/approvals/" + b.dataset.q, { decision: b.dataset.d }).catch(() => {});

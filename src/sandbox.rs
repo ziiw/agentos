@@ -60,12 +60,16 @@ pub struct GrantMount {
     pub kind: Mount,
 }
 
-/// A grant to add to a running sandbox, as sent to process A.
+/// A grant to add to (or take back from) a running sandbox, as sent to
+/// process A.
 #[derive(Serialize, Deserialize)]
 struct AttachRequest {
     path: PathBuf,
     /// `(upper, work)` for a writable, transactional grant.
     overlay: Option<(PathBuf, PathBuf)>,
+    /// Unmount it instead.
+    #[serde(default)]
+    detach: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,12 +85,22 @@ pub struct Attacher {
 impl Attacher {
     /// Mounts `g` at its path inside the running sandbox. Blocks until done.
     pub fn attach(&self, g: &GrantMount) -> Result<()> {
-        use std::io::BufRead;
         let overlay = match &g.kind {
             Mount::Overlay { upper, work } => Some((upper.clone(), work.clone())),
             Mount::ReadOnly => None,
         };
-        let mut req = serde_json::to_string(&AttachRequest { path: g.path.clone(), overlay })?;
+        self.send(&AttachRequest { path: g.path.clone(), overlay, detach: false })
+    }
+
+    /// Unmounts what's mounted at `path` inside the running sandbox. Files
+    /// already open there stay open; nothing new can be reached through it.
+    pub fn detach(&self, path: &Path) -> Result<()> {
+        self.send(&AttachRequest { path: path.to_path_buf(), overlay: None, detach: true })
+    }
+
+    fn send(&self, request: &AttachRequest) -> Result<()> {
+        use std::io::BufRead;
+        let mut req = serde_json::to_string(request)?;
         req.push('\n');
         let mut chan = self.chan.lock().map_err(|_| anyhow::anyhow!("attach channel poisoned"))?;
         chan.get_mut().write_all(req.as_bytes()).context("the sandbox is gone")?;
@@ -385,6 +399,17 @@ struct OpenHow {
 fn attach(req: &AttachRequest, b: Pid, own_ns: &fs::File, staging: &Path) -> Result<()> {
     use nix::sched::setns;
     use std::os::fd::FromRawFd;
+    if req.detach {
+        let sandbox_ns = fs::File::open(format!("/proc/{b}/ns/mnt")).context("the sandbox's mount namespace")?;
+        setns(&sandbox_ns, CloneFlags::CLONE_NEWNS).context("enter the sandbox's mount namespace")?;
+        // Not through a symlink the agent may have put on the way.
+        let unmounted = umount2(&req.path, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW).with_context(|| format!("unmount {}", req.path.display()));
+        if let Err(e) = setns(own_ns, CloneFlags::CLONE_NEWNS) {
+            eprintln!("agent: sandbox: can't return to the host view ({e}); no more grants can be changed");
+            unsafe { libc::_exit(125) };
+        }
+        return unmounted;
+    }
     let is_dir = req.path.is_dir();
     fs::create_dir_all(staging)?;
     let point = if is_dir { staging.to_path_buf() } else { staging.join("file") };

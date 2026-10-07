@@ -102,6 +102,14 @@ impl Allowlist {
         if entries.is_empty() { "no hosts".into() } else { entries.join(", ") }
     }
 
+    /// Removes an entry (as given to `parse` or `add`); returns whether it was there.
+    pub fn remove(&mut self, entry: &str) -> bool {
+        let Ok(gone) = Allowlist::parse(&[entry.to_string()]) else { return false };
+        let before = self.rules.len();
+        self.rules.retain(|r| !gone.rules.contains(r));
+        self.rules.len() != before
+    }
+
     /// Adds an entry (as for `parse`) to a live allowlist.
     pub fn add(&mut self, entry: &str) -> Result<()> {
         self.rules.extend(Allowlist::parse(&[entry.to_string()])?.rules);
@@ -150,11 +158,29 @@ pub type Sink = Arc<dyn Fn(NetEvent) + Send + Sync>;
 /// (your policy forbids it).
 pub type Gate = Arc<dyn Fn(&str, u16, bool) -> std::result::Result<bool, String> + Send + Sync>;
 
+#[derive(Clone)]
 pub struct Handle {
     active: Arc<AtomicUsize>,
+    open: Open,
 }
 
+/// Connections being relayed: (id, host, port, the agent's end).
+type Open = Arc<std::sync::Mutex<Vec<(u64, String, u16, UnixStream)>>>;
+
 impl Handle {
+    /// Closes every open connection to `host:port`; returns how many.
+    pub fn close(&self, host: &str, port: u16) -> usize {
+        let Ok(open) = self.open.lock() else { return 0 };
+        let mut n = 0;
+        for (_, h, p, stream) in open.iter() {
+            if h == host && *p == port {
+                let _ = stream.shutdown(Shutdown::Both);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Waits up to `timeout` for open connections to finish and report.
     pub fn drain(&self, timeout: Duration) {
         let start = Instant::now();
@@ -180,23 +206,25 @@ pub type LiveAllowlist = Arc<std::sync::RwLock<Allowlist>>;
 /// Threads must only be started after the sandbox has been forked.
 pub fn serve(listener: UnixListener, allow: LiveAllowlist, broker: Option<Arc<Broker>>, gate: Option<Gate>, sink: Sink) -> Handle {
     let active = Arc::new(AtomicUsize::new(0));
-    let counter = active.clone();
+    let open: Open = Arc::default();
+    let (counter, registry) = (active.clone(), open.clone());
     thread::spawn(move || {
         for client in listener.incoming().flatten() {
             counter.fetch_add(1, Ordering::SeqCst);
-            let (allow, broker, gate, sink, counter) = (allow.clone(), broker.clone(), gate.clone(), sink.clone(), counter.clone());
+            let (allow, broker, gate, sink, counter, registry) =
+                (allow.clone(), broker.clone(), gate.clone(), sink.clone(), counter.clone(), registry.clone());
             thread::spawn(move || {
-                if let Some(event) = handle(client, &allow, broker.as_deref(), gate.as_ref()) {
+                if let Some(event) = handle(client, &allow, broker.as_deref(), gate.as_ref(), &registry) {
                     sink(event);
                 }
                 counter.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
-    Handle { active }
+    Handle { active, open }
 }
 
-fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>, gate: Option<&Gate>) -> Option<NetEvent> {
+fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>, gate: Option<&Gate>, open: &Open) -> Option<NetEvent> {
     let start = Instant::now();
     let head = read_head(&mut client).ok()?;
     let mut words = head.lines().next().unwrap_or_default().split_whitespace();
@@ -252,6 +280,12 @@ fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>
         return None;
     }
     event.allowed = true;
+    // Registered while it lasts, so taking the host back can close it.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::SeqCst);
+    if let (Ok(mut o), Ok(c)) = (open.lock(), client.try_clone()) {
+        o.push((id, host.clone(), port, c));
+    }
     match broker.filter(|b| b.brokers(&host)) {
         Some(broker) => {
             event.brokered = true;
@@ -265,6 +299,9 @@ fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>
             }
         }
         None => (event.bytes_out, event.bytes_in) = pump(client, upstream),
+    }
+    if let Ok(mut o) = open.lock() {
+        o.retain(|(i, ..)| *i != id);
     }
     event.ms = start.elapsed().as_millis() as u64;
     Some(event)
@@ -414,6 +451,7 @@ mod tests {
         assert!(live.allows("pypi.org", 443) && live.allows("api.anthropic.com", 443));
         assert_eq!(live.describe(), "api.anthropic.com, pypi.org, *.example.com:8443");
         assert!(live.add("not a host").is_err());
+        assert!(live.remove("pypi.org") && !live.allows("pypi.org", 443) && !live.remove("pypi.org"));
     }
 
     #[test]
