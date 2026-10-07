@@ -1021,6 +1021,31 @@ SH
   : > "$CFG"
 fi
 
+section "what a budget can't count is refused"
+if ! curl -sS -m 10 -o /dev/null https://api.anthropic.com 2>/dev/null || ! curl -sS -m 10 -o /dev/null https://api.openai.com 2>/dev/null; then
+  skip "needs api.anthropic.com and api.openai.com to answer (no key needed: the refusals happen before anything is sent)"
+else
+  reset_proj
+  cd "$PROJ"
+  # api_post BODY HOST/PATH [agent run flags…]
+  api_post() { local body="$1" url="$2"; shift 2; "$AGENT" run --allow api.anthropic.com --allow api.openai.com "$@" -- curl -sS -m 20 -X POST -H content-type:application/json -d "$body" "https://$url" 2>&1; }
+  out="$(api_post '{"requests":[]}' api.anthropic.com/v1/messages/batches --budget 1usd)"
+  check "under a budget, a Message Batch is refused before it's sent" grep -q "Message Batches are billed when they finish, so this call can't count against the budget" <<<"$out"
+  check "...in the API's own error format" grep -q '"type":"invalid_request_error"' <<<"$out"
+  check "...journaled" grep -q '"kind":"model.unmeterable".*"refused":true' "$(latest_task_dir)/events.jsonl"
+  check "...and agent log says why" grep -q 'api.anthropic.com/v1/messages/batches refused under a budget: Message Batches' <<<"$("$AGENT" log)"
+  out="$(api_post '{"model":"gpt-5","input":"hi","background":true}' api.openai.com/v1/responses --budget 1usd)"
+  check "...as is a background response" grep -q 'background responses are billed when they finish' <<<"$out"
+  out="$(api_post '{"model":"gpt-5","input":"hi"}' api.openai.com/v1/responses --budget 1usd)"
+  check "a response the agent waits for goes to the provider" grep -q '"error"' <<<"$out"
+  check "...not stopped by agentos" lacks 'agentos:' "$out"
+  export ANTHROPIC_API_KEY=sk-ant-fake
+  out="$(api_post '{"requests":[]}' api.anthropic.com/v1/messages/batches --secret ANTHROPIC_API_KEY=api.anthropic.com/x-api-key)"
+  unset ANTHROPIC_API_KEY
+  check "without a budget it goes, and you're told it isn't counted" grep -q "Message Batches are billed when they finish: calls to api.anthropic.com/v1/messages/batches aren't counted" <<<"$out"
+  check "...reaching the provider" grep -q '"error"' <<<"$out"
+fi
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7

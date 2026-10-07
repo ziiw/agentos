@@ -12,7 +12,7 @@
 //!
 //! Model API calls relayed here are also metered (see `gateway`).
 
-use crate::gateway::{Meter, Reader};
+use crate::gateway::{self, Api, Meter, Reader};
 use crate::vault::Vault;
 use anyhow::{Context, Result, bail};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
@@ -295,6 +295,35 @@ fn copy_body(body: Body, r: &mut impl BufRead, w: &mut impl Write, seen: &mut dy
     Ok(n)
 }
 
+/// Reads a whole request body ahead, as framed, to look inside before it
+/// goes on: (framed bytes, payload).
+fn hold_body(body: Body, r: &mut impl BufRead) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    const LIMIT: usize = 64 << 20;
+    let (mut framed, mut payload) = (Vec::new(), Vec::new());
+    copy_body(body, r, &mut Capped { buf: &mut framed, limit: LIMIT }, &mut |b| payload.extend_from_slice(b))?;
+    Ok((framed, payload))
+}
+
+/// A buffer that refuses to grow past `limit`.
+struct Capped<'a> {
+    buf: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl Write for Capped<'_> {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        if self.buf.len() + b.len() > self.limit {
+            return Err(io::Error::other("request too large to look inside under a budget"));
+        }
+        self.buf.extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Reads a whole (de-chunked) body, for the few exchanges that must be rewritten.
 fn read_body(body: Body, r: &mut impl BufRead) -> io::Result<Vec<u8>> {
     const LIMIT: u64 = 1 << 20;
@@ -402,31 +431,61 @@ fn relay_http<A: Read + Write, B: Read + Write>(
                 agent.get_mut().flush()?;
             }
             let mut close = req.has_token("connection", "close");
+            let post = method.eq_ignore_ascii_case("POST");
             let model = meter.and_then(|m| m.endpoint(host, &path).map(|api| (m, api)));
-            if let Some((m, api)) = model {
+            // Near the end of a budget, one model call at a time, until it's recorded.
+            let _turn = model.and_then(|(m, _)| m.turn());
+            // Paid calls whose cost no response reports: refused under a budget.
+            let mut refusal = match (meter, post) {
+                (Some(m), true) => m.unmeterable(host, &path).and_then(|(why, api)| m.unmetered(host, &path, why, api)),
+                _ => None,
+            };
+            // A request body read ahead, to look inside before it goes on.
+            let mut held: Option<Vec<u8>> = None;
+            if let (Some((m, api)), None) = (model, &refusal) {
                 // Over budget: you may be asked to raise it while the call
                 // waits. If the provider hung up on the idle connection
                 // meanwhile, the agent's client retries on a new one.
                 if !m.admit() {
-                    // Still over budget: answered here, never sent.
-                    up += raw.len() as u64 + copy_body(request_body(&req), &mut agent, &mut io::sink(), &mut |_| {})?;
-                    let (status, reason, body) = m.refuse(api);
-                    let resp = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
-                    agent.get_mut().write_all(resp.as_bytes())?;
-                    agent.get_mut().flush()?;
-                    (down, requests) = (down + resp.len() as u64, requests + 1);
-                    if close {
-                        return Ok(());
+                    refusal = Some(m.refuse(api));
+                } else if api == Api::Openai && post && path.ends_with("/responses") && m.budgeted() {
+                    let (framed, payload) = hold_body(request_body(&req), &mut agent)?;
+                    if gateway::wants_background(&payload) {
+                        refusal = m.unmetered(host, &path, gateway::BACKGROUND, api);
                     }
-                    continue;
+                    held = Some(framed);
                 }
                 // Plain responses, so the usage in them can be read.
                 req.headers.retain(|(n, _)| !n.eq_ignore_ascii_case("accept-encoding"));
             }
+            if let Some((status, reason, body)) = refusal {
+                // Answered here, never sent.
+                up += raw.len() as u64
+                    + match &held {
+                        Some(framed) => framed.len() as u64,
+                        None => copy_body(request_body(&req), &mut agent, &mut io::sink(), &mut |_| {})?,
+                    };
+                let resp = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                agent.get_mut().write_all(resp.as_bytes())?;
+                agent.get_mut().flush()?;
+                (down, requests) = (down + resp.len() as u64, requests + 1);
+                if close {
+                    return Ok(());
+                }
+                continue;
+            }
             let started = Instant::now();
             let head = req.serialize();
             remote.get_mut().write_all(head.as_bytes())?;
-            up += head.len() as u64 + copy_body(request_body(&req), &mut agent, remote.get_mut(), &mut |_| {})?;
+            up += head.len() as u64
+                + match held {
+                    Some(framed) => {
+                        remote.get_mut().write_all(&framed)?;
+                        remote.get_mut().flush()?;
+                        framed.len() as u64
+                    }
+                    None => copy_body(request_body(&req), &mut agent, remote.get_mut(), &mut |_| {})?,
+                };
             requests += 1;
 
             loop {
@@ -653,6 +712,49 @@ mod tests {
         assert!(got.contains("budget is used up (150 of 100 tokens)"), "{got}");
         let t = meter.totals();
         assert_eq!((t.calls, t.usage.input, t.usage.output, t.refused), (1, 120, 30, 1));
+    }
+
+    #[test]
+    fn unmeterable_calls_are_refused_under_a_budget() {
+        use crate::gateway::{Budget, builtin_endpoints};
+        let budgeted = Meter::new(builtin_endpoints(), Vec::new(), Some(Budget::Usd(5.0)), Arc::new(|_| {}));
+        let free = Meter::new(builtin_endpoints(), Vec::new(), None, Arc::new(|_| {}));
+        let post = |path: &str, body: &str| format!("POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+
+        // Anthropic's batches: never sent under a budget, sent without one.
+        let batch = post("/v1/messages/batches", r#"{"requests":[]}"#);
+        let (mut agent, mut remote) = (pipe(&batch), pipe(ok));
+        relay_http(&mut agent, &mut remote, "api.anthropic.com", &[], None, Some(&budgeted)).unwrap();
+        assert!(remote.output.is_empty(), "nothing goes out");
+        let got = String::from_utf8(agent.output).unwrap();
+        assert!(got.contains("400 Bad Request") && got.contains("Message Batches are billed when they finish"), "{got}");
+        let (mut agent, mut remote) = (pipe(&batch), pipe(ok));
+        relay_http(&mut agent, &mut remote, "api.anthropic.com", &[], None, Some(&free)).unwrap();
+        assert!(String::from_utf8(remote.output).unwrap().contains("POST /v1/messages/batches"), "no budget: it goes");
+        // Reading a batch's results costs nothing more.
+        let (mut agent, mut remote) = (pipe("GET /v1/messages/batches/msgbatch_1 HTTP/1.1\r\n\r\n"), pipe(ok));
+        relay_http(&mut agent, &mut remote, "api.anthropic.com", &[], None, Some(&budgeted)).unwrap();
+        assert!(!remote.output.is_empty());
+
+        // OpenAI's background responses: the body is read ahead to tell.
+        let background = post("/v1/responses", r#"{"model":"gpt-5","input":"hi","background":true}"#);
+        let (mut agent, mut remote) = (pipe(&background), pipe(ok));
+        relay_http(&mut agent, &mut remote, "api.openai.com", &[], None, Some(&budgeted)).unwrap();
+        assert!(remote.output.is_empty());
+        assert!(String::from_utf8(agent.output).unwrap().contains("background responses are billed when they finish"));
+        // A plain one goes, body intact, whether it was sent whole or in chunks.
+        let body = r#"{"model":"gpt-5","input":"hi","background":false}"#;
+        let chunked = format!("POST /v1/responses HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len());
+        for req in [post("/v1/responses", body), chunked] {
+            let (mut agent, mut remote) = (pipe(&req), pipe(ok));
+            relay_http(&mut agent, &mut remote, "api.openai.com", &[], None, Some(&budgeted)).unwrap();
+            let sent = String::from_utf8(remote.output).unwrap();
+            assert!(sent.ends_with(&req[req.find("\r\n\r\n").unwrap() + 4..]), "{sent}");
+            assert!(String::from_utf8(agent.output).unwrap().ends_with("{}"));
+        }
+        let t = budgeted.totals();
+        assert_eq!((t.calls, t.refused), (0, 0), "not refusals of the budget itself");
     }
 
     #[test]

@@ -594,6 +594,8 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "model.unmetered" => p.yellow(format!("{}: {}", s(&d["host"]), s(&d["why"]))),
         "model.refused" => p.yellow("over budget: refused, not sent"),
+        "model.unmeterable" if d["refused"] == true => p.yellow(format!("{}{} refused under a budget: {}", s(&d["host"]), s(&d["path"]), s(&d["why"]))),
+        "model.unmeterable" => p.yellow(format!("{}{} not counted: {}", s(&d["host"]), s(&d["path"]), s(&d["why"]))),
         "budget.exhausted" if d["reason"].is_string() => {
             let then = if d["asks"] == true { "you're asked before the next call" } else { "model calls refused from now on" };
             format!("{}: {then}", p.red(s(&d["reason"])))

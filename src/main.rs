@@ -291,7 +291,9 @@ struct Mode {
     #[arg(long, value_name = "N")]
     pids: Option<u32>,
     /// Budget for model calls: dollars (2usd, $2) or tokens (500k, 2M).
-    /// Measured on the wire; once it's used up, model calls are refused.
+    /// Measured on the wire; once it's used up, you're asked whether to
+    /// raise it, else model calls are refused. Calls it can't measure
+    /// (batches, background responses) are refused under a budget.
     #[arg(long, value_name = "AMOUNT")]
     budget: Option<Budget>,
 }
@@ -1787,7 +1789,7 @@ fn meter_observer(journal: Journal, err: Paint, asking: Arc<std::sync::atomic::A
         }
         gateway::Event::Nearly(totals, budget) => {
             let _ = journal.append("budget.nearly", json!({ "totals": totals, "budget": budget }));
-            say(format!("{} 80% of the budget used ({})", err.cyan("agent ▸"), totals.against(budget)));
+            say(format!("{} 80% of the budget used ({}): model calls go one at a time from now on", err.cyan("agent ▸"), totals.against(budget)));
         }
         gateway::Event::Exhausted(totals, budget) => {
             let asks = asking.load(Ordering::SeqCst);
@@ -1798,6 +1800,14 @@ fn meter_observer(journal: Journal, err: Paint, asking: Arc<std::sync::atomic::A
             let asks = asking.load(Ordering::SeqCst);
             let _ = journal.append("budget.exhausted", json!({ "reason": text, "asks": asks }));
             say(format!("{} {text}: {}", err.yellow("agent ▸"), after_exhausted(asks)));
+        }
+        gateway::Event::Unmeterable { host, path, why, refused } => {
+            let _ = journal.append("model.unmeterable", json!({ "host": host, "path": path, "why": why, "refused": refused }));
+            if refused {
+                say(format!("{} refused {host}{path}: {why}, so it can't count against the budget", err.yellow("agent ▸")));
+            } else if warned.lock().is_ok_and(|mut seen| seen.insert(format!("{host} {why}"))) {
+                say(format!("{} {why}: calls to {host}{path} aren't counted", err.yellow("agent: warning:")));
+            }
         }
         gateway::Event::Refused(totals) => {
             let _ = journal.append("model.refused", json!({ "refused": totals.refused }));

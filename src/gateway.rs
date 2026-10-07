@@ -76,9 +76,46 @@ pub fn builtin_endpoints() -> Vec<Endpoint> {
         ("api.openai.com", "/v1/responses", Api::Openai),
         ("api.openai.com", "/v1/chat/completions", Api::Openai),
         ("api.openai.com", "/v1/completions", Api::Openai),
+        ("api.openai.com", "/v1/embeddings", Api::Openai),
     ]
     .map(|(host, path, api)| Endpoint { host: host.into(), path: path.into(), api })
     .to_vec()
+}
+
+/// Paid calls whose cost no response reports, because they're billed
+/// later or in units agentos doesn't price: (host, POST path, why). A `*`
+/// is one path segment. Under a budget they're refused; otherwise noted.
+const UNMETERABLE: &[(&str, &str, &str)] = &[
+    ("api.anthropic.com", "/v1/messages/batches", "Message Batches are billed when they finish"),
+    ("api.anthropic.com", "/v1/complete", "legacy Text Completions don't report usage"),
+    ("api.openai.com", "/v1/batches", "batches are billed when they finish"),
+    ("api.openai.com", "/v1/fine_tuning/jobs", "fine-tuning is billed as it trains"),
+    ("api.openai.com", "/v1/images/*", "images are billed per image"),
+    ("api.openai.com", "/v1/audio/*", "audio is billed per minute or character"),
+    ("api.openai.com", "/v1/videos", "videos are billed per second"),
+    ("api.openai.com", "/v1/threads/runs", "Assistants runs are billed as they run"),
+    ("api.openai.com", "/v1/threads/*/runs", "Assistants runs are billed as they run"),
+    ("api.openai.com", "/v1/realtime/*", "Realtime sessions are billed over a WebSocket"),
+];
+
+/// Why a background Responses call can't be metered.
+pub const BACKGROUND: &str = "background responses are billed when they finish";
+
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let (mut p, mut q) = (pattern.split('/'), path.trim_end_matches('/').split('/'));
+    loop {
+        match (p.next(), q.next()) {
+            (None, None) => return true,
+            (Some("*"), Some(seg)) if !seg.is_empty() => {}
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Whether a Responses request body asks to run in the background.
+pub fn wants_background(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body).is_ok_and(|v| v["background"] == true)
 }
 
 /// Tokens, as the provider reported them for one call or a whole task.
@@ -415,6 +452,9 @@ pub enum Event<'a> {
     /// A budget shared with other tasks is used up (a sentence saying which).
     Over(&'a str),
     Refused(&'a Totals),
+    /// A paid call agentos can't meter: refused under a budget, else let
+    /// through uncounted.
+    Unmeterable { host: &'a str, path: &'a str, why: &'a str, refused: bool },
 }
 
 pub type Observer = Arc<dyn Fn(Event) + Send + Sync>;
@@ -431,6 +471,8 @@ pub struct Meter {
     spend: Option<Spend>,
     raiser: std::sync::OnceLock<Raiser>,
     state: Mutex<State>,
+    /// Held by the one model call in flight, near the end of a budget.
+    single: Mutex<()>,
 }
 
 /// What's used up: this task's own budget, or one it shares.
@@ -511,7 +553,7 @@ struct State {
 impl Meter {
     pub fn new(endpoints: Vec<Endpoint>, prices: Vec<(String, Price)>, budget: Option<Budget>, observer: Observer) -> Meter {
         let state = Mutex::new(State { budget, ..State::default() });
-        Meter { endpoints, prices, observer, spend: None, raiser: std::sync::OnceLock::new(), state }
+        Meter { endpoints, prices, observer, spend: None, raiser: std::sync::OnceLock::new(), state, single: Mutex::new(()) }
     }
 
     /// Records calls in the ledger, and enforces the shared budgets too.
@@ -588,6 +630,37 @@ impl Meter {
         self.endpoints.iter().find(|e| e.matches(host, path)).map(|e| e.api)
     }
 
+    /// Whether a POST to `host` + `path` costs money no response will
+    /// report: why, and the API to answer in.
+    pub fn unmeterable(&self, host: &str, path: &str) -> Option<(&'static str, Api)> {
+        let (_, _, why) = UNMETERABLE.iter().find(|(h, p, _)| *h == host && path_matches(p, path))?;
+        let api = if host == "api.anthropic.com" { Api::Anthropic } else { Api::Openai };
+        Some((why, api))
+    }
+
+    /// Whether any budget applies: this task's, or one it shares.
+    pub fn budgeted(&self) -> bool {
+        self.budget().is_some() || self.spend.as_ref().is_some_and(|s| !s.budgets.is_empty())
+    }
+
+    /// Answers a call that can't be metered: refused under a budget (the
+    /// response for the agent), or `None` to let it through, uncounted.
+    pub fn unmetered(&self, host: &str, path: &str, why: &str, api: Api) -> Option<(u16, &'static str, String)> {
+        let refused = self.budgeted();
+        (self.observer)(Event::Unmeterable { host, path, why, refused });
+        refused.then(|| error_response(api, &format!("agentos: {why}, so this call can't count against the budget: it's refused while one applies")))
+    }
+
+    /// Near the end of a budget (80%), model calls go one at a time, so
+    /// calls made in parallel (subagents, say) can't overshoot it together.
+    /// Hold the guard until the call is recorded.
+    pub fn turn(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let own = self.state.lock().is_ok_and(|s| s.budget.is_some_and(|b| s.totals.fraction(b) >= 0.8));
+        let now = crate::util::now_ms();
+        let shared = || self.spend.as_ref().is_some_and(|sp| sp.budgets.iter().any(|b| sp.ledger.standing(b, now).fraction() >= 0.8));
+        if own || shared() { self.single.lock().ok() } else { None }
+    }
+
     pub fn totals(&self) -> Totals {
         self.state.lock().map(|s| s.totals.clone()).unwrap_or_default()
     }
@@ -614,11 +687,7 @@ impl Meter {
                 format!("agentos: this task's budget is used up ({spent}); its work so far is held for review")
             }
         };
-        let body = match api {
-            Api::Anthropic => json!({ "type": "error", "error": { "type": "invalid_request_error", "message": message } }),
-            Api::Openai => json!({ "error": { "message": message, "type": "invalid_request_error", "code": "budget_exhausted" } }),
-        };
-        (400, "Bad Request", body.to_string())
+        error_response(api, &message)
     }
 
     /// Records a finished call from what `reader` saw of its response.
@@ -694,6 +763,15 @@ impl Meter {
             }
         }
     }
+}
+
+/// A 400 in the API's own error format, one clients don't retry.
+fn error_response(api: Api, message: &str) -> (u16, &'static str, String) {
+    let body = match api {
+        Api::Anthropic => json!({ "type": "error", "error": { "type": "invalid_request_error", "message": message } }),
+        Api::Openai => json!({ "error": { "message": message, "type": "invalid_request_error", "code": "budget_exhausted" } }),
+    };
+    (400, "Bad Request", body.to_string())
 }
 
 /// How often a shared budget starts over, in your local time.
@@ -1333,6 +1411,7 @@ mod tests {
                 Event::Exhausted(..) => "exhausted".into(),
                 Event::Over(text) => format!("over: {text}"),
                 Event::Refused(t) => format!("refused {}", t.refused),
+                Event::Unmeterable { why, .. } => why.to_string(),
             };
             log.lock().unwrap().push(name);
         });
@@ -1474,6 +1553,38 @@ mod tests {
         ledger.raise(&daily, Budget::Usd(5.0), "terminal", yesterday).unwrap();
         assert_eq!(ledger.standing(&daily, now).cap, Budget::Usd(2.0));
         assert_eq!(ledger.by_task(Period::Day.start(now)), [("a".to_string(), 0.6, 1000)]);
+    }
+
+    #[test]
+    fn what_cant_be_metered() {
+        assert!(path_matches("/v1/threads/*/runs", "/v1/threads/thread_1/runs"));
+        assert!(path_matches("/v1/images/*", "/v1/images/generations/"));
+        assert!(!path_matches("/v1/threads/*/runs", "/v1/threads//runs"));
+        assert!(!path_matches("/v1/messages/batches", "/v1/messages/batches/msgbatch_1/cancel"));
+        let meter = Meter::new(builtin_endpoints(), Vec::new(), None, Arc::new(|_| {}));
+        assert_eq!(meter.unmeterable("api.anthropic.com", "/v1/messages/batches").map(|(_, api)| api), Some(Api::Anthropic));
+        assert_eq!(meter.unmeterable("api.openai.com", "/v1/audio/speech").map(|(_, api)| api), Some(Api::Openai));
+        assert!(meter.unmeterable("api.anthropic.com", "/v1/messages").is_none());
+        assert!(meter.unmeterable("api.anthropic.com", "/api/event_logging/batch").is_none(), "Claude Code's own housekeeping");
+        assert!(meter.unmeterable("evil.example", "/v1/batches").is_none());
+        assert_eq!(meter.endpoint("api.openai.com", "/v1/embeddings"), Some(Api::Openai), "embeddings report their usage");
+        assert!(wants_background(br#"{"model":"gpt-5","background":true}"#));
+        assert!(!wants_background(br#"{"model":"gpt-5","background":"true","metadata":{"background":true}}"#));
+        assert!(!meter.budgeted() && meter.unmetered("api.openai.com", "/v1/batches", "x", Api::Openai).is_none());
+    }
+
+    #[test]
+    fn calls_go_one_at_a_time_near_the_end() {
+        let meter = Meter::new(builtin_endpoints(), Vec::new(), Some(Budget::Usd(1.0)), Arc::new(|_| {}));
+        assert!(meter.turn().is_none(), "plenty left: in parallel");
+        let mut r = Reader::new(Api::Anthropic, Some("application/json"), None);
+        r.feed(br#"{"type":"message","model":"claude-sonnet-5-5","usage":{"input_tokens":400000,"output_tokens":5000}}"#);
+        meter.record("api.anthropic.com", "/v1/messages", 200, r, Duration::ZERO, false);
+        let turn = meter.turn();
+        assert!(turn.is_some(), "$0.85 of $1.00: one at a time");
+        assert!(meter.single.try_lock().is_err(), "the next one waits");
+        drop(turn);
+        assert!(meter.turn().is_some());
     }
 
     #[test]
