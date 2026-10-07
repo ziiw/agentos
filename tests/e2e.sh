@@ -351,6 +351,7 @@ kill $ANSWERER 2>/dev/null; wait $ANSWERER 2>/dev/null
 kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
 out="$("$AGENT" run --ask -- sh -c "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"request_path_access\",\"arguments\":{\"path\":\"$ASKED/docs\",\"access\":\"read\",\"reason\":\"x\"}}}' | /run/agentos/agent mcp" 2>&1 </dev/null)"
 check "with nobody to ask, the agent is told so" grep -q 'nobody can approve' <<<"$out"
+check "...and so are you, and the journal" grep -q '"kind":"agent.request".*"decision":"nobody to ask"' "$(latest_task_dir)/events.jsonl"
 rm -f asks.sh
 
 section "background tasks"

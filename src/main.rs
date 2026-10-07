@@ -1236,19 +1236,24 @@ impl Control {
 
     /// Asks you, and journals the request and your answer.
     fn ask(&self, kind: Kind, target: &str, reason: &str) -> std::result::Result<approvals::Decision, Reply> {
-        let Some(asker) = &self.asker else {
-            return Err(Reply::answer(format!("Not granted: nobody can approve requests in this task ({}). Tell the user what you need instead.", self.no_asker)));
-        };
         let reason = approvals::sanitize(reason, 300);
         let req = Request { kind, target: approvals::sanitize(target, 200), reason: Some(reason.clone()) };
-        let (decision, _) = asker.ask(&req, |s| self.err.cyan(s));
-        let kind = match kind {
+        let label = match kind {
             Kind::Host => "host",
             Kind::Read => "read",
             Kind::Write => "write",
             Kind::Tool => "tool",
         };
-        let _ = self.journal.append("agent.request", json!({ "kind": kind, "target": req.target, "reason": reason, "decision": decision.label() }));
+        let record = |decision: &str| {
+            let _ = self.journal.append("agent.request", json!({ "kind": label, "target": req.target, "reason": reason, "decision": decision }));
+        };
+        let Some(asker) = &self.asker else {
+            record("nobody to ask");
+            say(format!("{} the agent asked for {} ({}), but {}", self.err.yellow("agent:"), req.target, label, self.no_asker));
+            return Err(Reply::answer(format!("Not granted: nobody can approve requests in this task ({}). Tell the user what you need instead.", self.no_asker)));
+        };
+        let (decision, _) = asker.ask(&req, |s| self.err.cyan(s));
+        record(decision.label());
         match decision {
             d if d.allows() => Ok(d),
             approvals::Decision::Timeout => Err(Reply::answer("No answer from the user in time. You can ask again later, or carry on without it.")),

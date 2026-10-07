@@ -17,7 +17,10 @@ CMD="${1:-shell}"
 [ $# -gt 0 ] && shift
 
 TTY=()
-[ -t 0 ] && [ -t 1 ] && TTY=(-it)
+# `su -c` starts a new session with no terminal, so nothing could ask you a
+# question (agentos's approvals open /dev/tty); --pty gives the dev user one.
+SU_PTY=""
+[ -t 0 ] && [ -t 1 ] && TTY=(-it) && SU_PTY="--pty"
 
 # Say which checkout gets built: every checkout shares the same build cache,
 # so running an old copy's dev.sh silently installs the old code.
@@ -63,6 +66,6 @@ echo 'agent is on PATH. Try: mkdir -p ~/app && cd ~/app && agent do \"say hello\
 exec su - dev" ;;
   exec) run "$SETUP
 $CLAUDE
-su - dev -c $(printf '%q' "$*")" ;;
+su - dev $SU_PTY -c $(printf '%q' "$*")" ;;
   *) echo "usage: $0 [shell|exec CMD...|test|build]" >&2; exit 2 ;;
 esac

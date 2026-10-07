@@ -118,12 +118,16 @@ NOTES="$APP.notes"
 WORD="pelican-$RANDOM"
 rm -rf "$NOTES" && mkdir -p "$NOTES" && echo "The magic word is $WORD." > "$NOTES/word.txt"
 echo "  Claude will ask to read $NOTES: answer y when agentos asks."
-out="$(agent do "Read $NOTES/word.txt and reply with only the magic word in it. This sandbox doesn't show that folder yet: ask for it." 2>&1 | tee /dev/stderr)"
+agent do "Read $NOTES/word.txt and reply with only the magic word in it. This sandbox doesn't show that folder yet: ask for it." 2>&1 | tee "$NOTES.out"
+out="$(cat "$NOTES.out")"
 if agent log --json | grep -q '"kind":"agent.request"'; then pass "Claude asked, through agentos's MCP server"; else fail "Claude asked, through agentos's MCP server"; fi
+if agent log --json | grep -q '"kind":"agent.request".*"decision":"nobody to ask"'; then
+  echo "  (nobody could be asked: no terminal. Run this from an interactive terminal, or with agent serve running.)"
+fi
 if agent log --json | grep -q '"kind":"grant.added"'; then pass "the folder was added to the running sandbox"; else fail "the folder was added to the running sandbox"; fi
 if grep -q "$WORD" <<<"$out"; then pass "...and Claude could read it"; else fail "...and Claude could read it"; fi
 agent rollback >/dev/null
-rm -rf "$NOTES"
+rm -rf "$NOTES" "$NOTES.out"
 
 echo
 if [ $failed -eq 0 ]; then

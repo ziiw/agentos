@@ -624,6 +624,7 @@ fn describe(p: Paint, e: &Event) -> String {
                 "once" => p.green("you allowed it"),
                 "always" => p.green("you allowed it, always, for this project"),
                 "timeout" => p.yellow("no answer, not granted"),
+                "nobody to ask" => p.yellow("nobody to ask, not granted"),
                 "impossible" => p.yellow(format!("not possible: {}", truncate(&s(&d["why"]), 80))),
                 _ => p.yellow("you denied it"),
             };
