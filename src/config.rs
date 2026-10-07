@@ -26,6 +26,8 @@
 //! cpus = 4
 //! pids = 4096
 //! budget = "5usd"                         # model calls, per task: dollars or tokens (2M)
+//! daily = "20usd"                         # …and across tasks: all of yours (in a
+//! monthly = "150usd"                      # project's file: that project's); weekly too
 //!
 //! [mcp.github]                            # your file only: an MCP server agentos runs
 //! command = ["github-mcp-server", "stdio"] # outside the sandbox, with your credentials;
@@ -90,6 +92,12 @@ struct LimitsSection {
     pids: Option<u32>,
     #[serde(default)]
     budget: Option<String>,
+    #[serde(default)]
+    daily: Option<String>,
+    #[serde(default)]
+    weekly: Option<String>,
+    #[serde(default)]
+    monthly: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,6 +131,9 @@ pub struct Settings {
     pub limits: crate::limits::Limits,
     /// Default budget for model calls (a project's overrides yours).
     pub budget: Option<Budget>,
+    /// Budgets across tasks: (period, amount, for this project only).
+    /// Yours cover all your tasks, a project's that project's; both apply.
+    pub periodic: Vec<(crate::gateway::Period, Budget, bool)>,
     /// Your prices for models agentos doesn't know: (model or `prefix*`, price).
     pub prices: Vec<(String, Price)>,
     /// Your MCP servers, run by agentos outside the sandbox.
@@ -235,7 +246,13 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
     if file.agent.is_some() {
         s.agent = file.agent.clone();
     }
-    let LimitsSection { memory, cpus, pids, budget } = file.limits;
+    let LimitsSection { memory, cpus, pids, budget, daily, weekly, monthly } = file.limits;
+    for (period, value) in crate::gateway::Period::ALL.into_iter().zip([daily, weekly, monthly]) {
+        if let Some(v) = value {
+            let amount = v.parse().map_err(|e| anyhow::anyhow!("{shown}: [limits] {} = {e}", period.key()))?;
+            s.periodic.push((period, amount, project.is_some()));
+        }
+    }
     let limits = crate::limits::Limits { memory, cpus, pids };
     limits.validate().with_context(|| format!("{shown}: [limits]"))?;
     s.limits = limits.or(&s.limits);

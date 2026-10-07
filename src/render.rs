@@ -584,6 +584,7 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "model.unmetered" => p.yellow(format!("{}: {}", s(&d["host"]), s(&d["why"]))),
         "model.refused" => p.yellow("over budget: refused, not sent"),
+        "budget.exhausted" if d["reason"].is_string() => p.red(s(&d["reason"])),
         "budget.nearly" | "budget.exhausted" => {
             let t: Totals = serde_json::from_value(d["totals"].clone()).unwrap_or_default();
             let what = if e.kind == "budget.nearly" { p.yellow("80% used") } else { p.red("used up: model calls refused from now on") };

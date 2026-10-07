@@ -10,11 +10,18 @@
 //!
 //! A call's cost is only known once it's done, so the call that crosses the
 //! budget completes: a task can end slightly over.
+//!
+//! Every metered call also goes into a ledger in the task store, shared by
+//! all tasks, for budgets across them: per day, week or month, for all your
+//! tasks or one project's.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -331,6 +338,8 @@ pub enum Event<'a> {
     Nearly(&'a Totals),
     /// The budget is used up: model calls are refused from now on.
     Exhausted(&'a Totals),
+    /// A budget shared with other tasks is used up (a sentence saying which).
+    Over(&'a str),
     Refused(&'a Totals),
 }
 
@@ -342,7 +351,16 @@ pub struct Meter {
     prices: Vec<(String, Price)>,
     budget: Option<Budget>,
     observer: Observer,
+    spend: Option<Spend>,
     state: Mutex<State>,
+}
+
+/// Where a task's calls go in the ledger, and the shared budgets it answers to.
+pub struct Spend {
+    pub ledger: Arc<Ledger>,
+    pub task: String,
+    pub project: PathBuf,
+    pub budgets: Vec<Periodic>,
 }
 
 #[derive(Default)]
@@ -350,11 +368,25 @@ struct State {
     totals: Totals,
     nearly: bool,
     exhausted: bool,
+    /// A shared budget ran out during this task (and it was said).
+    over: bool,
 }
 
 impl Meter {
     pub fn new(endpoints: Vec<Endpoint>, prices: Vec<(String, Price)>, budget: Option<Budget>, observer: Observer) -> Meter {
-        Meter { endpoints, prices, budget, observer, state: Mutex::new(State::default()) }
+        Meter { endpoints, prices, budget, observer, spend: None, state: Mutex::new(State::default()) }
+    }
+
+    /// Records calls in the ledger, and enforces the shared budgets too.
+    pub fn with_spend(mut self, spend: Spend) -> Meter {
+        self.spend = Some(spend);
+        self
+    }
+
+    /// The shared budget that's used up, if one is.
+    fn over(&self) -> Option<String> {
+        let spend = self.spend.as_ref()?;
+        spend.ledger.over(&spend.budgets, crate::util::now_ms())
     }
 
     pub fn budget(&self) -> Option<Budget> {
@@ -377,8 +409,9 @@ impl Meter {
         self.state.lock().map(|s| s.totals.clone()).unwrap_or_default()
     }
 
+    /// This task's budget, or one it shares, is used up.
     pub fn exhausted(&self) -> bool {
-        self.state.lock().is_ok_and(|s| s.exhausted)
+        self.state.lock().is_ok_and(|s| s.exhausted) || self.over().is_some()
     }
 
     /// Counts a refused call and returns the response for the agent: an
@@ -390,8 +423,14 @@ impl Meter {
             s.totals.clone()
         };
         (self.observer)(Event::Refused(&totals));
-        let spent = self.budget.map(|b| totals.against(b)).unwrap_or_default();
-        let message = format!("agentos: this task's budget is used up ({spent}); its work so far is held for review");
+        let own = self.state.lock().is_ok_and(|s| s.exhausted);
+        let message = match (own, self.over()) {
+            (false, Some(over)) => format!("agentos: {over}; this task's work so far is held for review"),
+            _ => {
+                let spent = self.budget.map(|b| totals.against(b)).unwrap_or_default();
+                format!("agentos: this task's budget is used up ({spent}); its work so far is held for review")
+            }
+        };
         let body = match api {
             Api::Anthropic => json!({ "type": "error", "error": { "type": "invalid_request_error", "message": message } }),
             Api::Openai => json!({ "error": { "message": message, "type": "invalid_request_error", "code": "budget_exhausted" } }),
@@ -447,7 +486,210 @@ impl Meter {
         if exhausted {
             (self.observer)(Event::Exhausted(&totals));
         }
+        if let Some(spend) = &self.spend {
+            let entry = Entry {
+                ts_ms: crate::util::now_ms(),
+                task: spend.task.clone(),
+                project: spend.project.display().to_string(),
+                usd: cost,
+                tokens: call.usage.tokens(),
+            };
+            let _ = spend.ledger.add(&entry);
+            if let Some(over) = self.over() {
+                let first = self.state.lock().is_ok_and(|mut s| !std::mem::replace(&mut s.over, true));
+                if first {
+                    (self.observer)(Event::Over(&over));
+                }
+            }
+        }
     }
+}
+
+/// How often a shared budget starts over, in your local time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Period {
+    Day,
+    Week,
+    Month,
+}
+
+impl Period {
+    pub const ALL: [Period; 3] = [Period::Day, Period::Week, Period::Month];
+
+    /// Its key under [limits].
+    pub fn key(self) -> &'static str {
+        match self {
+            Period::Day => "daily",
+            Period::Week => "weekly",
+            Period::Month => "monthly",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Period::Day => "today",
+            Period::Week => "this week",
+            Period::Month => "this month",
+        }
+    }
+
+    fn resets(self) -> &'static str {
+        match self {
+            Period::Day => "at midnight",
+            Period::Week => "on Monday",
+            Period::Month => "on the 1st",
+        }
+    }
+
+    /// When the current period began (local midnight; weeks start on Monday).
+    pub fn start(self, now_ms: u64) -> u64 {
+        // SAFETY: localtime_r and mktime only read and write the tm we own.
+        unsafe {
+            let t = (now_ms / 1000) as libc::time_t;
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&t, &mut tm);
+            tm.tm_sec = 0;
+            tm.tm_min = 0;
+            tm.tm_hour = 0;
+            match self {
+                Period::Day => {}
+                Period::Week => tm.tm_mday -= (tm.tm_wday + 6) % 7,
+                Period::Month => tm.tm_mday = 1,
+            }
+            tm.tm_isdst = -1;
+            (libc::mktime(&mut tm).max(0) as u64) * 1000
+        }
+    }
+}
+
+/// A budget shared by tasks: all of yours, or one project's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Periodic {
+    pub amount: Budget,
+    pub period: Period,
+    /// `None`: all your tasks.
+    pub project: Option<PathBuf>,
+}
+
+impl Periodic {
+    fn scope(&self) -> String {
+        match &self.project {
+            None => "all your tasks".into(),
+            Some(p) => format!("this project ({})", crate::util::display_path(p)),
+        }
+    }
+}
+
+/// One metered call, in the ledger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Entry {
+    pub ts_ms: u64,
+    pub task: String,
+    pub project: String,
+    pub usd: f64,
+    pub tokens: u64,
+}
+
+/// What every task spent on model calls: one JSON line per call, a file per
+/// (UTC) month, in the task store. Read incrementally: each file is parsed
+/// once, then only what other tasks added since.
+pub struct Ledger {
+    dir: PathBuf,
+    read: Mutex<HashMap<String, (u64, Vec<Entry>)>>,
+}
+
+fn month(ms: u64) -> String {
+    crate::util::rfc3339(ms)[..7].to_string()
+}
+
+impl Ledger {
+    /// The task store's ledger, and whether it was just created (empty).
+    pub fn open(store_root: &Path) -> anyhow::Result<(Ledger, bool)> {
+        let dir = store_root.join("ledger");
+        let fresh = match std::fs::create_dir(&dir) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+        };
+        Ok((Ledger { dir, read: Mutex::new(HashMap::new()) }, fresh))
+    }
+
+    pub fn add(&self, e: &Entry) -> anyhow::Result<()> {
+        let path = self.dir.join(format!("{}.jsonl", month(e.ts_ms)));
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).map_err(|(_, e)| e)?;
+        f.write_all(format!("{}\n", serde_json::to_string(e)?).as_bytes())?;
+        Ok(())
+    }
+
+    /// Spent since `since_ms` (USD, tokens): by everyone, or in one project.
+    pub fn spent(&self, since_ms: u64, project: Option<&Path>) -> (f64, u64) {
+        let now = crate::util::now_ms();
+        let mut months = vec![month(since_ms)];
+        // Every month from then to now (a period is at most a month long).
+        if month(now) != months[0] {
+            months.push(month(now));
+        }
+        let project = project.map(|p| p.display().to_string());
+        let Ok(mut read) = self.read.lock() else { return (0.0, 0) };
+        let (mut usd, mut tokens) = (0.0, 0);
+        for m in months {
+            let (offset, entries) = read.entry(m.clone()).or_default();
+            if let Ok(mut f) = std::fs::File::open(self.dir.join(format!("{m}.jsonl"))) {
+                let mut more = String::new();
+                if f.seek(SeekFrom::Start(*offset)).is_ok() && f.read_to_string(&mut more).is_ok() {
+                    // Only whole lines: another task may be halfway through one.
+                    let complete = more.rfind('\n').map_or(0, |i| i + 1);
+                    *offset += complete as u64;
+                    entries.extend(more[..complete].lines().filter_map(|l| serde_json::from_str::<Entry>(l).ok()));
+                }
+            }
+            for e in entries.iter().filter(|e| e.ts_ms >= since_ms && project.as_ref().is_none_or(|p| *p == e.project)) {
+                usd += e.usd;
+                tokens += e.tokens;
+            }
+        }
+        (usd, tokens)
+    }
+
+    fn used(&self, b: &Periodic, now_ms: u64) -> (f64, u64) {
+        self.spent(b.period.start(now_ms), b.project.as_deref())
+    }
+
+    /// The first of `budgets` that's used up, in a sentence.
+    pub fn over(&self, budgets: &[Periodic], now_ms: u64) -> Option<String> {
+        budgets.iter().find_map(|b| {
+            let (usd, tokens) = self.used(b, now_ms);
+            let (done, spent) = match b.amount {
+                Budget::Usd(v) => (usd >= v, format!("{} of {}", usd_str(usd), usd_str(v))),
+                Budget::Tokens(n) => (tokens >= n, format!("{} of {} tokens", tokens_str(tokens), tokens_str(n))),
+            };
+            done.then(|| format!("{}'s budget for {} is used up ({spent}); it resets {}", b.period.label(), b.scope(), b.period.resets()))
+        })
+    }
+
+    /// Where each budget stands: "today $0.30 of $0.50 (all your tasks)".
+    pub fn status(&self, budgets: &[Periodic], now_ms: u64) -> Vec<String> {
+        budgets
+            .iter()
+            .map(|b| {
+                let (usd, tokens) = self.used(b, now_ms);
+                let spent = match b.amount {
+                    Budget::Usd(v) => format!("{} of {}", usd_str(usd), usd_str(v)),
+                    Budget::Tokens(n) => format!("{} of {} tokens", tokens_str(tokens), tokens_str(n)),
+                };
+                format!("{} {spent} ({})", b.period.label(), b.scope())
+            })
+            .collect()
+    }
+}
+
+fn usd_str(v: f64) -> String {
+    usd(v)
+}
+
+fn tokens_str(n: u64) -> String {
+    tokens(n)
 }
 
 /// What a response said about its own cost.
@@ -763,6 +1005,7 @@ mod tests {
                 Event::Unmetered { .. } => "unmetered".into(),
                 Event::Nearly(_) => "nearly".into(),
                 Event::Exhausted(_) => "exhausted".into(),
+                Event::Over(text) => format!("over: {text}"),
                 Event::Refused(t) => format!("refused {}", t.refused),
             };
             log.lock().unwrap().push(name);
@@ -802,6 +1045,58 @@ mod tests {
         let t = meter.totals();
         assert_eq!((t.assumed, t.cost_usd), (1, 10.0));
         assert!(t.describe().contains("≤ $10.00") && meter.exhausted());
+    }
+
+    #[test]
+    fn shared_budgets_count_every_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, fresh) = Ledger::open(dir.path()).unwrap();
+        assert!(fresh && !Ledger::open(dir.path()).unwrap().1, "fresh only the first time");
+        let ledger = Arc::new(ledger);
+        let (app, site) = (PathBuf::from("/home/you/code/app"), PathBuf::from("/home/you/code/site"));
+        let now = crate::util::now_ms();
+        let entry = |task: &str, project: &Path, usd: f64, ts_ms: u64| Entry { ts_ms, task: task.into(), project: project.display().to_string(), usd, tokens: 1000 };
+        ledger.add(&entry("a", &app, 0.30, now)).unwrap();
+        ledger.add(&entry("b", &site, 0.25, now)).unwrap();
+        ledger.add(&entry("old", &app, 9.0, Period::Month.start(now).saturating_sub(86_400_000))).unwrap();
+        let (usd, tokens) = ledger.spent(Period::Day.start(now), None);
+        assert!((usd - 0.55).abs() < 1e-9 && tokens == 2000);
+        assert!((ledger.spent(Period::Day.start(now), Some(&app)).0 - 0.30).abs() < 1e-9);
+
+        let all = Periodic { amount: Budget::Usd(0.50), period: Period::Day, project: None };
+        let mine = Periodic { amount: Budget::Usd(1.0), period: Period::Day, project: Some(app.clone()) };
+        let over = ledger.over(&[mine.clone(), all.clone()], now).unwrap();
+        assert!(over.starts_with("today's budget for all your tasks is used up ($0.55 of $0.50)") && over.ends_with("at midnight"), "{over}");
+        assert!(ledger.over(&[mine.clone()], now).is_none());
+        assert_eq!(ledger.status(&[mine], now), ["today $0.30 of $1.00 (this project (/home/you/code/app))"]);
+
+        // A meter: its calls go in the ledger, and a shared budget refuses the next.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let log = events.clone();
+        let observer: Observer = Arc::new(move |e| {
+            if let Event::Over(text) = e {
+                log.lock().unwrap().push(text.to_string());
+            }
+        });
+        let budgets = vec![Periodic { amount: Budget::Usd(1.0), period: Period::Day, project: None }];
+        let meter = Meter::new(builtin_endpoints(), Vec::new(), None, observer).with_spend(Spend { ledger: ledger.clone(), task: "c".into(), project: app, budgets });
+        assert!(!meter.exhausted());
+        let mut r = Reader::new(Api::Anthropic, Some("application/json"), None);
+        r.feed(br#"{"type":"message","model":"claude-sonnet-5-5","usage":{"input_tokens":100000,"output_tokens":25000}}"#);
+        meter.record("api.anthropic.com", "/v1/messages", 200, r, Duration::ZERO, false);
+        assert!(meter.exhausted(), "$0.55 + $0.45 = $1.00 today");
+        assert!(meter.refuse(Api::Anthropic).2.contains("today's budget for all your tasks is used up ($1.00 of $1.00)"));
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn periods_start_where_you_expect() {
+        let now = crate::util::now_ms();
+        let (day, week, month) = (Period::Day.start(now), Period::Week.start(now), Period::Month.start(now));
+        assert!(day <= now && now - day < 25 * 3_600_000);
+        assert!(week <= day && day - week < 7 * 25 * 3_600_000);
+        assert!(month <= day && day - month < 31 * 25 * 3_600_000);
+        assert_eq!(Period::Day.start(day), day, "midnight is the start of its own day");
     }
 
     #[test]

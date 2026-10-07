@@ -839,6 +839,43 @@ TOML
   : > "$CFG"
 fi
 
+section "budgets across tasks (daily, weekly, monthly)"
+if [ -z "$FAKE_API" ]; then
+  skip "shared budgets need the stand-in model API (httpbin)"
+else
+  reset_proj
+  cd "$PROJ"
+  STORE2="$WORK/store-spend"
+  cat > "$WORK/tools/model-agent/one-call" <<SH
+#!/bin/sh
+curl -sS -m 20 "$JSON_CALL"; echo
+SH
+  chmod +x "$WORK/tools/model-agent/one-call"
+  cat > "$WORK/cfg/agents/onecall.toml" <<TOML
+run = ["one-call"]
+allow = ["$FAKE_API"]
+models = [{ url = "https://$FAKE_API/base64/*", api = "anthropic" }]
+TOML
+  printf '[limits]\ndaily = "0.5usd"\n' > "$CFG"
+  spend() { AGENTOS_HOME="$STORE2" AGENTOS_CONFIG="$CFG" "$AGENT" "$@"; }
+  out="$(spend do --agent onecall first 2>&1)"
+  check "a task shows where today's budget stands" grep -q 'spend: today \$0.00 of \$0.50 (all your tasks)' <<<"$out"
+  out="$(spend do --agent onecall second 2>&1)"
+  check "the task that uses up the day's budget is told, with when it resets" grep -q "today's budget for all your tasks is used up (\$0.60 of \$0.50); it resets at midnight" <<<"$out"
+  out="$(spend do --agent onecall third 2>&1)"
+  check "...and the next task doesn't start" grep -q "today's budget for all your tasks is used up" <<<"$out"
+  check "...it fails, before running anything" test "$(spend do --agent onecall fourth >/dev/null 2>&1; echo $?)" = 2
+  check "agent spend shows today, against your budget" grep -Eq 'today +\$0.60 · 220k of \$0.50' <<<"$(spend spend)"
+  printf '[limits]\ndaily = "100usd"\n' > "$CFG"
+  printf '[limits]\ndaily = "0.2usd"\n' > .agentos.toml
+  spend trust >/dev/null
+  out="$(spend do --agent onecall fifth 2>&1)"
+  check "a project's own daily budget caps that project" grep -q "today's budget for this project (.*) is used up (\$0.60 of \$0.20)" <<<"$out"
+  check "...while yours still has room" grep -Eq 'today +\$0.60 · 220k of \$100.00' <<<"$(spend spend)"
+  rm -f .agentos.toml "$WORK/cfg/agents/onecall.toml"
+  : > "$CFG"
+fi
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7

@@ -4,7 +4,7 @@ use agentos::changes::{self, Summary};
 use agentos::config;
 use agentos::control::{self, Call, PathRules, PathVerdict, Reply};
 use agentos::doctor::{self, Level};
-use agentos::gateway::{self, Budget, Endpoint, Meter, Price};
+use agentos::gateway::{self, Budget, Endpoint, Ledger, Meter, Periodic, Price, Spend};
 use agentos::journal::{Integrity, Journal};
 use agentos::limits::{self, Limits};
 use agentos::outbox;
@@ -171,6 +171,9 @@ enum Command {
         /// The file (default: the nearest .agentos.toml from here)
         path: Option<PathBuf>,
     },
+    /// What agents spent on model calls: today, this week, this month, in
+    /// all and in this project, against your budgets
+    Spend,
     /// Your rules for what agents may do without asking (policy.cedar):
     /// list them, or check what they say about a request
     Policy {
@@ -381,6 +384,8 @@ struct Plan {
     models: Vec<Endpoint>,
     /// Your MCP servers, reached through agentos.
     mcp: Vec<agentos::mcp::Server>,
+    /// Budgets across tasks: (period, amount, this project's only).
+    periodic: Vec<(gateway::Period, Budget, bool)>,
 }
 
 fn main() -> ExitCode {
@@ -424,6 +429,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
         Command::Policy { command } => cmd_policy(command),
+        Command::Spend => cmd_spend(&store),
         Command::Mcp { .. } => unreachable!(),
     }
 }
@@ -441,6 +447,7 @@ struct Applied {
     budget: Option<Budget>,
     prices: Vec<(String, Price)>,
     mcp: Vec<agentos::mcp::Server>,
+    periodic: Vec<(gateway::Period, Budget, bool)>,
 }
 
 /// Merges your config and a trusted project config into this task's grants.
@@ -460,7 +467,7 @@ fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Applied> {
             secrets.push(Secret::parse(&format!("{name}={target}"))?);
         }
     }
-    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp })
+    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic })
 }
 
 /// The task's budget: --budget, else your config's. The gateway enforces it
@@ -667,6 +674,7 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             prices: applied.prices,
             models: profile.models,
             mcp: applied.mcp,
+            periodic: applied.periodic,
         },
     )
 }
@@ -722,6 +730,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             prices: applied.prices,
             models: Vec::new(),
             mcp: applied.mcp,
+            periodic: applied.periodic,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {
@@ -811,10 +820,22 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     // budget, it relays the model APIs this task can reach even when it has
     // no credential to add for them.
     let budget = if plan.net == Net::Proxy { plan.budget } else { None };
+    // Budgets shared with your other tasks (and this project's), and the
+    // ledger they're counted in.
+    let project = approvals::project_root(&cwd, &home);
+    let periodic: Vec<Periodic> = plan
+        .periodic
+        .iter()
+        .map(|(period, amount, mine)| Periodic { amount: *amount, period: *period, project: mine.then(|| project.clone()) })
+        .collect();
+    if plan.net == Net::Host && !periodic.is_empty() {
+        eprintln!("{} your daily/weekly/monthly budgets aren't enforced with --net host", Paint::stderr().yellow("agent: warning:"));
+    }
+    let ledger = Arc::new(open_ledger(store, &home)?);
     let mut endpoints = gateway::builtin_endpoints();
     endpoints.extend(plan.models);
     let mut intercept: Vec<String> = Vec::new();
-    if budget.is_some() {
+    if budget.is_some() || (plan.net == Net::Proxy && !periodic.is_empty()) {
         for e in &endpoints {
             if allowlist.allows(&e.host, 443) && !intercept.contains(&e.host) {
                 intercept.push(e.host.clone());
@@ -831,6 +852,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     let mut env = build_env(&plan.grants.env, &home)?;
     let brokered_env = plan.secrets.iter().map(|s| (s.env.clone(), s.placeholder.clone()));
     let brokering = !plan.secrets.is_empty() || plan.login.as_ref().is_some_and(|l| l.brokered) || !intercept.is_empty();
+    // A shared budget that's already used up: don't start what can't run.
+    if brokering {
+        if let Some(over) = ledger.over(&periodic, util::now_ms()) {
+            bail!("{over}. (Budgets across tasks are under [limits] in your config, or a project's.)");
+        }
+    }
     let ca_env = brokering
         .then(|| {
             // Node and Bun add to their roots; curl, Python, git and OpenSSL
@@ -915,7 +942,9 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         journal.append("outbox.ready", json!({ "remotes": o.remotes }))?;
     }
     eprintln!("{}", render::banner(err, &task, outbox.is_some(), plan.login.as_ref().is_some_and(|l| l.brokered)));
-    let project = approvals::project_root(&cwd, &home);
+    if !periodic.is_empty() && task.meta.net == Net::Proxy {
+        eprintln!("  {}", err.dim(format!("spend: {}", ledger.status(&periodic, util::now_ms()).join(" · "))));
+    }
     let rules = rules.map(|set| {
         let all = policy::rules(&set);
         let names: Vec<String> = all.iter().map(|(name, effect)| format!("{effect} {name}")).collect();
@@ -955,7 +984,10 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     // The CA's private key never leaves this process; only its certificate
     // is written out for the sandbox to trust.
     let login = plan.login;
-    let meter = brokering.then(|| Arc::new(Meter::new(endpoints, plan.prices, budget, meter_observer(journal.clone(), err, budget))));
+    let meter = brokering.then(|| {
+        let spend = Spend { ledger: ledger.clone(), task: task.id().to_string(), project: project.clone(), budgets: periodic.clone() };
+        Arc::new(Meter::new(endpoints, plan.prices, budget, meter_observer(journal.clone(), err, budget)).with_spend(spend))
+    });
     if let (Some(b), Some(m)) = (budget, &meter) {
         let relayed: Vec<&str> = plan.secrets.iter().map(|s| s.host.as_str())
             .chain(login.iter().filter(|l| l.brokered).flat_map(|l| l.hosts.iter().map(String::as_str)))
@@ -1560,6 +1592,10 @@ fn meter_observer(journal: Journal, err: Paint, budget: Option<Budget>) -> gatew
             let used = budget.map(|b| totals.against(b)).unwrap_or_default();
             say(format!("{} budget used up ({used}): model calls are refused from now on", err.yellow("agent ▸")));
         }
+        gateway::Event::Over(text) => {
+            let _ = journal.append("budget.exhausted", json!({ "reason": text }));
+            say(format!("{} {text}: model calls are refused from now on", err.yellow("agent ▸")));
+        }
         gateway::Event::Refused(totals) => {
             let _ = journal.append("model.refused", json!({ "refused": totals.refused }));
             if totals.refused >= REFUSALS_BEFORE_STOP {
@@ -2056,6 +2092,49 @@ fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
                 Verdict::Undecided => println!("no rule matches: the allowlist and your config decide, or you're asked"),
             }
         }
+    }
+    Ok(0)
+}
+
+/// The store's spend ledger. A new one starts with the last 40 days of
+/// finished tasks, so nothing already spent is forgotten.
+fn open_ledger(store: &Store, home: &Path) -> Result<Ledger> {
+    let (ledger, fresh) = Ledger::open(store.root())?;
+    if fresh {
+        let since = util::now_ms().saturating_sub(40 * 86_400_000);
+        for t in store.list()? {
+            if let (Some(u), Some(ended)) = (&t.meta.usage, t.meta.ended_at_ms) {
+                if ended >= since && u.calls > 0 {
+                    let project = approvals::project_root(&t.meta.cwd, home).display().to_string();
+                    let entry = gateway::Entry { ts_ms: ended, task: t.id().to_string(), project, usd: u.cost_usd, tokens: u.usage.tokens() };
+                    ledger.add(&entry)?;
+                }
+            }
+        }
+    }
+    Ok(ledger)
+}
+
+fn cmd_spend(store: &Store) -> Result<i32> {
+    let (home, cwd) = (home_dir()?, std::env::current_dir()?);
+    let ledger = open_ledger(store, &home)?;
+    let project = approvals::project_root(&cwd, &home);
+    let budgets = config::load(store.root(), &cwd, &home)?.periodic;
+    let now = util::now_ms();
+    let out = Paint::stdout();
+    let limit = |period: gateway::Period, mine: bool| {
+        budgets.iter().find(|(p, _, m)| *p == period && *m == mine).map(|(_, b, _)| format!(" of {b}")).unwrap_or_default()
+    };
+    println!("{}", out.dim(format!("{:<12}{:<26}{}", "", "all your tasks", format!("this project ({})", display_path(&project)))));
+    for period in gateway::Period::ALL {
+        let since = period.start(now);
+        let (all, all_tokens) = ledger.spent(since, None);
+        let (here, here_tokens) = ledger.spent(since, Some(&project));
+        let col = |usd: f64, tokens: u64, mine: bool| format!("{} · {}{}", gateway::usd(usd), gateway::tokens(tokens), limit(period, mine));
+        println!("{:<12}{:<26}{}", period.label(), col(all, all_tokens, false), col(here, here_tokens, true));
+    }
+    if let Some(over) = ledger.over(&budgets.iter().map(|(period, amount, mine)| Periodic { amount: *amount, period: *period, project: mine.then(|| project.clone()) }).collect::<Vec<_>>(), now) {
+        println!("{} {over}", out.yellow("!"));
     }
     Ok(0)
 }

@@ -279,6 +279,17 @@ At 80% of the budget you get a heads-up. Once it's used up, further model calls 
 - **Metered APIs:** Anthropic's Messages API, OpenAI's Responses and Chat Completions, and whatever an agent file lists under `models`. Calls are measured whenever the broker relays them, as with Claude's login or a brokered key, even without a budget.
 - A default for every task goes in your config: `[limits] budget = "5usd"`.
 
+**Across tasks**, too, so many small tasks can't add up to a large bill:
+
+```toml
+[limits]
+daily = "20usd"        # all your tasks, per day (your local time)
+weekly = "80usd"
+monthly = "150usd"
+```
+
+In your config they cover all your tasks; in a project's `.agentos.toml`, that project's (both apply). Every metered call goes into a ledger in the task store that all tasks share, so budgets hold across tasks running at the same time. Once one is used up, model calls are refused as with a task budget, and new tasks don't start: the message says which budget and when it resets. `agent spend` shows today, this week and this month, for everything and for the current project. A new ledger starts with the last 40 days of finished tasks.
+
 ## agentd: the console
 
 ```bash
