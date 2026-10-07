@@ -91,6 +91,9 @@ scripts/dev.sh shell
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
+| `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
+| `agent spend` | What agents spent today, this week and this month, against your budgets |
+| `agent raise AMOUNT [--task ID \| --today \| --this-week \| --this-month [--project]]` | Raise a budget that's used up: a running task's, or one across tasks until it resets |
 
 `GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
 
@@ -282,7 +285,16 @@ agent do --budget 1M "summarize the codebase"        # tokens
 
 The gateway in the egress proxy reads the token counts the provider puts in each response, so the agent can't under-report them. Every model call is in the journal with its model, tokens and price. The task's total is in the exit summary, in `agent ls`, and live in the console.
 
-At 80% of the budget you get a heads-up. Once it's used up, further model calls are answered with an error in the API's own format instead of reaching the provider: the agent stops on it, and its work so far is held for review like any other task. An agent that keeps calling anyway is stopped. The call that crosses the budget completes, since its cost is only known once it's done, so a task can end slightly over.
+At 80% of the budget you get a heads-up. Once it's used up, **the agent's next model call waits while you're asked** whether to raise it, at the terminal or in agentd's console (and on your phone with `--notify`):
+
+```
+agent ▸ this task's budget is used up ($2.07 of $2.00); the agent's next model call waits
+  [y] raise it to $3.11 · or type an amount, e.g. 4.14usd · [N] no, let it stop ›
+```
+
+Raise it, and the call goes through as if nothing happened. Say no, or don't answer within two minutes, and the call is answered with an error in the API's own format instead of reaching the provider: the agent stops on it, and its work so far is held for review like any other task. A "no" holds for the rest of the task, and an agent that keeps calling anyway is stopped. With nobody to ask (no terminal, no agentd, or `--no-ask`), calls are refused right away. The call that crosses the budget completes, since its cost is only known once it's done, so a task can end slightly over.
+
+You can also raise a running task's budget before it runs out: `agent raise 5usd` (the latest running task, or `--task ID`), or **Raise budget** on its card in the console. Every raise is journaled with where you made it.
 
 - **Dollars are at list prices.** Claude's are built in, including cache reads and writes, fast mode and web searches. With a claude.ai login, that's what the same calls would cost on the API: a measure of use, not your bill. For other models, add prices to your config (`[prices]`). Until you do, an unknown model counts at the highest Claude rate, so the budget errs on the safe side and the total shows as an upper bound (`≤ $1.20`).
 - **Tokens count everything the model processed**: input, output, cache reads and writes.
@@ -298,7 +310,14 @@ weekly = "80usd"
 monthly = "150usd"
 ```
 
-In your config they cover all your tasks; in a project's `.agentos.toml`, that project's (both apply). Every metered call goes into a ledger in the task store that all tasks share, so budgets hold across tasks running at the same time. Once one is used up, model calls are refused as with a task budget, and new tasks don't start: the message says which budget and when it resets. `agent spend` shows today, this week and this month, for everything and for the current project. A new ledger starts with the last 40 days of finished tasks.
+In your config they cover all your tasks; in a project's `.agentos.toml`, that project's (both apply). Every metered call goes into a ledger in the task store that all tasks share, so budgets hold across tasks running at the same time. Once one is used up, running tasks ask you as with a task budget, and new tasks don't start: the message says which budget, when it resets, and how to raise it until then. `agent spend` shows today, this week and this month, for everything and for the current project. A new ledger starts with the last 40 days of finished tasks.
+
+Raising one lasts until it resets, so your config stays your standing policy:
+
+```bash
+agent raise 30usd --today              # all your tasks, until midnight
+agent raise 60usd --this-month --project   # this project's, until the 1st
+```
 
 ## agentd: the console
 
@@ -313,10 +332,14 @@ This starts agentd and prints a link like `http://127.0.0.1:7777/#token=…`. Th
 ```toml
 [console]
 projects = ["~/code/app", "~/code/site"]
-``` Questions from agents appear at the top with **Allow for this task / Always / Deny**, alongside the terminal prompt; the first answer wins. Tasks with no terminal to ask at, like Claude's full-screen interface or background runs, ask there too.
+```
+
+Questions from agents appear at the top with **Allow for this task / Always / Deny**, alongside the terminal prompt; the first answer wins. Tasks with no terminal to ask at, like Claude's full-screen interface or background runs, ask there too. A task whose budget runs out asks there with **Raise to … / Let it stop**.
+
+**Spend is in the header**: today's, against your daily budget if you have one. Click it for this week and this month, where each budget across tasks stands, and today's tasks by cost. A budget that's used up shows at the top, with buttons to raise it until it resets.
 
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
-- `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only), and when a task finishes, with what it left for review.
+- `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only, or which budget ran out), and when a task finishes, with what it left for review.
 
 ## Configuration
 

@@ -404,8 +404,11 @@ fn relay_http<A: Read + Write, B: Read + Write>(
             let mut close = req.has_token("connection", "close");
             let model = meter.and_then(|m| m.endpoint(host, &path).map(|api| (m, api)));
             if let Some((m, api)) = model {
-                if m.exhausted() {
-                    // Over budget: answered here, never sent.
+                // Over budget: you may be asked to raise it while the call
+                // waits. If the provider hung up on the idle connection
+                // meanwhile, the agent's client retries on a new one.
+                if !m.admit() {
+                    // Still over budget: answered here, never sent.
                     up += raw.len() as u64 + copy_body(request_body(&req), &mut agent, &mut io::sink(), &mut |_| {})?;
                     let (status, reason, body) = m.refuse(api);
                     let resp = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());

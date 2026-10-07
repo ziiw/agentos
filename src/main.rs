@@ -183,6 +183,28 @@ enum Command {
     /// What agents spent on model calls: today, this week, this month, in
     /// all and in this project, against your budgets
     Spend,
+    /// Raise a budget that's used up (or nearly): a running task's own, or
+    /// today's, this week's or this month's across tasks, until it resets
+    Raise {
+        /// The new budget: dollars (5usd, $5) or tokens (2M), as it's counted
+        amount: Budget,
+        /// The running task (default: the latest running one)
+        #[arg(long, conflicts_with_all = ["today", "this_week", "this_month"])]
+        task: Option<String>,
+        /// Today's budget across your tasks, until midnight
+        #[arg(long, conflicts_with_all = ["this_week", "this_month"])]
+        today: bool,
+        /// This week's, until Monday
+        #[arg(long, conflicts_with = "this_month")]
+        this_week: bool,
+        /// This month's, until the 1st
+        #[arg(long)]
+        this_month: bool,
+        /// With --today, --this-week or --this-month: this project's budget
+        /// (from its .agentos.toml), not the one for all your tasks
+        #[arg(long)]
+        project: bool,
+    },
     /// Your rules for what agents may do without asking (policy.cedar):
     /// list them, or check what they say about a request
     Policy {
@@ -439,6 +461,12 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
         Command::Policy { command } => cmd_policy(command),
         Command::Spend => cmd_spend(&store),
+        Command::Raise { amount, task, today, this_week, this_month, project } => {
+            let period = [(today, gateway::Period::Day), (this_week, gateway::Period::Week), (this_month, gateway::Period::Month)]
+                .into_iter()
+                .find_map(|(on, p)| on.then_some(p));
+            cmd_raise(&store, amount, task, period, project)
+        }
         Command::Revoke { target, task } => cmd_revoke(&store, target, task),
         Command::Mcp { .. } => unreachable!(),
     }
@@ -865,7 +893,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     // A shared budget that's already used up: don't start what can't run.
     if brokering {
         if let Some(over) = ledger.over(&periodic, util::now_ms()) {
-            bail!("{over}. (Budgets across tasks are under [limits] in your config, or a project's.)");
+            let project = if over.budget.project.is_some() { " --project" } else { "" };
+            bail!(
+                "{over}.\n  To raise it until then: agent raise {} {}{project}\n  (Budgets across tasks are under [limits] in your config, or a project's.)",
+                over.standing.offers()[0].spec(),
+                over.budget.period.flag(),
+            );
         }
     }
     let ca_env = brokering
@@ -997,9 +1030,12 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     // The CA's private key never leaves this process; only its certificate
     // is written out for the sandbox to trust.
     let login = plan.login;
+    // Whether you're asked to raise a budget that runs out (set once the
+    // sandbox is up and it's known whether anyone can be asked).
+    let asking = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let meter = brokering.then(|| {
         let spend = Spend { ledger: ledger.clone(), task: task.id().to_string(), project: project.clone(), budgets: periodic.clone() };
-        Arc::new(Meter::new(endpoints, plan.prices, budget, meter_observer(journal.clone(), err, budget)).with_spend(spend))
+        Arc::new(Meter::new(endpoints, plan.prices, budget, meter_observer(journal.clone(), err, asking.clone())).with_spend(spend))
     });
     if let (Some(b), Some(m)) = (budget, &meter) {
         let relayed: Vec<&str> = plan.secrets.iter().map(|s| s.host.as_str())
@@ -1083,6 +1119,10 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             })
             .flatten()
             .map(Arc::new);
+        if let (Some(a), Some(m)) = (&asker, &meter) {
+            m.set_raiser(raiser(a.clone(), journal.clone(), err));
+            asking.store(true, Ordering::SeqCst);
+        }
         if let Some(listener) = proxy_listener.take() {
             let gate = gate(asker.clone(), rules.clone(), given.clone(), journal.clone(), expected_denials.clone(), err);
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
@@ -1095,6 +1135,8 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
                 asker: asker.clone(),
                 attacher: attacher.clone(),
                 proxy: proxy_handle.clone(),
+                meter: meter.clone(),
+                task: task.id().to_string(),
                 journal: journal.clone(),
                 err,
             };
@@ -1209,8 +1251,10 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     }
     if let Some(m) = &meter {
         let totals = m.totals();
+        // Raised while it ran: the budget it ended with.
+        task.meta.budget = m.budget();
         if totals.calls + totals.unmetered + totals.refused > 0 {
-            journal.append("model.usage", json!({ "totals": totals, "budget": budget }))?;
+            journal.append("model.usage", json!({ "totals": totals, "budget": task.meta.budget }))?;
             task.meta.usage = Some(totals);
         }
         if m.exhausted() && task.meta.stop.is_none() {
@@ -1311,6 +1355,8 @@ struct Owner {
     asker: Option<Arc<Asker>>,
     attacher: Arc<sandbox::Attacher>,
     proxy: Option<proxy::Handle>,
+    meter: Option<Arc<Meter>>,
+    task: String,
     journal: Journal,
     err: Paint,
 }
@@ -1320,7 +1366,27 @@ impl Owner {
         match call {
             Call::Given => Reply::answer(self.given.lock().map(|g| serde_json::to_string(&*g).unwrap_or_default()).unwrap_or_default()),
             Call::Revoke { target } => self.revoke(&target),
-            _ => Reply::error("this socket is the task owner's: given and revoke only"),
+            Call::Raise { to, by } => self.raise(&to, &approvals::sanitize(&by, 40)),
+            _ => Reply::error("this socket is the task owner's: given, revoke and raise only"),
+        }
+    }
+
+    /// Raises the task's own budget: a model call waiting on it goes on.
+    fn raise(&self, to: &str, by: &str) -> Reply {
+        let Some(m) = &self.meter else {
+            return Reply::error(format!("task {}'s model calls aren't metered: it has no budget to raise", self.task));
+        };
+        let to: Budget = match to.parse() {
+            Ok(b) => b,
+            Err(e) => return Reply::error(e),
+        };
+        match m.raise(to) {
+            Ok(from) => {
+                let _ = self.journal.append("budget.raised", json!({ "scope": "task", "what": "this task's budget", "from": from, "to": to, "by": by }));
+                say(format!("{} the budget was raised to {to} (from {from}, {})", self.err.cyan("agent ▸"), render::by(by)));
+                Reply::answer(format!("task {}'s budget is now {to} (was {from})", self.task))
+            }
+            Err(e) => Reply::error(format!("can't raise task {}'s budget to {to}: {e}", self.task)),
         }
     }
 
@@ -1418,7 +1484,7 @@ impl Control {
             Call::Network { host, port, reason } => self.network(&host, port.unwrap_or(443), &reason),
             Call::Path { path, write, reason } => self.path(&path, write, &reason),
             Call::Mcp { .. } => Reply::error("MCP sessions are relayed, not answered"),
-            Call::Given | Call::Revoke { .. } => Reply::error("only the user can take grants back"),
+            Call::Given | Call::Revoke { .. } | Call::Raise { .. } => Reply::error("only the user can do that, from outside the sandbox"),
         }
     }
 
@@ -1478,6 +1544,7 @@ impl Control {
             Kind::Read => "read",
             Kind::Write => "write",
             Kind::Tool => "tool",
+            Kind::Budget => "budget",
         };
         let record_rule = |decision: &str, rule: Option<&str>| {
             let mut data = json!({ "kind": label, "target": req.target, "reason": reason, "decision": decision });
@@ -1702,7 +1769,7 @@ fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Vec<(String, 
 
 /// Journals every model call the gateway meters, and says so, live, when
 /// the budget is nearly or entirely used up.
-fn meter_observer(journal: Journal, err: Paint, budget: Option<Budget>) -> gateway::Observer {
+fn meter_observer(journal: Journal, err: Paint, asking: Arc<std::sync::atomic::AtomicBool>) -> gateway::Observer {
     // An agent that keeps calling after being refused is stopped.
     const REFUSALS_BEFORE_STOP: u64 = 5;
     let warned = Mutex::new(HashSet::new());
@@ -1718,19 +1785,19 @@ fn meter_observer(journal: Journal, err: Paint, budget: Option<Budget>) -> gatew
                 say(format!("{} a model call to {host} couldn't be measured ({why}): it isn't counted", err.yellow("agent: warning:")));
             }
         }
-        gateway::Event::Nearly(totals) => {
-            let _ = journal.append("budget.nearly", json!({ "totals": totals }));
-            let used = budget.map(|b| totals.against(b)).unwrap_or_default();
-            say(format!("{} 80% of the budget used ({used})", err.cyan("agent ▸")));
+        gateway::Event::Nearly(totals, budget) => {
+            let _ = journal.append("budget.nearly", json!({ "totals": totals, "budget": budget }));
+            say(format!("{} 80% of the budget used ({})", err.cyan("agent ▸"), totals.against(budget)));
         }
-        gateway::Event::Exhausted(totals) => {
-            let _ = journal.append("budget.exhausted", json!({ "totals": totals }));
-            let used = budget.map(|b| totals.against(b)).unwrap_or_default();
-            say(format!("{} budget used up ({used}): model calls are refused from now on", err.yellow("agent ▸")));
+        gateway::Event::Exhausted(totals, budget) => {
+            let asks = asking.load(Ordering::SeqCst);
+            let _ = journal.append("budget.exhausted", json!({ "totals": totals, "budget": budget, "asks": asks }));
+            say(format!("{} budget used up ({}): {}", err.yellow("agent ▸"), totals.against(budget), after_exhausted(asks)));
         }
         gateway::Event::Over(text) => {
-            let _ = journal.append("budget.exhausted", json!({ "reason": text }));
-            say(format!("{} {text}: model calls are refused from now on", err.yellow("agent ▸")));
+            let asks = asking.load(Ordering::SeqCst);
+            let _ = journal.append("budget.exhausted", json!({ "reason": text, "asks": asks }));
+            say(format!("{} {text}: {}", err.yellow("agent ▸"), after_exhausted(asks)));
         }
         gateway::Event::Refused(totals) => {
             let _ = journal.append("model.refused", json!({ "refused": totals.refused }));
@@ -1739,6 +1806,67 @@ fn meter_observer(journal: Journal, err: Paint, budget: Option<Budget>) -> gatew
             }
         }
     })
+}
+
+fn after_exhausted(asks: bool) -> &'static str {
+    if asks { "you're asked before the next model call goes" } else { "model calls are refused from now on" }
+}
+
+/// When a budget runs out mid-task, the next model call waits while you're
+/// asked (at the terminal or in agentd) whether to raise it, rather than
+/// failing. A "no" stands for the rest of the task, unless the budget is
+/// raised another way (`agent raise`).
+fn raiser(asker: Arc<Asker>, journal: Journal, err: Paint) -> gateway::Raiser {
+    let declined: Mutex<HashSet<String>> = Mutex::default();
+    Box::new(move |m: &Meter| {
+        // An amount that's still too low is asked about again, a few times.
+        for _ in 0..3 {
+            let Some(short) = m.shortfall() else { return true };
+            let key = short.key();
+            if declined.lock().is_ok_and(|d| d.contains(&key)) {
+                return false;
+            }
+            let req = Request { kind: Kind::Budget, target: short.what(), reason: Some(short.spent()) };
+            let settled = || m.shortfall().is_none_or(|s| s.key() != key);
+            match asker.ask_raise(&req, short.cap(), &short.offers(), settled, |s| err.cyan(s)) {
+                approvals::Raised::Settled => {}
+                approvals::Raised::To(to, via) => match m.raise_short(&short, to, via) {
+                    Ok(from) => {
+                        let _ = journal.append(
+                            "budget.raised",
+                            json!({ "scope": short.scope(), "what": short.what(), "from": from, "to": to, "by": via, "asked": true }),
+                        );
+                        say(format!("{} {} raised to {to}: the agent goes on", err.cyan("agent ▸"), short.what()));
+                    }
+                    Err(e) => say(format!("{} couldn't raise {} to {to}: {e}", err.yellow("agent: warning:"), short.what())),
+                },
+                approvals::Raised::No(why) => {
+                    let _ = journal.append("budget.declined", json!({ "scope": short.scope(), "what": short.what(), "cap": short.cap(), "why": why }));
+                    if why == "denied" {
+                        if let Ok(mut d) = declined.lock() {
+                            d.insert(key);
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+        m.shortfall().is_none()
+    })
+}
+
+/// Raises a budget your tasks share until its period resets: the one for
+/// all of them, or (`mine`) the project's at `cwd`. Returns what to say.
+fn raise_shared(store: &Store, home: &Path, cwd: &Path, period: gateway::Period, mine: bool, to: Budget, by: &str) -> Result<String> {
+    let settings = config::load(store.root(), cwd, home)?;
+    let Some((_, amount, _)) = settings.periodic.iter().find(|(p, _, m)| *p == period && *m == mine) else {
+        let whose = if mine { "this project's .agentos.toml (trusted)" } else { "your config" };
+        bail!("there's no {} budget to raise: set `{}` under [limits] in {whose}", period.key(), period.key());
+    };
+    let budget = Periodic { amount: *amount, period, project: mine.then(|| approvals::project_root(cwd, home)) };
+    let ledger = open_ledger(store, home)?;
+    let from = ledger.raise(&budget, to, by, util::now_ms()).map_err(|e| anyhow::anyhow!("can't raise {} to {to}: {e}", budget.what()))?;
+    Ok(format!("{} is now {to} (was {from}), until it resets {}", budget.what(), period.resets()))
 }
 
 /// Shows an agent's structured output as it works and records the
@@ -2298,7 +2426,10 @@ fn cmd_spend(store: &Store) -> Result<i32> {
     let now = util::now_ms();
     let out = Paint::stdout();
     let limit = |period: gateway::Period, mine: bool| {
-        budgets.iter().find(|(p, _, m)| *p == period && *m == mine).map(|(_, b, _)| format!(" of {b}")).unwrap_or_default()
+        let Some((_, amount, _)) = budgets.iter().find(|(p, _, m)| *p == period && *m == mine) else { return String::new() };
+        let st = ledger.standing(&Periodic { amount: *amount, period, project: mine.then(|| project.clone()) }, now);
+        let raised = if st.raised { format!(" (raised from {amount})") } else { String::new() };
+        format!(" of {}{raised}", st.cap)
     };
     println!("{}", out.dim(format!("{:<12}{:<26}{}", "", "all your tasks", format!("this project ({})", display_path(&project)))));
     for period in gateway::Period::ALL {
@@ -2311,6 +2442,29 @@ fn cmd_spend(store: &Store) -> Result<i32> {
     if let Some(over) = ledger.over(&budgets.iter().map(|(period, amount, mine)| Periodic { amount: *amount, period: *period, project: mine.then(|| project.clone()) }).collect::<Vec<_>>(), now) {
         println!("{} {over}", out.yellow("!"));
     }
+    Ok(0)
+}
+
+fn cmd_raise(store: &Store, amount: Budget, task: Option<String>, period: Option<gateway::Period>, project: bool) -> Result<i32> {
+    let Some(period) = period else {
+        if project {
+            bail!("--project goes with --today, --this-week or --this-month: a task's own budget has no project");
+        }
+        let task = match task {
+            Some(id) => store.resolve(Some(&id))?,
+            None => store.list()?.into_iter().rev().find(|t| t.is_live()).context("no task is running (to raise a budget across tasks: --today, --this-week or --this-month)")?,
+        };
+        if !task.is_live() {
+            bail!("task {} isn't running ({}): its budget can't change anymore", task.id(), task.status_label());
+        }
+        let reply = control::call(&task.dir.join(control::OWNER_SOCKET), &Call::Raise { to: amount.spec(), by: approvals::AT_TERMINAL.into() })?;
+        if !reply.ok {
+            bail!("{}", reply.text);
+        }
+        println!("{}", reply.text);
+        return Ok(0);
+    };
+    println!("{}", raise_shared(store, &home_dir()?, &std::env::current_dir()?, period, project, amount, approvals::AT_TERMINAL)?);
     Ok(0)
 }
 

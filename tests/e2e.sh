@@ -921,6 +921,106 @@ TOML
   : > "$CFG"
 fi
 
+section "raising a budget that's used up"
+if [ -z "$FAKE_API" ]; then
+  skip "raising budgets needs the stand-in model API (httpbin)"
+else
+  reset_proj
+  cd "$PROJ"
+  # Three calls at $0.30: the third finds a $0.50 budget used up, and waits.
+  cat > "$WORK/tools/model-agent/three-calls" <<SH
+#!/bin/sh
+for i in 1 2 3; do curl -sS -m 200 "$JSON_CALL"; echo; done
+echo done-calling
+SH
+  chmod +x "$WORK/tools/model-agent/three-calls"
+  for a in raiser:three-calls onecall:one-call; do
+    printf 'run = ["%s"]\nallow = ["%s"]\nmodels = [{ url = "https://%s/base64/*", api = "anthropic" }]\n' "${a#*:}" "$FAKE_API" "$FAKE_API" > "$WORK/cfg/agents/${a%%:*}.toml"
+  done
+  : > "$CFG"
+  if command -v script >/dev/null; then
+    # Agents whose output agentos renders (like Claude's) ask at the terminal too.
+    { cat "$WORK/cfg/agents/raiser.toml"; echo 'output = "claude-stream"'; } > "$WORK/cfg/agents/raiser-tty.toml"
+    out="$(script -qec "AGENTOS_CONFIG=$CFG $AGENT do --agent raiser-tty --budget 0.5usd at the terminal" /dev/null <<<"y" 2>&1)"
+    check "at the terminal, you're asked while the call waits" grep -q "this task's budget is used up (\$0.60 of \$0.50); the agent's next model call waits" <<<"$out"
+    check "...[y] raises it to the first offer, and the call goes on" grep -q "this task's budget raised to \$0.90: the agent goes on" <<<"$out"
+    check "...through to the provider" test "$(grep -c '"kind":"model.call"' "$(latest_task_dir)/events.jsonl")" = 3
+    rm -f "$WORK/cfg/agents/raiser-tty.toml"
+  else
+    skip "budget questions at the terminal need script(1)"
+  fi
+  start_agentd
+  budget_ask() { local q=""; for _ in $(seq 300); do q="$(api "$CONSOLE/api/approvals")"; grep -q '"kind":"budget"' <<<"$q" && break; sleep 0.1; done; echo "$q"; }
+  qid() { sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$1"; }
+  calls() { grep -c '"type":"message"' "$WORK/raise.out"; }
+
+  AGENTOS_CONFIG="$CFG" "$AGENT" do --agent raiser --budget 0.5usd raise me >"$WORK/raise.out" 2>&1 &
+  RUN_PID=$!
+  Q="$(budget_ask)"
+  check "a used-up budget asks you in the console, while the model call waits" grep -q "\"target\":\"this task's budget\"" <<<"$Q"
+  check "...with what's spent" grep -q '"reason":"\$0.60 of \$0.50"' <<<"$Q"
+  check "...and what to raise it to" grep -q '"offers":\["\$0.90","\$1.20"\]' <<<"$Q"
+  api -X POST -d '{"decision":"raise","to":"$1.20"}' "$CONSOLE/api/approvals/$(qid "$Q")" >/dev/null
+  wait $RUN_PID
+  events="$(latest_task_dir)/events.jsonl"
+  check "the agent was told it would be asked" grep -q "budget used up (\$0.60 of \$0.50): you're asked before the next model call goes" "$WORK/raise.out"
+  check "raising it lets the waiting call through" test "$(calls)" = 3
+  check "...and the task runs to the end" grep -q done-calling "$WORK/raise.out"
+  check "the raise is journaled, with where you answered" grep -q '"kind":"budget.raised".*"by":"agentd console"' "$events"
+  check "agent log shows it" grep -q "this task's budget raised to \$1.20 (from \$0.50), by you in agentd's console, when asked" <<<"$("$AGENT" log)"
+  ID="$("$AGENT" ls | sed -n 2p | cut -d' ' -f1)"
+  check "the task keeps the budget you raised it to" grep -q '"budget":"\$1.20"' <<<"$(api "$CONSOLE/api/tasks/$ID")"
+  check "a task that ended can't be raised" grep -q "isn't running" <<<"$(api -X POST -d '{"to":"5usd"}' "$CONSOLE/api/tasks/$ID/raise")"
+
+  AGENTOS_CONFIG="$CFG" "$AGENT" do --agent raiser --budget 0.5usd say no >"$WORK/raise.out" 2>&1 &
+  RUN_PID=$!
+  Q="$(budget_ask)"
+  api -X POST -d '{"decision":"deny"}' "$CONSOLE/api/approvals/$(qid "$Q")" >/dev/null
+  wait $RUN_PID
+  check "saying no refuses the call, as before" grep -q 'invalid_request_error' "$WORK/raise.out"
+  check "...and is journaled" grep -q '"kind":"budget.declined".*"why":"denied"' "$(latest_task_dir)/events.jsonl"
+
+  AGENTOS_CONFIG="$CFG" "$AGENT" do --agent raiser --budget 0.5usd raise it elsewhere >"$WORK/raise.out" 2>&1 &
+  RUN_PID=$!
+  Q="$(budget_ask)"
+  check "agent raise refuses less than it is" grep -q 'already \$0.50' <<<"$("$AGENT" raise 0.4usd 2>&1)"
+  check "...or less than what's spent" grep -q '\$0.60 is spent already' <<<"$("$AGENT" raise 0.55usd 2>&1)"
+  check "agent raise raises the running task's budget" grep -q 'budget is now \$2.00 (was \$0.50)' <<<"$("$AGENT" raise 2usd 2>&1)"
+  wait $RUN_PID
+  check "...and the waiting call goes on" test "$(calls)" = 3
+  check "...its question gone from the console" lacks '"kind":"budget"' "$(api "$CONSOLE/api/approvals")"
+  check "...journaled: by you at the terminal" grep -q '"kind":"budget.raised".*"by":"terminal"' "$(latest_task_dir)/events.jsonl"
+  kill $SERVE_PID 2>/dev/null
+  wait $SERVE_PID 2>/dev/null
+
+  # Across tasks: today's budget, raised until midnight.
+  SAVED_HOME="$AGENTOS_HOME"
+  export AGENTOS_HOME="$WORK/store-raise"
+  printf '[limits]\ndaily = "0.5usd"\n' > "$CFG"
+  r3() { AGENTOS_CONFIG="$CFG" "$AGENT" "$@"; }
+  r3 do --agent onecall one >/dev/null 2>&1
+  r3 do --agent onecall two >/dev/null 2>&1
+  out="$(r3 do --agent onecall three 2>&1)"
+  check "a task that can't start says how to raise today's budget" grep -q 'agent raise 0.9usd --today' <<<"$out"
+  check "...in its own unit" grep -q 'counted in dollars' <<<"$(r3 raise 2M --today 2>&1)"
+  check "...and only if there's one" grep -q 'no weekly budget to raise' <<<"$(r3 raise 2usd --this-week 2>&1)"
+  check "agent raise --today raises it until midnight" grep -q "today's budget for all your tasks is now \$1.00 (was \$0.50), until it resets at midnight" <<<"$(r3 raise 1usd --today 2>&1)"
+  check "...so the next task starts" grep -q 'spend: today \$0.60 of \$1.00 (all your tasks; raised from \$0.50)' <<<"$(r3 do --agent onecall four 2>&1)"
+  check "agent spend shows it raised" grep -Eq 'today +\$0.90 · 330k of \$1.00 \(raised from \$0.50\)' <<<"$(r3 spend)"
+  start_agentd AGENTOS_CONFIG="$CFG"
+  sp="$(api "$CONSOLE/api/spend")"
+  check "the console shows today's spend against the budget" grep -q '"spent":"\$0.90 of \$1.00"' <<<"$sp"
+  check "...that it was raised" grep -q '"raised":true' <<<"$sp"
+  check "...and today's tasks by what they spent" grep -q '"title":"onecall: four","spent":"\$0.30"' <<<"$sp"
+  check "raise today's budget from the console" grep -q 'is now \$3.00 (was \$1.00)' <<<"$(api -X POST -d '{"period":"daily","to":"3usd"}' "$CONSOLE/api/spend/raise")"
+  check "...not below what it is" grep -q '"error":.*already \$3.00' <<<"$(api -X POST -d '{"period":"daily","to":"2usd"}' "$CONSOLE/api/spend/raise")"
+  kill $SERVE_PID 2>/dev/null
+  wait $SERVE_PID 2>/dev/null
+  export AGENTOS_HOME="$SAVED_HOME"
+  rm -f "$WORK/cfg/agents/raiser.toml" "$WORK/cfg/agents/onecall.toml"
+  : > "$CFG"
+fi
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7

@@ -1,5 +1,6 @@
 //! Human-readable output for the CLI.
 
+use agentos::approvals;
 use agentos::changes::{self, Change, Entry, Kind, Summary};
 use agentos::gateway::{self, Budget, Totals, Usage};
 use agentos::journal::Event;
@@ -461,6 +462,15 @@ pub fn committed(p: Paint, task: &Task, applied: &[Change], remaining: usize) ->
     out
 }
 
+/// "by you at the terminal", "by you in agentd's console".
+pub fn by(via: &str) -> String {
+    match via {
+        approvals::AT_TERMINAL => "by you at the terminal".into(),
+        approvals::IN_AGENTD => "by you in agentd's console".into(),
+        other => format!("by {other}"),
+    }
+}
+
 pub fn log(p: Paint, task: &Task, events: &[Event]) -> String {
     let mut out = format!(
         "{} {} · {}\n",
@@ -584,11 +594,28 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "model.unmetered" => p.yellow(format!("{}: {}", s(&d["host"]), s(&d["why"]))),
         "model.refused" => p.yellow("over budget: refused, not sent"),
-        "budget.exhausted" if d["reason"].is_string() => p.red(s(&d["reason"])),
+        "budget.exhausted" if d["reason"].is_string() => {
+            let then = if d["asks"] == true { "you're asked before the next call" } else { "model calls refused from now on" };
+            format!("{}: {then}", p.red(s(&d["reason"])))
+        }
         "budget.nearly" | "budget.exhausted" => {
             let t: Totals = serde_json::from_value(d["totals"].clone()).unwrap_or_default();
-            let what = if e.kind == "budget.nearly" { p.yellow("80% used") } else { p.red("used up: model calls refused from now on") };
+            let what = match (e.kind.as_str(), d["asks"] == true) {
+                ("budget.nearly", _) => p.yellow("80% used"),
+                (_, true) => p.red("used up: you're asked before the next call"),
+                _ => p.red("used up: model calls refused from now on"),
+            };
             format!("{what} · {}", t.describe())
+        }
+        "budget.raised" => {
+            let budget = |v: &Value| serde_json::from_value::<Budget>(v.clone()).map(|b| b.to_string()).unwrap_or_default();
+            let asked = if d["asked"] == true { ", when asked" } else { "" };
+            p.cyan(format!("{} raised to {} (from {}), {}{asked}", s(&d["what"]), budget(&d["to"]), budget(&d["from"]), by(&s(&d["by"]))))
+        }
+        "budget.declined" => {
+            let cap = serde_json::from_value::<Budget>(d["cap"].clone()).map(|b| b.to_string()).unwrap_or_default();
+            let why = if d["why"] == "no answer" { "nobody answered" } else { "you said no" };
+            p.yellow(format!("{} stays at {cap}: {why}", s(&d["what"])))
         }
         "outbox.ready" => {
             let remotes: Vec<String> = d["remotes"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();

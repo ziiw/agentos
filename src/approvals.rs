@@ -7,6 +7,7 @@
 //! sandbox can see, and applied to later tasks like an allowlist from your
 //! own config.
 
+use crate::gateway::Budget;
 use crate::util::display_path;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -14,7 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
@@ -156,6 +157,9 @@ pub enum Kind {
     /// Calling a tool of one of your MCP servers (`target` is `server.tool`,
     /// `reason` its arguments).
     Tool,
+    /// A budget that's used up while a model call waits (`target` says
+    /// which, `reason` how much is spent): how far to raise it, if at all.
+    Budget,
 }
 
 /// One question: what, and the agent's reason when it asked on purpose.
@@ -181,7 +185,7 @@ impl Request {
         match self.kind {
             Kind::Host => Some(self.target.clone()),
             Kind::Tool => Some(format!("{TOOL_PREFIX}{}", self.target)),
-            Kind::Read | Kind::Write => None,
+            Kind::Read | Kind::Write | Kind::Budget => None,
         }
     }
 }
@@ -211,6 +215,9 @@ pub struct Question {
     pub reason: Option<String>,
     pub project: PathBuf,
     pub asked_ms: u64,
+    /// For a budget: what to raise it to, as offered (first is [y]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offers: Vec<String>,
 }
 
 fn host_kind() -> Kind {
@@ -235,13 +242,31 @@ pub fn questions(store_root: &Path) -> Vec<Question> {
 
 /// agentd's side: answer a question.
 pub fn answer(store_root: &Path, id: &str, decision: Decision) -> Result<()> {
+    answer_with(store_root, id, decision.label())
+}
+
+/// agentd's side: raise the budget a question is about.
+pub fn answer_raise(store_root: &Path, id: &str, to: Budget) -> Result<()> {
+    answer_with(store_root, id, &format!("raise {}", to.spec()))
+}
+
+fn answer_with(store_root: &Path, id: &str, text: &str) -> Result<()> {
     if !id.chars().all(|c| c.is_ascii_hexdigit()) || !queue(store_root, "pending").join(format!("{id}.json")).exists() {
         anyhow::bail!("no such question");
     }
     let dir = queue(store_root, "answers");
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join(format!("{id}.json")), decision.label())?;
+    fs::write(dir.join(format!("{id}.json")), text)?;
     Ok(())
+}
+
+/// Forgets questions whose task is gone: `live(task)` says which aren't.
+pub fn drop_stale(store_root: &Path, live: impl Fn(&str) -> bool) {
+    for q in questions(store_root) {
+        if !live(&q.task) {
+            let _ = fs::remove_file(queue(store_root, "pending").join(format!("{}.json", q.id)));
+        }
+    }
 }
 
 /// An answer typed at the terminal, or sent by agentd (a decision's label).
@@ -255,6 +280,44 @@ fn parse_decision(text: &str, kind: Kind) -> Decision {
         _ => Decision::Deny,
     }
 }
+
+/// An answer to a budget question: [y] for the first offer, an amount (a
+/// bare number counts in the budget's own unit), or anything else for no.
+fn parse_raise(text: &str, cap: Budget, offers: &[Budget]) -> Option<Budget> {
+    let t = text.trim();
+    let t = t.strip_prefix("raise").map(str::trim).unwrap_or(t);
+    match t.to_ascii_lowercase().as_str() {
+        "y" | "yes" => offers.first().copied(),
+        _ => match t.parse::<f64>() {
+            Ok(n) => cap.same_unit(n),
+            Err(_) => t.parse().ok(),
+        },
+    }
+}
+
+/// How a budget question ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Raised {
+    /// You raised it to this, answering there ("terminal", "agentd console").
+    To(Budget, &'static str),
+    /// It doesn't need raising anymore (raised elsewhere meanwhile).
+    Settled,
+    /// "denied", or "no answer".
+    No(&'static str),
+}
+
+/// What came back from a question.
+enum Heard {
+    /// An answer, and where it was given.
+    Text(String, &'static str),
+    Timeout,
+    Settled,
+    /// The terminal went away.
+    Gone,
+}
+
+pub const AT_TERMINAL: &str = "terminal";
+pub const IN_AGENTD: &str = "agentd console";
 
 /// Asks about hosts outside the allowlist, and what agents ask for: at the
 /// terminal, in agentd's console, or both (the first answer wins). One
@@ -317,73 +380,38 @@ impl Asker {
         }
 
         let mut tty = self.tty.as_ref().and_then(|t| t.lock().ok());
-        let id = crate::util::random_hex(8).unwrap_or_default();
-        let pending = queue(&self.store_root, "pending").join(format!("{id}.json"));
-        let answer_file = queue(&self.store_root, "answers").join(format!("{id}.json"));
-        if self.web {
-            let q = Question {
-                id: id.clone(),
-                task: self.task.clone(),
-                title: self.title.clone(),
-                kind: req.kind,
-                target: req.target.clone(),
-                reason: req.reason.clone(),
-                project: self.project.clone(),
-                asked_ms: crate::util::now_ms(),
-            };
-            let _ = fs::create_dir_all(pending.parent().unwrap_or(Path::new(".")));
-            let _ = fs::write(&pending, serde_json::to_vec(&q).unwrap_or_default());
-        }
-        if let Some(t) = tty.as_mut() {
-            let elsewhere = if self.web { " (or answer in agentd)" } else { "" };
-            let what = match (req.kind, &req.reason) {
-                (Kind::Host, None) => format!("the agent wants to reach {}", req.target),
-                (Kind::Host, Some(_)) => format!("the agent asks to reach {}", req.target),
-                (Kind::Read, _) => format!("the agent asks to read {}", req.target),
-                (Kind::Write, _) => format!("the agent asks to change {} (held for your review)", req.target),
-                (Kind::Tool, _) => format!("the agent wants to call {}", req.target),
-            };
-            let why = match (req.kind, req.reason.as_deref()) {
-                (_, None) => String::new(),
-                (Kind::Tool, Some(args)) => format!("\n  with: {args}"),
-                (_, Some(r)) => format!("\n  its reason: \u{201c}{r}\u{201d}"),
-            };
-            let project = display_path(&self.project);
-            let options = match req.kind {
-                Kind::Host => format!("[y] this task · [a] always, in {project} · [N] deny"),
-                Kind::Tool => format!("[y] this call · [t] this task · [a] always, in {project} · [N] deny"),
-                Kind::Read | Kind::Write => "[y] this task · [N] deny".to_string(),
-            };
-            // One write, so it can't interleave with the agent's own output.
-            let question = format!("\n{} {what}{why}\n  {options}{elsewhere} › ", paint("agent ▸"));
-            let _ = t.write_all(question.as_bytes());
-            let _ = t.flush();
-        }
-
-        let deadline = Instant::now() + ANSWER_TIMEOUT;
-        let mut line = Vec::new();
-        let decision = loop {
-            if Instant::now() >= deadline {
-                break Decision::Timeout;
-            }
-            if let Ok(text) = fs::read_to_string(&answer_file) {
+        let elsewhere = if self.web { " (or answer in agentd)" } else { "" };
+        let what = match (req.kind, &req.reason) {
+            (Kind::Host, None) => format!("the agent wants to reach {}", req.target),
+            (Kind::Host, Some(_)) => format!("the agent asks to reach {}", req.target),
+            (Kind::Read, _) => format!("the agent asks to read {}", req.target),
+            (Kind::Write, _) => format!("the agent asks to change {} (held for your review)", req.target),
+            (Kind::Tool, _) => format!("the agent wants to call {}", req.target),
+            (Kind::Budget, _) => format!("{} is used up", req.target),
+        };
+        let why = match (req.kind, req.reason.as_deref()) {
+            (_, None) => String::new(),
+            (Kind::Tool, Some(args)) => format!("\n  with: {args}"),
+            (_, Some(r)) => format!("\n  its reason: \u{201c}{r}\u{201d}"),
+        };
+        let project = display_path(&self.project);
+        let options = match req.kind {
+            Kind::Host => format!("[y] this task · [a] always, in {project} · [N] deny"),
+            Kind::Tool => format!("[y] this call · [t] this task · [a] always, in {project} · [N] deny"),
+            Kind::Read | Kind::Write | Kind::Budget => "[y] this task · [N] deny".to_string(),
+        };
+        let prompt = format!("\n{} {what}{why}\n  {options}{elsewhere} › ", paint("agent ▸"));
+        let decision = match self.hear(&mut tty, req, Vec::new(), &prompt, &|| false) {
+            Heard::Text(text, via) => {
                 let d = parse_decision(&text, req.kind);
-                if let Some(t) = tty.as_mut() {
+                if let (Some(t), true) = (tty.as_mut(), via == IN_AGENTD) {
                     let _ = writeln!(t, "{} (answered in agentd)", d.label());
                 }
-                break d;
+                d
             }
-            match tty.as_mut() {
-                Some(t) => match read_line_for(t, &mut line, Duration::from_millis(250)) {
-                    Some(true) => break parse_decision(&String::from_utf8_lossy(&line), req.kind),
-                    Some(false) => {}
-                    None => break Decision::Deny,
-                },
-                None => std::thread::sleep(Duration::from_millis(250)),
-            }
+            Heard::Timeout => Decision::Timeout,
+            Heard::Settled | Heard::Gone => Decision::Deny,
         };
-        let _ = fs::remove_file(&pending);
-        let _ = fs::remove_file(&answer_file);
         // A path is granted for this task only.
         let remembered = req.remembered_as();
         let decision = if decision == Decision::Always && remembered.is_none() { Decision::Once } else { decision };
@@ -404,6 +432,98 @@ impl Asker {
             answers.insert(key, decision);
         }
         (decision, true)
+    }
+
+    /// A budget is used up while a model call waits: asks how far to raise
+    /// it. `settled` ends the question early (it was raised elsewhere).
+    pub fn ask_raise(&self, req: &Request, cap: Budget, offers: &[Budget], settled: impl Fn() -> bool, paint: impl Fn(&str) -> String) -> Raised {
+        // One question at a time: by then, it may have been raised already.
+        let Ok(_turn) = self.asking.lock() else { return Raised::No("denied") };
+        if settled() {
+            return Raised::Settled;
+        }
+        let mut tty = self.tty.as_ref().and_then(|t| t.lock().ok());
+        let elsewhere = if self.web { " (or answer in agentd)" } else { "" };
+        let spent = req.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+        let (first, other) = (offers.first().copied().unwrap_or(cap), offers.get(1).copied().unwrap_or(cap));
+        let prompt = format!(
+            "\n{} {} is used up{spent}; the agent's next model call waits\n  [y] raise it to {first} · or type an amount, e.g. {} · [N] no, let it stop{elsewhere} › ",
+            paint("agent ▸"),
+            req.target,
+            other.spec(),
+        );
+        let (raised, echo) = match self.hear(&mut tty, req, offers.iter().map(|b| b.to_string()).collect(), &prompt, &settled) {
+            Heard::Text(text, via) => {
+                let raised = match parse_raise(&text, cap, offers) {
+                    Some(to) => Raised::To(to, via),
+                    None => Raised::No("denied"),
+                };
+                let echo = (via == IN_AGENTD).then(|| match raised {
+                    Raised::To(to, _) => format!("raise to {to} (answered in agentd)"),
+                    _ => "no (answered in agentd)".to_string(),
+                });
+                (raised, echo)
+            }
+            Heard::Settled => (Raised::Settled, Some("(raised elsewhere: the agent goes on)".to_string())),
+            Heard::Timeout => (Raised::No("no answer"), Some(format!("(no answer in {}s: it stays used up)", ANSWER_TIMEOUT.as_secs()))),
+            Heard::Gone => (Raised::No("denied"), None),
+        };
+        if let (Some(t), Some(echo)) = (tty.as_mut(), echo) {
+            let _ = writeln!(t, "{echo}");
+        }
+        raised
+    }
+
+    /// Puts a question to you, at the terminal (`prompt`) and in agentd,
+    /// and waits for the answer, or until `settled`.
+    fn hear(&self, tty: &mut Option<MutexGuard<'_, File>>, req: &Request, offers: Vec<String>, prompt: &str, settled: &dyn Fn() -> bool) -> Heard {
+        let id = crate::util::random_hex(8).unwrap_or_default();
+        let pending = queue(&self.store_root, "pending").join(format!("{id}.json"));
+        let answer_file = queue(&self.store_root, "answers").join(format!("{id}.json"));
+        if self.web {
+            let q = Question {
+                id: id.clone(),
+                task: self.task.clone(),
+                title: self.title.clone(),
+                kind: req.kind,
+                target: req.target.clone(),
+                reason: req.reason.clone(),
+                project: self.project.clone(),
+                asked_ms: crate::util::now_ms(),
+                offers,
+            };
+            let _ = fs::create_dir_all(pending.parent().unwrap_or(Path::new(".")));
+            let _ = fs::write(&pending, serde_json::to_vec(&q).unwrap_or_default());
+        }
+        if let Some(t) = tty.as_mut() {
+            // One write, so it can't interleave with the agent's own output.
+            let _ = t.write_all(prompt.as_bytes());
+            let _ = t.flush();
+        }
+        let deadline = Instant::now() + ANSWER_TIMEOUT;
+        let mut line = Vec::new();
+        let heard = loop {
+            if Instant::now() >= deadline {
+                break Heard::Timeout;
+            }
+            if settled() {
+                break Heard::Settled;
+            }
+            if let Ok(text) = fs::read_to_string(&answer_file) {
+                break Heard::Text(text, IN_AGENTD);
+            }
+            match tty.as_mut() {
+                Some(t) => match read_line_for(t, &mut line, Duration::from_millis(250)) {
+                    Some(true) => break Heard::Text(String::from_utf8_lossy(&line).into_owned(), AT_TERMINAL),
+                    Some(false) => {}
+                    None => break Heard::Gone,
+                },
+                None => std::thread::sleep(Duration::from_millis(250)),
+            }
+        };
+        let _ = fs::remove_file(&pending);
+        let _ = fs::remove_file(&answer_file);
+        heard
     }
 }
 
@@ -473,6 +593,21 @@ mod tests {
         remember(store, p, "tool:notes.post_note").unwrap();
         assert_eq!(remembered(store, p).unwrap(), vec!["pypi.org"], "tools aren't hosts");
         assert_eq!(remembered_tools(store, p).unwrap(), vec!["notes.post_note"]);
+    }
+
+    #[test]
+    fn budget_answers() {
+        let (usd, tok) = (Budget::Usd(0.5), Budget::Tokens(1_000_000));
+        let offers = [Budget::Usd(0.9), Budget::Usd(1.2)];
+        assert_eq!(parse_raise("y\n", usd, &offers), Some(Budget::Usd(0.9)), "[y]: the first offer");
+        assert_eq!(parse_raise("raise 1.2usd", usd, &offers), Some(Budget::Usd(1.2)), "agentd's answer");
+        assert_eq!(parse_raise("3", usd, &offers), Some(Budget::Usd(3.0)), "a bare number in the budget's unit");
+        assert_eq!(parse_raise("3", tok, &offers), Some(Budget::Tokens(3)));
+        assert_eq!(parse_raise("2M", tok, &offers), Some(Budget::Tokens(2_000_000)));
+        assert_eq!(parse_raise("$4", tok, &offers), Some(Budget::Usd(4.0)), "checked when applied");
+        for no in ["", "n", "no", "deny", "-1", "nan"] {
+            assert_eq!(parse_raise(no, usd, &offers), None, "{no:?}");
+        }
     }
 
     #[test]

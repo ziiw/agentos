@@ -46,6 +46,9 @@ pub enum Call {
     Given,
     /// Yours only: take back a folder or host granted while the task ran.
     Revoke { target: String },
+    /// Yours only: raise the task's budget (`to` as `Budget::spec`), from
+    /// `by` ("terminal", "agentd console").
+    Raise { to: String, by: String },
 }
 
 /// The task's owner socket, in its folder in the task store: how you (the

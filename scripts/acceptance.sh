@@ -105,10 +105,12 @@ if agent log >/dev/null; then pass "journal chain intact"; else fail "journal ch
 
 step "6. A budget stops a task"
 # Claude's first call alone (its system prompt) costs more than a cent, so
-# the call after it is refused. Costs one or two model calls.
+# the call after it waits for you, then is refused. Costs one or two model calls.
+echo "  agentos will ask whether to raise the budget: answer n."
 out="$(agent do --budget 0.01usd "Count from 1 to 5, running a separate echo command for each number." 2>&1)"
 echo "$out" | tail -6
 if grep -q 'budget used up' <<<"$out"; then pass "you're told when the budget is used up"; else fail "you're told when the budget is used up"; fi
+if agent log --json | grep -q '"kind":"budget.declined"'; then pass "you were asked before the call was refused"; else echo "  (nobody was asked: no terminal, so the call was refused right away)"; fi
 if agent log --json | grep -q '"kind":"model.refused"'; then pass "the next model call was refused, not sent"; else fail "the next model call was refused, not sent"; fi
 if agent ls | sed -n 2p | grep -q 'over budget'; then pass "agent ls shows the task over budget"; else fail "agent ls shows the task over budget"; fi
 agent rollback >/dev/null

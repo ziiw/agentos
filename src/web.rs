@@ -11,7 +11,7 @@
 use crate::render::{self, Paint};
 use agentos::approvals::{self, Agentd, Decision};
 use agentos::config;
-use agentos::gateway::Budget;
+use agentos::gateway::{Budget, Period, Periodic};
 use agentos::profiles;
 use agentos::store::Access;
 use agentos::changes::{self, Summary};
@@ -119,8 +119,15 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         (Method::Get, ["api", "launchpad"]) => launchpad(&store),
         (Method::Get, ["api", "tasks", id]) => task(&store, id),
         (Method::Post, ["api", "tasks", id, "revoke"]) => revoke(&store, id, &parts.body),
+        (Method::Post, ["api", "tasks", id, "raise"]) => raise_task(&store, id, &parts.body),
+        (Method::Get, ["api", "spend"]) => spend(&store),
+        (Method::Post, ["api", "spend", "raise"]) => raise_shared(&store, &parts.body),
         (Method::Post, ["api", "tasks", id, action]) if ["commit", "push", "rollback", "stop"].contains(action) => run_cli(&store, action, id),
-        (Method::Get, ["api", "approvals"]) => Ok(json!(approvals::questions(store.root()))),
+        (Method::Get, ["api", "approvals"]) => {
+            // A task that ended while asking leaves its question behind.
+            approvals::drop_stale(store.root(), |id| store.resolve(Some(id)).is_ok_and(|t| t.is_live()));
+            Ok(json!(approvals::questions(store.root())))
+        }
         (Method::Post, ["api", "approvals", id]) => {
             let decision = std::mem::take(&mut parts.body);
             decide(&store, id, &decision)
@@ -161,12 +168,18 @@ fn task_json(t: &Task) -> Value {
         "doing": doing,
         "cost": cost.map(gateway::usd),
         "tokens": tokens.map(gateway::tokens),
-        "budget": t.meta.budget.map(|b| b.to_string()),
+        "budget": live_budget(t, &events).map(|b| b.to_string()),
         "open": open,
         "started_ms": t.meta.started_at_ms,
         "changes": summary,
         "pushes": pushes,
     })
+}
+
+/// A task's budget: as raised while it runs, if it was.
+fn live_budget(t: &Task, events: &[agentos::journal::Event]) -> Option<Budget> {
+    let raised = events.iter().rev().find(|e| e.kind == "budget.raised" && e.data["scope"] == "task");
+    raised.and_then(|e| serde_json::from_value(e.data["to"].clone()).ok()).or(t.meta.budget)
 }
 
 fn tasks(store: &Store) -> Result<Value> {
@@ -324,15 +337,127 @@ fn run_cli(store: &Store, action: &str, id: &str) -> Result<Value> {
 }
 
 fn decide(store: &Store, id: &str, body: &str) -> Result<Value> {
-    let decision = match serde_json::from_str::<Value>(body).ok().and_then(|v| v["decision"].as_str().map(str::to_string)).as_deref() {
+    let v: Value = serde_json::from_str(body).unwrap_or_default();
+    let decision = match v["decision"].as_str() {
         Some("once") => Decision::Once,
         Some("call") => Decision::Call,
         Some("always") => Decision::Always,
         Some("deny") => Decision::Deny,
-        _ => bail!("decision must be once, call, always or deny"),
+        // A budget question: how far to raise it.
+        Some("raise") => {
+            let to: Budget = v["to"].as_str().context("raise needs {to}, e.g. 2usd")?.parse().map_err(|e| anyhow!("{e}"))?;
+            approvals::answer_raise(store.root(), id, to)?;
+            return Ok(json!({ "ok": true }));
+        }
+        _ => bail!("decision must be once, call, always, deny or raise"),
     };
     approvals::answer(store.root(), id, decision)?;
     Ok(json!({ "ok": true }))
+}
+
+/// Raises a running task's own budget (as `agent raise AMOUNT` does).
+fn raise_task(store: &Store, id: &str, body: &str) -> Result<Value> {
+    let t = store.resolve(Some(id))?;
+    let to: Budget = serde_json::from_str::<Value>(body).ok().and_then(|v| v["to"].as_str().map(str::to_string)).context("expected {to}")?.parse().map_err(|e| anyhow!("{e}"))?;
+    if !t.is_live() {
+        bail!("task {} isn't running: its budget can't change anymore", t.id());
+    }
+    let call = agentos::control::Call::Raise { to: to.spec(), by: approvals::IN_AGENTD.into() };
+    let reply = agentos::control::call(&t.dir.join(agentos::control::OWNER_SOCKET), &call)?;
+    Ok(json!({ "ok": reply.ok, "output": reply.text }))
+}
+
+/// Your budgets across tasks: yours, and those of your projects.
+fn shared_budgets(store: &Store, home: &Path) -> Result<Vec<Periodic>> {
+    let mut out: Vec<Periodic> = config::load(store.root(), home, home)?
+        .periodic
+        .into_iter()
+        .filter(|(_, _, mine)| !mine)
+        .map(|(period, amount, _)| Periodic { amount, period, project: None })
+        .collect();
+    for dir in projects(store, home)? {
+        let Ok(settings) = config::load(store.root(), &dir, home) else { continue };
+        let project = approvals::project_root(&dir, home);
+        for (period, amount, mine) in settings.periodic {
+            let b = Periodic { amount, period, project: Some(project.clone()) };
+            if mine && !out.contains(&b) {
+                out.push(b);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What agents spent, today, this week and this month; where each budget
+/// across tasks stands; and today's tasks by what they spent.
+fn spend(store: &Store) -> Result<Value> {
+    let home = crate::home_dir()?;
+    let ledger = crate::open_ledger(store, &home)?;
+    let now = util::now_ms();
+    let periods: Vec<Value> = Period::ALL
+        .iter()
+        .map(|p| {
+            let (usd, tokens) = ledger.spent(p.start(now), None);
+            json!({ "period": p.key(), "label": p.label(), "spent": gateway::usd(usd), "tokens": gateway::tokens(tokens) })
+        })
+        .collect();
+    let budgets: Vec<Value> = shared_budgets(store, &home)?
+        .iter()
+        .map(|b| {
+            let st = ledger.standing(b, now);
+            json!({
+                "period": b.period.key(),
+                "label": b.period.label(),
+                "resets": b.period.resets(),
+                "project": b.project,
+                "scope": b.project.as_deref().map(util::display_path).unwrap_or_else(|| "all your tasks".into()),
+                "spent": st.against(),
+                "cap": st.cap.to_string(),
+                "configured": b.amount.to_string(),
+                "raised": st.raised,
+                "fraction": st.fraction(),
+                "over": st.over(),
+                "offers": st.offers().iter().map(|o| json!({ "shown": o.to_string(), "to": o.spec() })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let today: Vec<Value> = ledger
+        .by_task(Period::Day.start(now))
+        .into_iter()
+        .take(8)
+        .map(|(id, usd, tokens)| {
+            let title = store.resolve(Some(&id)).map(|t| render::title(&t)).unwrap_or_else(|_| id.clone());
+            json!({ "id": id, "title": title, "spent": gateway::usd(usd), "tokens": gateway::tokens(tokens) })
+        })
+        .collect();
+    Ok(json!({ "periods": periods, "budgets": budgets, "today": today }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RaiseShared {
+    period: String,
+    #[serde(default)]
+    project: Option<PathBuf>,
+    to: String,
+}
+
+/// Raises a budget across tasks until it resets (as `agent raise AMOUNT
+/// --today` does), for all your tasks or one of your projects.
+fn raise_shared(store: &Store, body: &str) -> Result<Value> {
+    let req: RaiseShared = serde_json::from_str(body).context("expected {period, project?, to}")?;
+    let home = crate::home_dir()?;
+    let period = Period::ALL.into_iter().find(|p| p.key() == req.period).context("period must be daily, weekly or monthly")?;
+    let to: Budget = req.to.parse().map_err(|e| anyhow!("{e}"))?;
+    let cwd = match &req.project {
+        Some(p) => projects(store, &home)?
+            .into_iter()
+            .find(|dir| approvals::project_root(dir, &home) == *p)
+            .with_context(|| format!("{} isn't one of your projects", util::display_path(p)))?,
+        None => home.clone(),
+    };
+    let text = crate::raise_shared(store, &home, &cwd, period, req.project.is_some(), to, approvals::IN_AGENTD)?;
+    Ok(json!({ "ok": true, "output": text }))
 }
 
 /// Pings `url` (e.g. an ntfy.sh topic) with curl: once per new question, and
@@ -354,6 +479,11 @@ fn notifier(root: PathBuf, url: String) {
                     approvals::Kind::Read => "to read",
                     approvals::Kind::Write => "to change",
                     approvals::Kind::Tool => "to call",
+                    approvals::Kind::Budget => {
+                        let spent = q.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+                        send("agentos: a budget is used up", &format!("{}: {} is used up{spent}. Raise it?", q.title, q.target));
+                        continue;
+                    }
                 };
                 send("agentos: an agent is asking", &format!("{} asks {what} {}", q.title, q.target));
             }

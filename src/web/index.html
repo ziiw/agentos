@@ -64,16 +64,33 @@
   .new .error { color: var(--bad); font-size: 14px; margin-top: 10px; }
   header button { margin-left: auto; }
   header .dot { margin-left: 8px; }
+  header { flex-wrap: wrap; row-gap: 8px; }
+  header .pill { margin-left: auto; min-height: 34px; padding: 4px 12px; font-family: var(--mono); font-size: 13px; }
+  header .pill + button { margin-left: 0; }
+  .pill.warn { color: var(--warn); border-color: var(--warn); } .pill.over { color: var(--bad); border-color: var(--bad); }
+  @media (max-width: 520px) { header .sub, header .pill .when { display: none; } }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 6px 0 4px; }
+  .bar span { display: block; height: 100%; background: var(--accent); }
+  .bar.warn span { background: var(--warn); } .bar.over span { background: var(--bad); }
+  .line { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; padding: 3px 0; }
+  .line .counts { white-space: nowrap; }
+  .line .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .budget { padding: 10px 0; border-top: 1px solid var(--line); } .budget:first-of-type { border-top: 0; }
+  .budget .row { margin-top: 8px; } .budget .row button { min-height: 34px; padding: 4px 12px; }
+  .card.used { border-color: var(--bad); }
 </style>
 </head>
 <body>
 <main>
   <header>
     <h1>agentos</h1><span class="sub">agentd console</span>
+    <button id="spend-open" class="pill" hidden></button>
     <button id="new-open" class="primary">New task</button><span class="dot" id="dot" title="connection"></span>
   </header>
   <div id="notice"></div>
+  <section id="spend"></section>
   <section id="new"></section>
+  <section id="over"></section>
   <section id="asks"></section>
   <h2>Tasks</h2>
   <section id="tasks"><p class="empty">Loading…</p></section>
@@ -89,8 +106,10 @@
   let token = fromHash || store.get();
   let openTask = null;
   let lastTasks = [];
+  let spendOpen = false;
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const upper = (s) => String(s ?? "").charAt(0).toUpperCase() + String(s ?? "").slice(1);
   const ago = (ms) => {
     const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
     if (s < 60) return s + "s ago"; if (s < 3600) return Math.round(s / 60) + "m ago";
@@ -117,11 +136,24 @@
     }).join("\n");
   }
 
+  // A model call waits on this one: raise the budget, or let the task stop.
+  function budgetAsk(q) {
+    const offers = (q.offers || []).map((o, i) =>
+      `<button class="${i ? "" : "primary"}" data-q="${q.id}" data-d="raise" data-to="${esc(o)}">Raise to ${esc(o)}</button>`).join("");
+    return `<div class="card ask">
+      <div class="meta">${esc(q.title)} · ${ago(q.asked_ms)}</div>
+      <div class="what">${esc(upper(q.target))} is used up${q.reason ? `: <strong>${esc(q.reason)}</strong>` : ""}</div>
+      <div class="meta">The agent's next model call waits for your answer.</div>
+      <div class="row">${offers}<button data-q="${q.id}" data-d="raise" data-other="${esc(q.target)}">Other…</button>
+        <button class="danger" data-q="${q.id}" data-d="deny">Let it stop</button></div></div>`;
+  }
+
   function renderAsks(asks) {
     if (!asks.length) { $("asks").innerHTML = ""; return; }
     $("asks").innerHTML = `<h2>Waiting for you</h2>` + asks.map((q) => {
       const project = q.project.split("/").filter(Boolean).pop() || q.project;
       const kind = q.kind || "host";
+      if (kind === "budget") return budgetAsk(q);
       const what = kind === "read" ? "The agent asks to read"
         : kind === "write" ? "The agent asks to change"
         : kind === "tool" ? "The agent wants to call"
@@ -161,6 +193,49 @@
     return `<span class="counts">${esc(used)}${of}</span>`;
   }
 
+  // One budget across tasks: where it stands, and raising it until it resets.
+  function raiseRow(b) {
+    const until = b.period === "daily" ? " today" : b.period === "weekly" ? " this week" : " this month";
+    const near = b.over || b.fraction >= 0.8;
+    const data = `data-raise-period="${b.period}" data-project="${esc(b.project || "")}" data-what="${esc(b.label)}'s budget for ${esc(b.scope)}" data-cap="${esc(b.cap)}"`;
+    const offers = near ? b.offers.map((o, i) => `<button class="${i ? "" : "primary"}" ${data} data-to="${esc(o.to)}">Raise to ${esc(o.shown)}${until}</button>`).join("") : "";
+    return `<div class="row">${offers}<button ${data}>${near ? "Other…" : "Raise…"}</button></div>`;
+  }
+
+  function budgetLine(b) {
+    const cls = b.over ? "over" : b.fraction >= 0.8 ? "warn" : "";
+    const pct = Math.min(100, Math.round(b.fraction * 100));
+    return `<div class="budget">
+      <div class="line"><span class="name"><strong>${esc(upper(b.label))}</strong> · ${esc(b.scope)}</span><span class="counts">${esc(b.spent)}</span></div>
+      <div class="bar ${cls}"><span style="width:${pct}%"></span></div>
+      <div class="meta">${b.over ? "used up · " : ""}resets ${esc(b.resets)}${b.raised ? ` · raised from ${esc(b.configured)}` : ""}</div>
+      ${raiseRow(b)}</div>`;
+  }
+
+  function renderSpend(sp) {
+    const pill = $("spend-open");
+    if (!sp) { pill.hidden = true; $("over").innerHTML = ""; $("spend").innerHTML = ""; return; }
+    const today = sp.periods[0];
+    const daily = sp.budgets.find((b) => b.period === "daily" && !b.project);
+    pill.hidden = false;
+    pill.innerHTML = `<span class="when">today </span>${esc(daily ? daily.spent : today.spent)}`;
+    pill.className = "pill" + (sp.budgets.some((b) => b.over) ? " over" : sp.budgets.some((b) => b.fraction >= 0.8) ? " warn" : "");
+    // Used up: new tasks won't start and running ones can't call their model.
+    const over = sp.budgets.filter((b) => b.over);
+    $("over").innerHTML = over.length ? `<h2>Budget used up</h2>` + over.map((b) => `<div class="card used">
+      <div class="what">${esc(upper(b.label))}'s budget for ${esc(b.scope)} is used up: <strong>${esc(b.spent)}</strong></div>
+      <div class="meta">Until it resets ${esc(b.resets)}, new tasks won't start and running ones can't call their model, unless you raise it.</div>
+      ${raiseRow(b)}</div>`).join("") : "";
+    if (!spendOpen) { $("spend").innerHTML = ""; return; }
+    const periods = sp.periods.map((p) => `<div class="line"><span>${esc(upper(p.label))}</span><span class="counts">${esc(p.spent)} · ${esc(p.tokens)} tokens</span></div>`).join("");
+    const budgets = sp.budgets.length ? sp.budgets.map(budgetLine).join("")
+      : `<p class="empty">No budgets across tasks. Set <code>daily</code>, <code>weekly</code> or <code>monthly</code> under <code>[limits]</code> in your config.</p>`;
+    const tasks = sp.today.length ? sp.today.map((t) => `<div class="line"><span class="name">${esc(t.title)}</span><span class="counts">${esc(t.spent)}</span></div>`).join("")
+      : `<p class="empty">No model calls today.</p>`;
+    $("spend").innerHTML = `<h2>Spend</h2><div class="card">${periods}<h3>Budgets across tasks</h3>${budgets}<h3>Today, by task</h3>${tasks}
+      <div class="row"><button data-spend="close">Close</button></div></div>`;
+  }
+
   function renderTasks(tasks) {
     if (!tasks.length) { $("tasks").innerHTML = `<p class="empty">No tasks yet. Start one with <code>agent do "…"</code>.</p>`; return; }
     $("tasks").innerHTML = tasks.map((t) => {
@@ -178,8 +253,9 @@
   async function loadDetail(id) {
     const el = $("detail"); if (!el) return;
     const t = await api("/api/tasks/" + id);
+    const raise = t.budget ? `<button data-raise-task="${id}" data-cap="${esc(t.budget)}">Raise budget</button>` : "";
     const actions = t.live
-      ? `<div class="row"><button class="danger" data-act="stop" data-id="${id}">Stop</button></div>`
+      ? `<div class="row">${raise}<button class="danger" data-act="stop" data-id="${id}">Stop</button></div>`
       : t.open ? `<div class="row">
         <button class="primary" data-act="commit" data-id="${id}">Commit${t.pushes ? " and push" : ""}</button>
         ${t.pushes ? `<button data-act="push" data-id="${id}">Push only</button>` : ""}
@@ -232,8 +308,9 @@
   async function refresh() {
     if (!token) { $("notice").innerHTML = `<div class="notice">Open the link that <code>agent serve</code> printed: it carries the access token.</div>`; return; }
     try {
-      const [asks, tasks] = await Promise.all([api("/api/approvals"), api("/api/tasks")]);
+      const [asks, tasks, sp] = await Promise.all([api("/api/approvals"), api("/api/tasks"), api("/api/spend").catch(() => null)]);
       $("notice").innerHTML = ""; $("dot").classList.add("live");
+      if (!document.querySelector("#spend button:focus, #over button:focus")) renderSpend(sp && sp.periods ? sp : null);
       renderAsks(asks);
       lastTasks = tasks;
       if (!document.querySelector("#detail button:focus")) renderTasks(tasks);
@@ -244,6 +321,7 @@
   }
 
   $("new-open").addEventListener("click", () => ($("new").innerHTML ? ($("new").innerHTML = "") : openNew()));
+  $("spend-open").addEventListener("click", () => { spendOpen = !spendOpen; refresh(); });
 
   document.addEventListener("click", async (ev) => {
     const b = ev.target.closest("button");
@@ -258,9 +336,33 @@
       setTimeout(refresh, 500);
       return;
     }
-    if (b && b.dataset.q) {
+    if (b && b.dataset.spend === "close") { spendOpen = false; return refresh(); }
+    if (b && b.dataset.raisePeriod) {
+      const to = b.dataset.to || prompt(`Raise ${b.dataset.what} (now ${b.dataset.cap}) to, until it resets:`, "");
+      if (!to) return;
       b.disabled = true;
-      await api("/api/approvals/" + b.dataset.q, { decision: b.dataset.d }).catch(() => {});
+      const r = await api("/api/spend/raise", { period: b.dataset.raisePeriod, project: b.dataset.project || undefined, to }).catch((e) => ({ error: e.message }));
+      if (r.error) alert(r.error);
+      return refresh();
+    }
+    if (b && b.dataset.raiseTask) {
+      const to = prompt(`Raise this task's budget (now ${b.dataset.cap}) to:`, "");
+      if (!to) return;
+      const r = await api(`/api/tasks/${b.dataset.raiseTask}/raise`, { to }).catch((e) => ({ output: e.message }));
+      const res = $("result");
+      if (res) res.innerHTML = `<pre class="output">${esc(r.output || r.error || "")}</pre>`;
+      setTimeout(refresh, 500);
+      return;
+    }
+    if (b && b.dataset.q) {
+      const body = { decision: b.dataset.d };
+      if (b.dataset.d === "raise") {
+        body.to = b.dataset.to || prompt(`Raise ${b.dataset.other} to:`, "");
+        if (!body.to) return;
+      }
+      b.disabled = true;
+      const r = await api("/api/approvals/" + b.dataset.q, body).catch(() => ({}));
+      if (r.error) alert(r.error);
       return refresh();
     }
     if (b && b.dataset.act) {
