@@ -12,6 +12,7 @@ use agentos::policy::{self, Question, Verdict};
 use agentos::profiles::{self, AgentEvent, Output};
 use agentos::proxy::{self, Allowlist, NetEvent};
 use agentos::sandbox::{self, GrantMount, Mount, RunMount};
+use agentos::taint;
 use agentos::store::{Access, Grant, Net, NewTask, Status, Store, Task};
 use agentos::util::{self, display_path};
 use agentos::vault::Vault;
@@ -241,6 +242,9 @@ enum PolicyCommand {
         /// The agent asking
         #[arg(long, default_value = "claude")]
         agent: String,
+        /// Pretend the task has read untrusted input of this kind (web, tool or file; repeatable)
+        #[arg(long, value_name = "KIND")]
+        tainted: Vec<String>,
     },
 }
 
@@ -425,6 +429,8 @@ struct Plan {
     prices: Vec<(String, Price)>,
     /// Model APIs the agent calls beyond the well-known ones.
     models: Vec<Endpoint>,
+    /// Hosts whose content doesn't taint the task (besides model APIs and credentials' hosts).
+    taint_trusted: Vec<String>,
     /// Your MCP servers, reached through agentos.
     mcp: Vec<agentos::mcp::Server>,
     /// Budgets across tasks: (period, amount, this project's only).
@@ -499,6 +505,7 @@ struct Applied {
     prices: Vec<(String, Price)>,
     mcp: Vec<agentos::mcp::Server>,
     periodic: Vec<(gateway::Period, Budget, bool)>,
+    taint_trusted: Vec<String>,
 }
 
 /// Merges your config and a trusted project config into this task's grants.
@@ -518,7 +525,7 @@ fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Applied> {
             secrets.push(Secret::parse(&format!("{name}={target}"))?);
         }
     }
-    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic })
+    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
 }
 
 /// The task's budget: --budget, else your config's. The gateway enforces it
@@ -724,6 +731,7 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             budget,
             prices: applied.prices,
             models: profile.models,
+            taint_trusted: applied.taint_trusted.into_iter().chain(profile.allow.iter().cloned()).collect(),
             mcp: applied.mcp,
             periodic: applied.periodic,
         },
@@ -780,6 +788,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             budget,
             prices: applied.prices,
             models: Vec::new(),
+            taint_trusted: applied.taint_trusted,
             mcp: applied.mcp,
             periodic: applied.periodic,
         },
@@ -1001,6 +1010,15 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     if !periodic.is_empty() && task.meta.net == Net::Proxy {
         eprintln!("  {}", err.dim(format!("spend: {}", ledger.status(&periodic, util::now_ms()).join(" · "))));
     }
+    // What the task has read that it shouldn't trust. Its own model APIs and
+    // the hosts of credentials you gave it don't count.
+    let taint = {
+        let mut trusted = plan.taint_trusted.clone();
+        trusted.extend(endpoints.iter().map(|e| e.host.clone()));
+        trusted.extend(plan.secrets.iter().map(|s| s.host.clone()));
+        trusted.extend(plan.login.iter().flat_map(|l| l.hosts.iter().cloned()));
+        Arc::new(taint::Taint::new(Some(journal.clone()), trusted))
+    };
     let rules = rules.map(|set| {
         let all = policy::rules(&set);
         let names: Vec<String> = all.iter().map(|(name, effect)| format!("{effect} {name}")).collect();
@@ -1014,7 +1032,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             shown.push(format!("project rules: {} ({})", display_path(f), plural(theirs, "rule")));
         }
         eprintln!("  {}", err.dim(shown.join(" · ")));
-        Arc::new(policy::Policy::new(set, plan.agent.as_deref().unwrap_or("command"), task.id(), &project))
+        Arc::new(policy::Policy::new(set, plan.agent.as_deref().unwrap_or("command"), task.id(), &project).with_taint(taint.clone()))
     });
     if let Some(l) = limits::current() {
         eprintln!("  {}", err.dim(format!("limits: {}", l.describe())));
@@ -1137,7 +1155,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             asking.store(true, Ordering::SeqCst);
         }
         if let Some(listener) = proxy_listener.take() {
-            let gate = gate(asker.clone(), rules.clone(), given.clone(), journal.clone(), expected_denials.clone(), err);
+            let gate = gate(asker.clone(), rules.clone(), taint.clone(), given.clone(), journal.clone(), expected_denials.clone(), err);
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
             proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, Some(gate), sink));
         }
@@ -1164,6 +1182,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             approvals::remembered_tools(store.root(), &project).unwrap_or_default(),
             journal.clone(),
             store.root(),
+            taint.clone(),
             err,
         ));
         gateway_slot = Some(gateway.clone());
@@ -1192,6 +1211,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
                 outbox: outbox.is_some(),
                 mcp: mcp_servers.iter().map(|m| m.name.clone()).collect(),
                 given: given.clone(),
+                taint: taint.clone(),
                 err,
             };
             let relay: control::Relay = Arc::new(move |name, conn| gateway.clone().relay(&name, conn));
@@ -1287,7 +1307,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     if let Some(e) = setup_error {
         bail!("sandbox setup failed: {e}\n(run `agent doctor` to check this machine)");
     }
-    eprintln!("{}", render::exit_summary(err, &task, &summary, &pushes, outcome.as_ref(), blocked.load(Ordering::SeqCst)));
+    eprintln!("{}", render::exit_summary(err, &task, &summary, &pushes, outcome.as_ref(), blocked.load(Ordering::SeqCst), taint.describe().as_deref()));
     Ok(exit_code)
 }
 
@@ -1295,8 +1315,9 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 /// terminal to ask at.
 /// Decides each connection through the proxy: your rules first (a forbid
 /// refuses even a listed host), then the allowlist, then you.
-fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, given: GivenList, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Gate {
+fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, taint: Arc<taint::Taint>, given: GivenList, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Gate {
     Arc::new(move |host: &str, port: u16, listed: bool| {
+        let verdict = (|| -> std::result::Result<bool, String> {
         let entry = approvals::entry(host, port);
         if taken_back(&given, "host", &entry) {
             return Err("you took it back from this task".into());
@@ -1330,6 +1351,12 @@ fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, given: Gi
         }
         give(&given, "host", &entry, None);
         Ok(true)
+        })();
+        // Whatever it fetches from there is input the agent shouldn't trust.
+        if verdict.is_ok() {
+            taint.web(host);
+        }
+        verdict
     })
 }
 
@@ -1453,12 +1480,13 @@ fn gateway_for(
     remembered: Vec<String>,
     journal: Journal,
     store_root: &Path,
+    taint: Arc<taint::Taint>,
     err: Paint,
 ) -> agentos::mcp::Gateway {
     let ask: Box<dyn Fn(&Request) -> Option<approvals::Decision> + Send + Sync> =
         Box::new(move |req: &Request| asker.as_ref().map(|a| a.ask(req, |s| err.cyan(s)).0));
     let tell: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text| say(format!("{} {text}", err.yellow("agent: warning:"))));
-    agentos::mcp::Gateway::new(servers, cwd.to_path_buf(), task_dir.to_path_buf(), ask, rules, remembered, journal, tell, store_root.to_path_buf())
+    agentos::mcp::Gateway::new(servers, cwd.to_path_buf(), task_dir.to_path_buf(), ask, rules, remembered, journal, tell, store_root.to_path_buf(), taint)
 }
 
 /// Answers what the agent asks agentos from inside its sandbox (through
@@ -1489,6 +1517,7 @@ struct Control {
     mcp: Vec<String>,
     /// What you granted while it ran, and what you took back.
     given: GivenList,
+    taint: Arc<taint::Taint>,
     err: Paint,
 }
 
@@ -1553,7 +1582,7 @@ impl Control {
     /// Your rules answer first; then you're asked.
     fn ask(&self, kind: Kind, target: &str, reason: &str, question: Question) -> std::result::Result<approvals::Decision, Reply> {
         let reason = approvals::sanitize(reason, 300);
-        let req = Request { kind, target: approvals::sanitize(target, 200), reason: Some(reason.clone()) };
+        let req = Request { kind, target: approvals::sanitize(target, 200), reason: Some(reason.clone()), taint: None };
         let label = match kind {
             Kind::Host => "host",
             Kind::Read => "read",
@@ -1667,6 +1696,10 @@ impl Control {
         }
         if let Err(reply) = self.ask(if write { Kind::Write } else { Kind::Read }, &shown, reason, Question::path(write, &path)) {
             return reply;
+        }
+        // A folder outside the project is input the agent shouldn't trust.
+        if !path.starts_with(&self.cwd) {
+            self.taint.mark(taint::Source::File, &shown);
         }
         match self.grant(&path, write) {
             Ok(()) if write => Reply::answer(format!(
@@ -1849,7 +1882,7 @@ fn raiser(asker: Arc<Asker>, journal: Journal, err: Paint) -> gateway::Raiser {
             if declined.lock().is_ok_and(|d| d.contains(&key)) {
                 return false;
             }
-            let req = Request { kind: Kind::Budget, target: short.what(), reason: Some(short.spent()) };
+            let req = Request { kind: Kind::Budget, target: short.what(), reason: Some(short.spent()), taint: None };
             let settled = || m.shortfall().is_none_or(|s| s.key() != key);
             match asker.ask_raise(&req, short.cap(), &short.offers(), settled, |s| err.cyan(s)) {
                 approvals::Raised::Settled => {}
@@ -2349,7 +2382,7 @@ fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
                 }
             }
         }
-        Some(PolicyCommand::Check { action, target, args, agent }) => {
+        Some(PolicyCommand::Check { action, target, args, agent, tainted }) => {
             let question = match policy::Action::parse(&action) {
                 Some(policy::Action::Connect) => {
                     let (host, port) = target.rsplit_once(':').and_then(|(h, p)| Some((h, p.parse().ok()?))).unwrap_or((target.as_str(), 443));
@@ -2370,7 +2403,16 @@ fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
                 None => bail!("{action}: expected connect, read, write or call"),
             };
             let project = approvals::project_root(&std::env::current_dir()?, &home);
-            match policy::Policy::new(set, &agent, "check", &project).decide(&question) {
+            let sources = tainted
+                .iter()
+                .map(|k| match k.as_str() {
+                    "web" => Ok(taint::Source::Web),
+                    "tool" => Ok(taint::Source::Tool),
+                    "file" => Ok(taint::Source::File),
+                    other => bail!("--tainted {other}: expected web, tool or file"),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            match policy::Policy::new(set, &agent, "check", &project).pretend_tainted(&sources).decide(&question) {
                 Verdict::Permit(rule) => println!("{} by \u{201c}{rule}\u{201d}: no question asked", out.green("permitted")),
                 Verdict::Forbid(rule) => {
                     let (who, name) = policy::whose(&rule);

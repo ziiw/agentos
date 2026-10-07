@@ -144,7 +144,7 @@ fn net_label(net: &Net, allow: &[String]) -> String {
     }
 }
 
-pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome: Option<&AgentEvent>, blocked: usize) -> String {
+pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome: Option<&AgentEvent>, blocked: usize, tainted: Option<&str>) -> String {
     let id = task.id();
     let took = util::duration(task.meta.ended_at_ms.unwrap_or(0).saturating_sub(task.meta.started_at_ms));
     let mut head = format!("{} task {} exited {} in {took}", p.cyan("agent ▸"), p.bold(id), task.meta.exit_code.unwrap_or(-1));
@@ -165,7 +165,7 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
     }
     let ignored = if s.ignored > 0 { p.dim(format!(" · {} ignored", s.ignored)) } else { String::new() };
     if s.total() == 0 && s.git == 0 && pushes.is_empty() {
-        return format!("{head} · no changes{ignored}");
+        return format!("{head} · no changes{ignored}{}", taint_note(p, tainted));
     }
     let n = s.total();
     let mut held = Vec::new();
@@ -183,7 +183,17 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
     for (cmd, what) in hints {
         let _ = write!(out, "\n        {}  {what}", p.bold(format!("agent {cmd:<width$} {id}")));
     }
+    out.push_str(&taint_note(p, tainted));
     out
+}
+
+/// Under the summary: this task read something it shouldn't trust, so look
+/// at what it did with that.
+fn taint_note(p: Paint, tainted: Option<&str>) -> String {
+    match tainted {
+        Some(what) => format!("\n        {}", p.yellow(format!("\u{26a0} it read untrusted input ({what}): read the diff and the held pushes with that in mind"))),
+        None => String::new(),
+    }
 }
 
 pub fn task_table(p: Paint, tasks: &[Task]) -> String {
@@ -675,6 +685,15 @@ fn describe(p: Paint, e: &Event) -> String {
                 _ => p.yellow("you denied it"),
             };
             format!("{} asked to {what} · \u{201c}{}\u{201d} · {answer}", p.cyan("?"), truncate(&s(&d["reason"]), 80))
+        }
+        "taint.marked" => {
+            let what = match s(&d["source"]).as_str() {
+                "web" => "reached",
+                "tool" => "read results from",
+                _ => "read",
+            };
+            let first = if d["first"] == true { " · from now on it's asked before tool calls that change things" } else { "" };
+            p.yellow(format!("tainted: {what} {}{first}", s(&d["detail"])))
         }
         "mcp.start" => format!("started your MCP server {} ({})", s(&d["server"]), s(&d["command"])),
         "mcp.call" => {

@@ -160,6 +160,7 @@
         : q.reason ? "The agent asks to reach" : "The agent wants to reach";
       const held = kind === "write" ? `<div class="meta">Its changes there are held for your review, like the rest.</div>` : "";
       const why = !q.reason ? "" : kind === "tool" ? `<pre>${esc(q.reason)}</pre>` : `<div class="reason">\u201c${esc(q.reason)}\u201d</div>`;
+      const taint = q.taint ? `<div class="meta" style="color:var(--warn)">\u26a0 This task has read untrusted input: ${esc(q.taint)}</div>` : "";
       const always = kind === "host" || kind === "tool" ? `<button data-q="${q.id}" data-d="always">Always in ${esc(project)}</button>` : "";
       const allow = kind === "tool"
         ? `<button class="primary" data-q="${q.id}" data-d="call">Allow this call</button><button data-q="${q.id}" data-d="once">For this task</button>`
@@ -167,7 +168,7 @@
       return `<div class="card ask">
         <div class="meta">${esc(q.title)} · ${ago(q.asked_ms)}</div>
         <div class="what">${what} <strong>${esc(q.target)}</strong></div>
-        ${why}${held}
+        ${why}${taint}${held}
         <div class="row">
           ${allow}
           ${always}

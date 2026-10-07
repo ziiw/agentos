@@ -27,9 +27,16 @@
 //! - resources `Host::"pypi.org"` {name, port}, `Path::"/home/you/code/lib"`
 //!   {path}, `Tool::"github.create_issue"` {server, name};
 //! - context {agent, task, project, reason (the agent's own words, when it
-//!   asked), args (a tool call's arguments)}.
+//!   asked), args (a tool call's arguments), tainted (the task has read
+//!   untrusted input), taint (which kinds: "web", "tool", "file")}.
 //!
 //! `"~/…"` in a string means your home folder.
+//!
+//! ```cedar
+//! @id("no uploads after reading the web")
+//! forbid (principal, action == Action::"call", resource)
+//! when { context.tainted && context.taint.contains("web") && resource.name like "upload*" };
+//! ```
 //!
 //! A project can ship rules too, in `.agentos.cedar` at its root. They can
 //! only forbid, so they apply to every task there without your review (a
@@ -41,6 +48,9 @@ use cedar_policy::{Authorizer, Context, Decision, Effect, Entities, EntityId, En
 use serde_json::{Map, Value, json};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
+
+use crate::taint::Taint;
 
 /// Next to your config.toml.
 pub const FILE: &str = "policy.cedar";
@@ -127,6 +137,7 @@ pub struct Policy {
     agent: String,
     task: String,
     project: String,
+    taint: Option<Arc<Taint>>,
 }
 
 /// Your rules, if you wrote any. A file that doesn't parse is an error, not
@@ -226,7 +237,22 @@ fn cedar_json(v: &Value) -> Option<Value> {
 
 impl Policy {
     pub fn new(set: PolicySet, agent: &str, task: &str, project: &Path) -> Policy {
-        Policy { set, agent: agent.to_string(), task: task.to_string(), project: project.display().to_string() }
+        Policy { set, agent: agent.to_string(), task: task.to_string(), project: project.display().to_string(), taint: None }
+    }
+
+    /// Rules that see what the task has read: `context.tainted` and `context.taint`.
+    pub fn with_taint(mut self, taint: Arc<Taint>) -> Policy {
+        self.taint = Some(taint);
+        self
+    }
+
+    /// Pretends the task has read these kinds of input (`agent policy check --tainted`).
+    pub fn pretend_tainted(self, sources: &[crate::taint::Source]) -> Policy {
+        let taint = Arc::new(Taint::new(None, Vec::new()));
+        for s in sources {
+            taint.mark(*s, "(assumed)");
+        }
+        self.with_taint(taint)
     }
 
     pub fn decide(&self, q: &Question) -> Verdict {
@@ -242,6 +268,9 @@ impl Policy {
         if let Some(r) = &q.reason {
             context.insert("reason".into(), json!(r));
         }
+        let kinds = self.taint.as_ref().map(|t| t.sources()).unwrap_or_default();
+        context.insert("tainted".into(), json!(!kinds.is_empty()));
+        context.insert("taint".into(), json!(kinds));
         if let Some(args) = q.args.as_ref().and_then(cedar_json) {
             context.insert("args".into(), args);
         }
@@ -315,6 +344,32 @@ mod tests {
         assert_eq!(call(json!({})), Verdict::Undecided, "a rule that can't be evaluated doesn't match");
         assert_eq!(rules(&p.set).len(), 5);
         assert_eq!(rules(&p.set)[1], ("rule 2".to_string(), "forbid"));
+    }
+
+    #[test]
+    fn rules_see_taint() {
+        use crate::taint::Source;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE);
+        std::fs::write(
+            &file,
+            r#"
+            @id("clean tasks may file issues")
+            permit (principal, action == Action::"call", resource == Tool::"github.create_issue") when { !context.tainted };
+            @id("no web then upload")
+            forbid (principal, action == Action::"call", resource) when { context.taint.contains("web") && resource.name like "upload*" };
+            "#,
+        )
+        .unwrap();
+        let set = || load(&file, Path::new("/h")).unwrap().unwrap();
+        let q = Question::call("github", "create_issue", &json!({}));
+        let clean = Policy::new(set(), "claude", "t", Path::new("/p"));
+        assert_eq!(clean.decide(&q), Verdict::Permit("clean tasks may file issues".into()));
+        let web = Policy::new(set(), "claude", "t", Path::new("/p")).pretend_tainted(&[Source::Web]);
+        assert_eq!(web.decide(&q), Verdict::Undecided, "tainted: the permit no longer matches");
+        assert_eq!(web.decide(&Question::call("drive", "upload_file", &json!({}))), Verdict::Forbid("no web then upload".into()));
+        let tool = Policy::new(set(), "claude", "t", Path::new("/p")).pretend_tainted(&[Source::Tool]);
+        assert_eq!(tool.decide(&Question::call("drive", "upload_file", &json!({}))), Verdict::Undecided);
     }
 
     #[test]

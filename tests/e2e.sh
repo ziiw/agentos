@@ -700,6 +700,7 @@ else
   cat > "$CFG" <<TOML
 [mcp.tracker]
 url = "$R/mcp"
+taint = false
 tools = { create_issue = "allow" }
 
 [mcp.bot]
@@ -733,6 +734,9 @@ TOML
   out="$(TRACKER_TOKEN=static-secret rc run -- sh -c 'echo "token: ${TRACKER_TOKEN:-unset}"; python3 ./mcp-client bot tools/list "tools/call:whoami:{}"' 2>&1 </dev/null)"
   check "a token from your environment works too" grep -q 'whoami: signed in as bot' <<<"$out"
   check "...and stays out of the sandbox" grep -q 'token: unset' <<<"$out"
+  sed -i '/^taint = false/d' "$CFG"
+  out="$(rc run -- python3 ./mcp-client tracker tools/list 'tools/call:whoami:{}' 'tools/call:create_issue:{"title":"after reading"}' 2>&1 </dev/null)"
+  check "a remote server's results taint the task by default: the allowed call is asked about" grep -q 'create_issue: agentos: .*nobody can be asked' <<<"$out"
   check "agent connect --forget forgets the sign-in" grep -q 'forgot your sign-in to tracker' <<<"$(rc connect tracker --forget)"
   check "...for good" test ! -e "$AGENTOS_HOME/vault/mcp-tracker.json"
   kill $REMOTE_PID 2>/dev/null; wait $REMOTE_PID 2>/dev/null
@@ -811,6 +815,86 @@ check "...rather than being skipped" test "$(run_rules run -- true >/dev/null 2>
 rm -f "$RULES" rules.sh mcp-client
 unset NOTES_FILE
 : > "$CFG"
+
+section "taint: a task that has read untrusted input is asked before it acts"
+if ! command -v python3 >/dev/null; then
+  skip "the stand-in MCP server needs python3"
+else
+  reset_proj
+  cd "$PROJ"
+  cp "$HERE/mcp-client" ./mcp-client
+  export NOTES_FILE="$WORK/taint-notes.txt"
+  : > "$NOTES_FILE"
+  cat > "$CFG" <<TOML
+[mcp.notes]
+command = ["python3", "$HERE/fake-mcp-server"]
+env = ["NOTES_FILE"]
+taint = true
+tools = { post_note = "allow" }
+
+[taint]
+trusted = ["example.org"]
+TOML
+  tt() { AGENTOS_CONFIG="$CFG" "$AGENT" "$@"; }
+  CALLS=(tools/list 'tools/call:post_note:{"text":"before"}' 'tools/call:read_note:{}' 'tools/call:post_note:{"text":"after"}')
+  out="$(tt run -- python3 ./mcp-client notes "${CALLS[@]}" 2>&1 </dev/null)"
+  events="$(latest_task_dir)/events.jsonl"
+  check "before it reads anything, your config's allow applies" grep -qx before "$NOTES_FILE"
+  check "a read-only tool still runs" grep -q 'read_note: notes:' <<<"$out"
+  check "reading a result from an outside server taints the task" grep -q '"kind":"taint.marked".*"detail":"notes","first":true,"source":"tool"' "$events"
+  check "...and then the allowed tool that changes things is asked about" grep -q 'post_note: agentos: .*nobody can be asked' <<<"$out"
+  check "...so it didn't happen" lacks after "$(cat "$NOTES_FILE")"
+  check "the summary says what the task read" grep -q 'it read untrusted input (tool results (notes))' <<<"$out"
+  check "agent log shows the taint" grep -q 'tainted: read results from notes' <<<"$("$AGENT" log)"
+
+  # The same calls, with the server marked as trusted.
+  : > "$NOTES_FILE"
+  sed -i 's/^taint = true/taint = false/' "$CFG"
+  out="$(tt run -- python3 ./mcp-client notes "${CALLS[@]}" 2>&1 </dev/null)"
+  check "a server you say is trusted doesn't taint" lacks '"kind":"taint.marked"' "$(cat "$(latest_task_dir)/events.jsonl")"
+  check "...so everything your config allows goes through" test "$(grep -c . "$NOTES_FILE")" = 2
+
+  # Rules see taint; one that permits wins over the default.
+  : > "$NOTES_FILE"
+  sed -i 's/^taint = false/taint = true/' "$CFG"
+  RULES="$(dirname "$CFG")/policy.cedar"
+  cat > "$RULES" <<'CEDAR'
+@id("notes are fine")
+permit (principal, action == Action::"call", resource == Tool::"notes.post_note");
+@id("clean tasks only")
+permit (principal, action == Action::"read", resource) when { !context.tainted && resource.path like "/nowhere/*" };
+@id("nothing after the web")
+forbid (principal, action == Action::"connect", resource == Host::"example.net") when { context.tainted && context.taint.contains("web") };
+CEDAR
+  check "agent policy check --tainted: a rule that permits a tool still does" grep -q 'permitted by “notes are fine”' <<<"$(tt policy check call notes.post_note --tainted tool)"
+  check "...rules can ask whether the task is clean" grep -q 'no rule matches' <<<"$(tt policy check read /nowhere/x --tainted file)"
+  check "...and which kind of input it read" grep -q 'forbidden by your rule “nothing after the web”' <<<"$(tt policy check connect example.net --tainted web)"
+  check "...a clean task isn't affected" grep -q 'no rule matches' <<<"$(tt policy check connect example.net)"
+  check "an unknown kind is refused" bash -c "! AGENTOS_CONFIG='$CFG' '$AGENT' policy check connect x.org --tainted cookies 2>/dev/null"
+  out="$(tt run -- python3 ./mcp-client notes "${CALLS[@]}" 2>&1 </dev/null)"
+  check "a rule of yours permits the call even when tainted" test "$(grep -c . "$NOTES_FILE")" = 2
+
+  # Web and files.
+  rm -f "$RULES"
+  tt run --allow example.org --allow pypi.org -- sh -c 'curl -sS -m 20 -o /dev/null https://example.org; curl -sS -m 20 -o /dev/null https://pypi.org/simple/' >/dev/null 2>&1 </dev/null
+  check "hosts you trust and package registries don't taint" lacks '"kind":"taint.marked"' "$(cat "$(latest_task_dir)/events.jsonl")"
+  out="$(tt run --allow example.com -- sh -c 'curl -sS -m 20 -o /dev/null https://example.com' 2>&1 </dev/null)"
+  events="$(latest_task_dir)/events.jsonl"
+  check "reaching any other host taints the task" grep -q '"kind":"taint.marked".*"detail":"example.com".*"source":"web"' "$events"
+  check "...and the summary says so" grep -q 'it read untrusted input (web pages (example.com))' <<<"$out"
+  mkdir -p "$ASKED/taint-read" && echo hi > "$ASKED/taint-read/file"
+  printf '@id("read what we asked")\npermit (principal, action == Action::"read", resource) when { resource.path like "%s/taint-*" };\n' "$ASKED" > "$RULES"
+  tt run -- sh -c "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"request_path_access\",\"arguments\":{\"path\":\"$ASKED/taint-read\",\"access\":\"read\",\"reason\":\"r\"}}}' | /run/agentos/agent mcp" >/dev/null 2>&1 </dev/null
+  check "a folder outside the project, granted mid-task, taints it" grep -q '"kind":"taint.marked".*"source":"file"' "$(latest_task_dir)/events.jsonl"
+  rm -f "$RULES"
+
+  # A project can't decide what you trust.
+  printf '[taint]\ntrusted = ["evil.example"]\n' > .agentos.toml
+  check "[taint] in a project's config is refused" grep -q 'only belongs in your own config' <<<"$(tt trust 2>&1 </dev/null)"
+  rm -f .agentos.toml mcp-client
+  unset NOTES_FILE
+  : > "$CFG"
+fi
 
 section "project rules (.agentos.cedar): they can only forbid"
 reset_proj

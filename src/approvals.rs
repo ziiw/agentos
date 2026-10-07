@@ -168,12 +168,14 @@ pub struct Request {
     pub kind: Kind,
     pub target: String,
     pub reason: Option<String>,
+    /// What the task has read that it shouldn't trust, when that's why you're asked.
+    pub taint: Option<String>,
 }
 
 impl Request {
     /// A connection the agent attempted.
     pub fn host(host: &str, port: u16) -> Request {
-        Request { kind: Kind::Host, target: entry(host, port), reason: None }
+        Request { kind: Kind::Host, target: entry(host, port), reason: None, taint: None }
     }
 
     fn key(&self) -> String {
@@ -213,6 +215,9 @@ pub struct Question {
     /// The agent's own words, when it asked on purpose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// What the task has read that it shouldn't trust, when that's why you're asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<String>,
     pub project: PathBuf,
     pub asked_ms: u64,
     /// For a budget: what to raise it to, as offered (first is [y]).
@@ -369,7 +374,18 @@ impl Asker {
         let key = req.key();
         // Nobody answered last time: an agent asking again gets asked again.
         // ("This call" answers aren't kept at all.)
-        let cached = || self.answers.lock().ok().and_then(|a| a.get(&key).copied()).filter(|d| *d != Decision::Timeout);
+        // A yes given before the task read untrusted input doesn't carry over
+        // to after; a no does.
+        let tainted_key = format!("{key}!tainted");
+        let cached = || {
+            let answers = self.answers.lock().ok()?;
+            let earlier = answers.get(&key).copied();
+            let answer = match (&req.taint, earlier) {
+                (Some(_), Some(d)) if d.allows() => answers.get(&tainted_key).copied(),
+                _ => earlier,
+            };
+            answer.filter(|d| *d != Decision::Timeout)
+        };
         if let Some(d) = cached() {
             return (d, false);
         }
@@ -393,6 +409,10 @@ impl Asker {
             (_, None) => String::new(),
             (Kind::Tool, Some(args)) => format!("\n  with: {args}"),
             (_, Some(r)) => format!("\n  its reason: \u{201c}{r}\u{201d}"),
+        };
+        let why = match &req.taint {
+            Some(t) => format!("{why}\n  {}", paint(&format!("\u{26a0} this task has read untrusted input: {t}"))),
+            None => why,
         };
         let project = display_path(&self.project);
         let options = match req.kind {
@@ -429,6 +449,9 @@ impl Asker {
             }
         }
         if let (Ok(mut answers), false) = (self.answers.lock(), decision == Decision::Call) {
+            if req.taint.is_some() {
+                answers.insert(tainted_key, decision);
+            }
             answers.insert(key, decision);
         }
         (decision, true)
@@ -488,6 +511,7 @@ impl Asker {
                 kind: req.kind,
                 target: req.target.clone(),
                 reason: req.reason.clone(),
+                taint: req.taint.clone(),
                 project: self.project.clone(),
                 asked_ms: crate::util::now_ms(),
                 offers,

@@ -283,7 +283,7 @@ What a rule sees:
 | principal | `Agent::"claude"` (the agent's name; `Agent::"command"` for `agent run`) |
 | actions | `Action::"connect"`, `"read"` and `"write"` (folders asked for mid-task), `"call"` (your MCP servers' tools) |
 | resources | `Host::"pypi.org"` {name, port}, `Path::"/home/you/code/lib"` {path}, `Tool::"github.create_issue"` {server, name} |
-| context | `agent`, `task`, `project`, `reason` (the agent's own words, when it asked), `args` (a tool call's arguments) |
+| context | `agent`, `task`, `project`, `reason` (the agent's own words, when it asked), `args` (a tool call's arguments), `tainted` and `taint` (see Taint, below) |
 
 **A project can ship rules too**, in `.agentos.cedar` at its root, for anyone who runs agents there:
 
@@ -296,6 +296,28 @@ when { resource.name like "*.prod.example.com" };
 Project rules can only forbid, so they apply without review, and they beat your own `permit` and `--allow`. A project file with a `permit` in it, or one that doesn't parse, stops the task: a protection the project asked for is never silently dropped. An agent can't loosen them for itself: rules are read when the task starts, and `agent diff` flags any change it makes to the file.
 
 `"~/…"` in a string means your home. `agent policy` lists your rules and the project's, and `agent policy check read ~/code/lib` (or `connect pypi.org`, or `call github.create_issue --args '{"repo":"x"}'`) tells you what they'd say. Every decision a rule makes is journaled with the rule's name. A rules file that doesn't parse stops tasks rather than being skipped, and agents can never be granted it.
+
+## Taint: what it read changes what it may do
+
+An agent can be steered by any text it reads: a web page, an issue, a file it was never meant to trust. So agentos tracks whether a task has read something like that, and treats a task that has differently. A task is **tainted** once it:
+
+- reaches a host that isn't one of its own model APIs, a host of a credential you gave it, a package registry (PyPI, npm, crates.io, Go), or one you list under `[taint] trusted = ["git.corp.example", "*.docs.example"]` in your config (never a project's);
+- reads a result from an MCP server that reaches outside your machine: every remote server (`url = …`), and a local one only if you say `taint = true` (`taint = false` trusts a remote one);
+- is allowed, mid-task, to read a folder outside its project.
+
+Taint stays for the rest of the task. From then on, **a tool call that isn't read-only is asked about every time**, with what the task read shown in the question, even if your config says `allow` or you answered "always" before. Read-only tools still run. Only a rule of yours that permits the call lets it through silently, and your rules can see the taint:
+
+```cedar
+@id("no uploads once it has read the web")
+forbid (principal, action == Action::"call", resource)
+when { context.taint.contains("web") && resource.name like "upload*" };
+
+@id("clean tasks may file issues")
+permit (principal, action == Action::"call", resource == Tool::"github.create_issue")
+when { !context.tainted };
+```
+
+`agent policy check call github.create_issue --tainted web` asks what they'd say. The journal records each source (`taint.marked`), and the summary at the end of a tainted task says what it read, so you review its diff and held pushes with that in mind. A server's own `readOnlyHint` is still believed; it's the server's word, so give `taint = true` only to servers you'd believe it from.
 
 ## Budgets
 
@@ -481,6 +503,7 @@ src/control.rs   the agent's requests from inside (control socket), and what may
 src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway to yours
 src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refresh
 src/policy.rs    your rules (Cedar): answers given in advance
+src/taint.rs     whether a task has read untrusted input
 src/main.rs      CLI          src/render.rs   output
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run

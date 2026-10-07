@@ -38,6 +38,9 @@
 //! url = "https://mcp.linear.app/mcp"      # never the sandbox; `agent connect linear`
 //!                                         # signs in (or: token = "ENV_VAR")
 //!
+//! [taint]                                 # your file only: hosts whose content doesn't make
+//! trusted = ["git.corp.example", "*.docs.example"] # a task "tainted" (registries and model APIs already don't)
+//!
 //! [console]                               # your file only: where agentd's console can
 //! projects = ["~/code/app"]               # start tasks (besides folders you've used)
 //!
@@ -76,6 +79,15 @@ struct ConfigFile {
     mcp: BTreeMap<String, crate::mcp::Server>,
     #[serde(default)]
     console: Console,
+    #[serde(default)]
+    taint: TaintSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaintSection {
+    #[serde(default)]
+    trusted: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -142,6 +154,8 @@ pub struct Settings {
     pub prices: Vec<(String, Price)>,
     /// Your MCP servers, run by agentos outside the sandbox.
     pub mcp: Vec<crate::mcp::Server>,
+    /// Hosts that don't taint a task, besides the built-in ones.
+    pub taint_trusted: Vec<String>,
     /// Folders agentd's console can start tasks in (besides those you've used).
     pub projects: Vec<PathBuf>,
     /// Default agent for `agent do` (a project's overrides yours).
@@ -272,6 +286,17 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
     if project.is_some() && !file.prices.is_empty() {
         bail!("{shown}: [prices] only belongs in your own config, never in a project's");
     }
+    // A cloned repo must never decide what your tasks trust.
+    if project.is_some() && !file.taint.trusted.is_empty() {
+        bail!("{shown}: [taint] only belongs in your own config, never in a project's");
+    }
+    for host in &file.taint.trusted {
+        let name = host.strip_prefix("*.").unwrap_or(host);
+        if name.is_empty() || name.contains(['*', '/', ':', ' ', '@']) {
+            bail!("{shown}: [taint] trusted: {host:?} isn't a host name (or *.suffix)");
+        }
+    }
+    s.taint_trusted.extend(file.taint.trusted.iter().map(|h| h.to_ascii_lowercase()));
     if project.is_some() && !file.console.projects.is_empty() {
         bail!("{shown}: [console] only belongs in your own config, never in a project's");
     }

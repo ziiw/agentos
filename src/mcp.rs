@@ -157,6 +157,11 @@ pub struct Server {
     /// token. Without one, `agent connect NAME` signs in (OAuth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Whether what this server returns is untrusted input (a task that
+    /// reads it is "tainted"). Default: yes for a remote server, no for one
+    /// agentos runs on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint: Option<bool>,
     /// Per tool. Without an entry: allowed when the server marks the tool
     /// read-only, asked otherwise.
     #[serde(default)]
@@ -172,6 +177,11 @@ pub enum Policy {
 }
 
 impl Server {
+    /// Whether its results taint a task.
+    pub fn taints(&self) -> bool {
+        self.taint.unwrap_or(self.url.is_some())
+    }
+
     pub fn validate(&self) -> Result<()> {
         let name = &self.name;
         if name.is_empty() || name == "agentos" || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
@@ -292,6 +302,8 @@ pub struct Gateway {
     pub say: Arc<dyn Fn(String) + Send + Sync>,
     /// The task store: sign-ins to remote servers are in its vault.
     pub store_root: PathBuf,
+    /// What the task has read that it shouldn't trust.
+    pub taint: Arc<crate::taint::Taint>,
     children: Mutex<Vec<u32>>,
 }
 
@@ -520,8 +532,9 @@ impl Gateway {
         journal: Journal,
         say: Arc<dyn Fn(String) + Send + Sync>,
         store_root: PathBuf,
+        taint: Arc<crate::taint::Taint>,
     ) -> Gateway {
-        Gateway { servers, cwd, log_dir, ask, rules, remembered, journal, say, store_root, children: Mutex::new(Vec::new()) }
+        Gateway { servers, cwd, log_dir, ask, rules, remembered, journal, say, store_root, taint, children: Mutex::new(Vec::new()) }
     }
 
     /// Ends the servers still running (the task is over).
@@ -651,6 +664,11 @@ impl Gateway {
         let Ok(mut msg) = serde_json::from_str::<Value>(&line) else { return line };
         let (Some(id), None) = (msg.get("id").map(|i| i.to_string()), msg.get("method")) else { return line };
         let Ok(mut s) = session.lock() else { return line };
+        // Content from a server that reaches outside your machine is input
+        // the task shouldn't trust (not the tool list, nor a handshake).
+        if server.taints() && !s.listing.contains(&id) && ["content", "contents", "messages"].iter().any(|k| msg["result"].get(k).is_some()) {
+            self.taint.mark(crate::taint::Source::Tool, &server.name);
+        }
         if s.listing.remove(&id) {
             if let Some(tools) = msg["result"]["tools"].as_array_mut() {
                 tools.retain(|t| {
@@ -745,6 +763,10 @@ impl Gateway {
                     (None, _) if read_only || self.remembered.contains(&target) => Policy::Allow,
                     (None, _) => Policy::Ask,
                 };
+                // A task that has read untrusted input is asked before anything
+                // that isn't read-only, whatever your config or an earlier
+                // "always" said. Only a rule of yours permits it silently.
+                let policy = if policy == Policy::Allow && !read_only && self.taint.is_tainted() { Policy::Ask } else { policy };
                 match policy {
                     Policy::Allow if read_only => forward("read-only", None),
                     Policy::Allow => forward("allowed", None),
@@ -753,7 +775,7 @@ impl Gateway {
                         // Asking can take a while; other messages keep flowing.
                         let (gw, server, session, to_server, to_agent) = (self.clone(), server.clone(), session.clone(), to_server.clone(), to_agent.clone());
                         std::thread::spawn(move || {
-                            let req = Request { kind: Kind::Tool, target: target.clone(), reason: Some(summary(&args, 300)) };
+                            let req = Request { kind: Kind::Tool, target: target.clone(), reason: Some(summary(&args, 300)), taint: gw.taint.describe() };
                             match (gw.ask)(&req) {
                                 Some(d) if d.allows() => {
                                     if let Ok(mut s) = session.lock() {
