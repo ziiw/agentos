@@ -82,7 +82,7 @@ scripts/dev.sh shell
 | `agent logs [TASK] [-f]` / `wait` / `stop` | Follow, wait for, or stop a (background) task |
 | `agent diff [TASK] [PATH…] [--stat]` | Show what a task changed |
 | `agent commit [TASK] [PATH…] [--force] [--no-push]` | Apply changes to your files (all, or under PATHs) and send held git pushes |
-| `agent push [TASK] [--force]` | Send only the held git pushes |
+| `agent push [TASK] [--force]` | Send only what's held: git pushes and tool calls |
 | `agent rollback [TASK] [PATH…]` | Discard changes (all, or under PATHs) |
 | `agent log [TASK] [--json]` | Show the journal and verify its hash chain |
 | `agent doctor` | Check this machine |
@@ -228,8 +228,10 @@ Claude gets it automatically, as `github`; other agents reach it inside the sand
 
 - tools the server marks read-only run directly;
 - any other tool asks you first, showing the call's arguments: allow this call, allow it for the rest of the task, always in this project, or deny;
-- `tools` sets a tool to `allow`, `ask` or `deny`; denied tools aren't even listed to the agent;
+- `tools` sets a tool to `allow`, `ask`, `hold` or `deny` (see below); denied tools aren't even listed to the agent;
 - every call is journaled: the tool, its arguments, how it was allowed, and whether it failed.
+
+**Hold calls for review, instead of approving them one by one.** A call that changes things but whose result the agent doesn't need (create an issue, post a message) can be *held*: `tools = { create_issue = "hold" }`, or `hold = true` on a server to hold all its tools that aren't read-only, or `[h]` when you're asked. The agent is told it's queued and that it hasn't happened. Nothing runs, and a tainted task isn't asked either. `agent diff` lists the held calls with their arguments, next to the files and git pushes; `agent commit` runs them in order, from outside the sandbox with your credentials, and `agent rollback` drops them. A call that fails stays held (`agent push` retries). Hold only tools whose result the agent can do without: it can't see what a held call returns.
 
 Only your own config can declare servers: a project's `.agentos.toml` can't make agentos run anything on your machine. A server runs as you, with your access; agentos governs the calls the agent makes, not what the server can reach.
 

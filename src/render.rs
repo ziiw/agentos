@@ -144,7 +144,7 @@ fn net_label(net: &Net, allow: &[String]) -> String {
     }
 }
 
-pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome: Option<&AgentEvent>, blocked: usize, tainted: Option<&str>) -> String {
+pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome: Option<&AgentEvent>, blocked: usize, tainted: Option<&str>, calls: &[agentos::held::Held]) -> String {
     let id = task.id();
     let took = util::duration(task.meta.ended_at_ms.unwrap_or(0).saturating_sub(task.meta.started_at_ms));
     let mut head = format!("{} task {} exited {} in {took}", p.cyan("agent ▸"), p.bold(id), task.meta.exit_code.unwrap_or(-1));
@@ -164,7 +164,7 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
         let _ = write!(head, " · {}", p.yellow(format!("{blocked} connection{} blocked", if blocked == 1 { "" } else { "s" })));
     }
     let ignored = if s.ignored > 0 { p.dim(format!(" · {} ignored", s.ignored)) } else { String::new() };
-    if s.total() == 0 && s.git == 0 && pushes.is_empty() {
+    if s.total() == 0 && s.git == 0 && pushes.is_empty() && calls.is_empty() {
         return format!("{head} · no changes{ignored}{}", taint_note(p, tainted));
     }
     let n = s.total();
@@ -175,6 +175,11 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
     if !pushes.is_empty() {
         let targets: Vec<String> = pushes.iter().map(|x| format!("{} {}", x.remote, x.short_ref())).collect();
         let what = if pushes.len() == 1 { "1 git push".to_string() } else { format!("{} git pushes", pushes.len()) };
+        held.push(format!("{what} ({})", targets.join(", ")));
+    }
+    if !calls.is_empty() {
+        let targets: Vec<String> = calls.iter().map(|c| c.target()).collect();
+        let what = if calls.len() == 1 { "1 tool call".to_string() } else { format!("{} tool calls", calls.len()) };
         held.push(format!("{what} ({})", targets.join(", ")));
     }
     let mut out = format!("{head} · {} held for review{ignored}", held.join(" and "));
@@ -208,6 +213,12 @@ pub fn task_table(p: Paint, tasks: &[Task]) -> String {
             Some(s) => (summary_short(p, s), summary_short(Paint(false), s).chars().count()),
             None => (p.dim("-"), 1),
         };
+        let calls = if t.is_open() { agentos::held::pending(&t.dir).map(|v| v.len()).unwrap_or(0) } else { 0 };
+        if calls > 0 {
+            let extra = format!(" \u{23f8}{calls}");
+            visible_changes += extra.chars().count();
+            changes.push_str(&p.cyan(extra));
+        }
         if pushes > 0 {
             let extra = format!(" ↑{pushes}");
             visible_changes += extra.chars().count();
@@ -318,7 +329,7 @@ pub fn ignored_summary(changes: &[Change]) -> String {
     format!("{n} ignored change{}: {}{more}", if n == 1 { "" } else { "s" }, roots.iter().take(3).cloned().collect::<Vec<_>>().join(", "))
 }
 
-pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], stat_only: bool, show_ignored: bool) -> String {
+pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], calls: &[agentos::held::Held], stat_only: bool, show_ignored: bool) -> String {
     let mut out = String::new();
     let state = if task.is_live() { p.cyan("running") } else { p.dim(task.status_label()) };
     let _ = writeln!(
@@ -333,7 +344,7 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], stat
     let shown: Vec<&Change> = changes.iter().filter(|c| show_ignored || (!c.ignored && !c.git)).collect();
     let git_files = if show_ignored { 0 } else { changes.iter().filter(|c| c.git && !c.ignored).count() };
     let hidden = changes.iter().filter(|c| c.ignored).count() - shown.iter().filter(|c| c.ignored).count();
-    if shown.is_empty() && pushes.is_empty() && git_files == 0 {
+    if shown.is_empty() && pushes.is_empty() && calls.is_empty() && git_files == 0 {
         let _ = writeln!(out, "{}", p.dim("no pending changes"));
     } else if !shown.is_empty() {
         let width = shown.iter().map(|c| change_path(c).chars().count()).max().unwrap_or(0).min(70);
@@ -381,6 +392,12 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], stat
                 truncate(&h.subject, 60),
                 p.dim(count)
             );
+        }
+    }
+    if !calls.is_empty() {
+        let _ = writeln!(out, "\n  {}", p.bold("held tool calls (run by `agent commit` or `agent push`, with your credentials)"));
+        for h in calls {
+            let _ = writeln!(out, "  {}  {}  {}", p.cyan("\u{23f8}"), p.bold(h.target()), truncate(&h.args.to_string(), 100));
         }
     }
     if shown.iter().any(|c| c.path.file_name().is_some_and(|n| n == agentos::config::PROJECT_FILE)) {
@@ -704,6 +721,8 @@ fn describe(p: Paint, e: &Event) -> String {
                     let (who, name) = agentos::policy::whose(&rule);
                     p.yellow(format!("forbidden by {who} rule \u{201c}{name}\u{201d}"))
                 }
+                "held" => p.cyan("held for your review (runs when you commit)"),
+                "held by you" => p.cyan("you held it for review (runs when you commit)"),
                 "read-only" => p.dim("read-only"),
                 "allowed" => p.dim("allowed by your config"),
                 "call" => p.green("you allowed this call"),

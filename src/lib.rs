@@ -12,6 +12,7 @@ pub mod config;
 pub mod control;
 pub mod doctor;
 pub mod gateway;
+pub mod held;
 pub mod journal;
 pub mod limits;
 pub mod mcp;

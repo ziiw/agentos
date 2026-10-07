@@ -1266,6 +1266,11 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         let held: Vec<_> = pushes.iter().map(|p| json!({ "remote": p.remote, "ref": p.refname, "sha": p.sha })).collect();
         journal.append("outbox.held", json!({ "pushes": held }))?;
     }
+    let calls = agentos::held::pending(&task.dir)?;
+    if !calls.is_empty() {
+        let held: Vec<_> = calls.iter().map(|c| json!({ "call": c.target(), "seq": c.seq })).collect();
+        journal.append("outbox.held_calls", json!({ "calls": held }))?;
+    }
     let summary = Summary::of(&changes::scan(&task.layers())?);
     let ended = util::now_ms();
     let oom = if limits::current().is_some() { limits::oom_kills() } else { 0 };
@@ -1307,7 +1312,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     if let Some(e) = setup_error {
         bail!("sandbox setup failed: {e}\n(run `agent doctor` to check this machine)");
     }
-    eprintln!("{}", render::exit_summary(err, &task, &summary, &pushes, outcome.as_ref(), blocked.load(Ordering::SeqCst), taint.describe().as_deref()));
+    eprintln!("{}", render::exit_summary(err, &task, &summary, &pushes, outcome.as_ref(), blocked.load(Ordering::SeqCst), taint.describe().as_deref(), &calls));
     Ok(exit_code)
 }
 
@@ -2172,7 +2177,8 @@ fn cmd_diff(store: &Store, selector: Option<&str>, paths: &[PathBuf], stat: bool
     let task = store.resolve(selector)?;
     let changes = changes::select(changes::scan(&task.layers())?, &absolutize_all(paths)?);
     let pushes = if paths.is_empty() { held_pushes(&task)? } else { Vec::new() };
-    print!("{}", render::diff(Paint::stdout(), &task, &changes, &pushes, stat, all));
+    let calls = if paths.is_empty() { agentos::held::pending(&task.dir)? } else { Vec::new() };
+    print!("{}", render::diff(Paint::stdout(), &task, &changes, &pushes, &calls, stat, all));
     Ok(0)
 }
 
@@ -2201,7 +2207,8 @@ fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: b
     };
     // Naming paths means files only; pushes go with a plain commit.
     let pushes = if paths.is_empty() && !no_push { outbox::pending(&task.dir)? } else { Vec::new() };
-    if selected.is_empty() && pushes.is_empty() {
+    let calls = if paths.is_empty() && !no_push { agentos::held::pending(&task.dir)? } else { Vec::new() };
+    if selected.is_empty() && pushes.is_empty() && calls.is_empty() {
         match skipped {
             0 => println!("nothing to commit"),
             n => println!("nothing to commit ({} ignored; `agent commit --all` includes them)", plural(n, "change")),
@@ -2227,7 +2234,8 @@ fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: b
         let pending = changes::scan(&layers)?.iter().filter(|c| !c.ignored).count();
         print!("{}", render::committed(Paint::stdout(), &task, &selected, pending));
     }
-    let failed = send_pushes(&task, &pushes, false)?;
+    let mut failed = send_pushes(&task, &pushes, false)?;
+    failed += send_calls(store, &task, &calls, failed > 0)?;
     finish_if_done(&mut task)?;
     Ok(if failed > 0 { 1 } else { 0 })
 }
@@ -2235,11 +2243,13 @@ fn cmd_commit(store: &Store, selector: Option<&str>, paths: &[PathBuf], force: b
 fn cmd_push(store: &Store, selector: Option<&str>, force: bool) -> Result<i32> {
     let mut task = open_task(store, selector)?;
     let pushes = outbox::pending(&task.dir)?;
-    if pushes.is_empty() {
+    let calls = agentos::held::pending(&task.dir)?;
+    if pushes.is_empty() && calls.is_empty() {
         println!("nothing to push");
         return Ok(0);
     }
-    let failed = send_pushes(&task, &pushes, force)?;
+    let mut failed = send_pushes(&task, &pushes, force)?;
+    failed += send_calls(store, &task, &calls, failed > 0)?;
     finish_if_done(&mut task)?;
     Ok(if failed > 0 { 1 } else { 0 })
 }
@@ -2277,17 +2287,66 @@ fn send_pushes(task: &Task, pushes: &[outbox::Push], force: bool) -> Result<usiz
     Ok(failed)
 }
 
+/// Runs held tool calls from outside the sandbox, in order, with your
+/// credentials. A call that fails stays held. `wait`: a push failed, so the
+/// calls (which may depend on it) wait too. Returns how many didn't run.
+fn send_calls(store: &Store, task: &Task, calls: &[agentos::held::Held], wait: bool) -> Result<usize> {
+    if calls.is_empty() {
+        return Ok(0);
+    }
+    let (out, err) = (Paint::stdout(), Paint::stderr());
+    if wait {
+        eprintln!("{} {} waiting for the failed push: `agent push {}` once it's sorted out", err.yellow("agent:"), plural(calls.len(), "held tool call"), task.id());
+        return Ok(calls.len());
+    }
+    let journal = task.journal();
+    let (cwd, home) = (task.meta.cwd.clone(), home_dir()?);
+    let servers = config::load(store.root(), &cwd, &home)?.mcp;
+    let tell: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text| eprintln!("{} {text}", Paint::stderr().yellow("agent: warning:")));
+    let taint = Arc::new(taint::Taint::new(None, Vec::new()));
+    let gateway = agentos::mcp::Gateway::new(servers, cwd, task.dir.clone(), Box::new(|_| None), None, Vec::new(), journal.clone(), tell, store.root().to_path_buf(), taint);
+    let mut failed = 0;
+    for c in calls {
+        let what = json!({ "server": c.server, "tool": c.tool, "arguments": approvals::sanitize(&c.args.to_string(), 1000), "seq": c.seq });
+        match gateway.release(&c.server, &c.tool, &c.args) {
+            Ok(r) if !r.is_error => {
+                agentos::held::remove(&task.dir, c.seq);
+                let mut what = what;
+                what["result"] = json!(approvals::sanitize(&r.text, 500));
+                journal.append("outbox.called", what)?;
+                println!("  {} ran {}: {}", out.green("\u{23f5}"), c.target(), render::first_line(&r.text, 80));
+            }
+            other => {
+                failed += 1;
+                let why = match other {
+                    Ok(r) => r.text,
+                    Err(e) => format!("{e:#}"),
+                };
+                let mut what = what;
+                what["error"] = json!(approvals::sanitize(&why, 500));
+                journal.append("outbox.call_failed", what)?;
+                eprintln!("  {} {}: {}", err.red("\u{2717} tool call"), c.target(), render::first_line(&why, 200));
+            }
+        }
+    }
+    gateway.stop_all();
+    if failed > 0 {
+        eprintln!("{} {} still held. Once you've sorted it out: `agent push {}`", err.yellow("agent:"), plural(failed, "tool call"), task.id());
+    }
+    Ok(failed)
+}
+
 /// Closes the task once nothing is left: no file changes (ignored ones are
 /// dropped) and no held pushes.
 fn finish_if_done(task: &mut Task) -> Result<()> {
     let files = changes::scan(&task.layers())?;
-    if files.iter().any(|c| !c.ignored) || !outbox::pending(&task.dir)?.is_empty() {
+    if files.iter().any(|c| !c.ignored) || !outbox::pending(&task.dir)?.is_empty() || !agentos::held::pending(&task.dir)?.is_empty() {
         return Ok(());
     }
     if !files.is_empty() {
         println!("{}", Paint::stdout().dim(format!("left out {}", render::ignored_summary(&files))));
     }
-    let applied = task.journal().read()?.iter().any(|e| e.kind == "commit" || e.kind == "outbox.pushed");
+    let applied = task.journal().read()?.iter().any(|e| e.kind == "commit" || e.kind == "outbox.pushed" || e.kind == "outbox.called");
     task.meta.status = if applied { Status::Committed } else { Status::Discarded };
     task.save()?;
     task.release_storage()
@@ -2302,11 +2361,19 @@ fn cmd_rollback(store: &Store, selector: Option<&str>, paths: &[PathBuf]) -> Res
     if paths.is_empty() {
         let pushes = outbox::pending(&task.dir)?;
         let held: Vec<_> = pushes.iter().map(|p| json!({ "remote": p.remote, "ref": p.refname, "sha": p.sha })).collect();
-        journal.append("rollback", json!({ "all": true, "changes": Summary::of(&pending), "pushes": held }))?;
-        let committed_before = journal.read()?.iter().any(|e| e.kind == "commit" || e.kind == "outbox.pushed");
+        let calls = agentos::held::pending(&task.dir)?;
+        let dropped: Vec<_> = calls.iter().map(|c| json!({ "call": c.target(), "arguments": approvals::sanitize(&c.args.to_string(), 300) })).collect();
+        journal.append("rollback", json!({ "all": true, "changes": Summary::of(&pending), "pushes": held, "calls": dropped }))?;
+        for c in &calls {
+            agentos::held::remove(&task.dir, c.seq);
+        }
+        let committed_before = journal.read()?.iter().any(|e| e.kind == "commit" || e.kind == "outbox.pushed" || e.kind == "outbox.called");
         let mut what = plural(counted(&pending), "change");
         if !pushes.is_empty() {
             what = format!("{what} and {}", plural(pushes.len(), "held push"));
+        }
+        if !calls.is_empty() {
+            what = format!("{what} and {}", plural(calls.len(), "held tool call"));
         }
         if committed_before {
             println!("rolled back the remaining {what} from task {}", task.id());

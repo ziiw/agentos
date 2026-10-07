@@ -27,6 +27,9 @@ pub enum Decision {
     /// This one tool call only (asked again next time).
     Call,
     Always,
+    /// Don't run this tool call now: hold it for review with the task's
+    /// other changes (tool calls only).
+    Hold,
     Deny,
     /// Nobody answered in time.
     Timeout,
@@ -42,6 +45,7 @@ impl Decision {
             Decision::Once => "once",
             Decision::Call => "call",
             Decision::Always => "always",
+            Decision::Hold => "hold",
             Decision::Deny => "deny",
             Decision::Timeout => "timeout",
         }
@@ -280,6 +284,7 @@ fn parse_decision(text: &str, kind: Kind) -> Decision {
     match (text.trim().to_ascii_lowercase().as_str(), kind) {
         ("y" | "yes" | "call", Kind::Tool) => Decision::Call,
         ("t" | "task" | "once", Kind::Tool) => Decision::Once,
+        ("h" | "hold", Kind::Tool) => Decision::Hold,
         ("y" | "yes" | "o" | "once" | "call", _) => Decision::Once,
         ("a" | "always", _) => Decision::Always,
         _ => Decision::Deny,
@@ -417,7 +422,7 @@ impl Asker {
         let project = display_path(&self.project);
         let options = match req.kind {
             Kind::Host => format!("[y] this task · [a] always, in {project} · [N] deny"),
-            Kind::Tool => format!("[y] this call · [t] this task · [a] always, in {project} · [N] deny"),
+            Kind::Tool => format!("[y] this call · [h] hold it for review · [t] this task · [a] always, in {project} · [N] deny"),
             Kind::Read | Kind::Write | Kind::Budget => "[y] this task · [N] deny".to_string(),
         };
         let prompt = format!("\n{} {what}{why}\n  {options}{elsewhere} › ", paint("agent ▸"));
@@ -448,7 +453,7 @@ impl Asker {
                 }
             }
         }
-        if let (Ok(mut answers), false) = (self.answers.lock(), decision == Decision::Call) {
+        if let (Ok(mut answers), false) = (self.answers.lock(), matches!(decision, Decision::Call | Decision::Hold)) {
             if req.taint.is_some() {
                 answers.insert(tainted_key, decision);
             }

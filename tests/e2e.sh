@@ -896,6 +896,104 @@ CEDAR
   : > "$CFG"
 fi
 
+section "held tool calls: the outbox for tools, released when you commit"
+if ! command -v python3 >/dev/null; then
+  skip "the stand-in MCP server needs python3"
+else
+  reset_proj
+  cd "$PROJ"
+  cp "$HERE/mcp-client" ./mcp-client
+  export NOTES_FILE="$WORK/held-notes.txt"
+  : > "$NOTES_FILE"
+  write_cfg() { cat > "$CFG" <<TOML
+[mcp.notes]
+command = ["python3", "$HERE/fake-mcp-server"]
+env = ["NOTES_FILE"]
+$1
+TOML
+  }
+  write_cfg 'tools = { post_note = "hold" }'
+  hh() { AGENTOS_CONFIG="$CFG" "$AGENT" "$@"; }
+  CALLS=(tools/list 'tools/call:post_note:{"text":"one"}' 'tools/call:read_note:{}' 'tools/call:post_note:{"text":"two"}')
+  out="$(hh run -- python3 ./mcp-client notes "${CALLS[@]}" 2>&1 </dev/null)"
+  events="$(latest_task_dir)/events.jsonl"
+  check "a held call isn't run: the agent is told it's queued" grep -q 'post_note: Queued, not done yet: notes.post_note is held for the user to review' <<<"$out"
+  check "...it has NOT happened" test ! -s "$NOTES_FILE"
+  check "read-only tools still run live" grep -q 'read_note: notes:' <<<"$out"
+  check "the summary lists what is held" grep -q '2 tool calls (notes.post_note, notes.post_note) held for review' <<<"$out"
+  check "each is journaled as held" test "$(grep -c '"decision":"held"' "$events")" = 2
+  d="$(hh diff 2>&1)"
+  check "agent diff shows them with their arguments" grep -q 'held tool calls' <<<"$d"
+  check "...in order" grep -q 'notes.post_note  {"text":"one"}' <<<"$d"
+  check "agent ls marks the task" grep -q '⏸2' <<<"$(hh ls)"
+  out="$(hh commit 2>&1)"
+  check "agent commit runs them, from outside the sandbox" grep -q 'ran notes.post_note: posted' <<<"$out"
+  check "...in the order they were made" test "$(tr '\n' ',' < "$NOTES_FILE")" = "one,two,"
+  check "...and the task is done" grep -q 'committed' <<<"$(hh ls)"
+  check "each run is journaled with its result" test "$(grep -c '"kind":"outbox.called"' "$(latest_task_dir)/events.jsonl")" = 2
+
+  # Rolling back drops them.
+  : > "$NOTES_FILE"
+  hh run -- python3 ./mcp-client notes tools/list 'tools/call:post_note:{"text":"never"}' >/dev/null 2>&1 </dev/null
+  out="$(hh rollback 2>&1)"
+  check "agent rollback drops held calls" grep -q '1 held tool call' <<<"$out"
+  check "...and they never run" test ! -s "$NOTES_FILE"
+  check "...it's journaled which" grep -q '"calls":\[{"arguments":"{\\"text\\":\\"never\\"}","call":"notes.post_note"' "$(latest_task_dir)/events.jsonl"
+
+  # A server can hold all its tools that change things.
+  write_cfg 'hold = true'
+  out="$(hh run -- python3 ./mcp-client notes tools/list 'tools/call:post_note:{"text":"x"}' 'tools/call:drop_notes:{}' 'tools/call:read_note:{}' 2>&1 </dev/null)"
+  check "hold = true holds every tool that isn't read-only" grep -q '2 tool calls (notes.post_note, notes.drop_notes) held for review' <<<"$out"
+  check "...and read-only ones still run" grep -q 'read_note: notes:' <<<"$out"
+  hh rollback >/dev/null 2>&1
+
+  # Held, a tainted task isn't asked: nothing goes out until you look.
+  write_cfg $'taint = true\ntools = { post_note = "allow", drop_notes = "hold" }'
+  out="$(hh run -- python3 ./mcp-client notes tools/list 'tools/call:read_note:{}' 'tools/call:drop_notes:{}' 'tools/call:post_note:{"text":"y"}' 2>&1 </dev/null)"
+  check "a tainted task's held call is held, not asked about" grep -q 'drop_notes: Queued, not done yet' <<<"$out"
+  check "...while its allowed one is asked about, as before" grep -q 'post_note: agentos: .*nobody can be asked' <<<"$out"
+  hh rollback >/dev/null 2>&1
+
+  # A call that fails when released stays held.
+  write_cfg 'tools = { post_note = "hold" }'
+  hh run -- python3 ./mcp-client notes tools/list 'tools/call:post_note:{"text":"later"}' >/dev/null 2>&1 </dev/null
+  cat > "$CFG" <<TOML
+[mcp.notes]
+command = ["no-such-server-0xdead"]
+TOML
+  out="$(hh commit 2>&1)"
+  check "a call that can't run says so" grep -q '✗ tool call.*notes.post_note' <<<"$out"
+  check "...and stays held, with the way to retry" grep -q '1 tool call still held. Once you.ve sorted it out: .agent push' <<<"$out"
+  check "...commit exits non-zero" test "$(hh commit >/dev/null 2>&1; echo $?)" != 0
+  write_cfg 'tools = { post_note = "hold" }'
+  out="$(hh push 2>&1)"
+  check "agent push runs what's still held" grep -q 'ran notes.post_note' <<<"$out"
+  check "...once" grep -qx later "$NOTES_FILE"
+
+  # [h] when you're asked.
+  write_cfg ''
+  start_agentd
+  ( for _ in $(seq 600); do
+      q="$(api "$CONSOLE/api/approvals")"
+      id="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$q")"
+      [ -n "$id" ] && api -X POST -d '{"decision":"hold"}' "$CONSOLE/api/approvals/$id" >/dev/null
+      sleep 0.1
+    done ) &
+  ANSWERER=$!
+  : > "$NOTES_FILE"
+  out="$(hh run --ask -- python3 ./mcp-client notes tools/list 'tools/call:post_note:{"text":"asked"}' 2>&1 </dev/null)"
+  kill $ANSWERER 2>/dev/null; wait $ANSWERER 2>/dev/null
+  kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+  check "answering [h] when asked holds the call" grep -q 'post_note: Queued, not done yet' <<<"$out"
+  check "...journaled as your choice" grep -q '"decision":"held by you"' "$(latest_task_dir)/events.jsonl"
+  check "...and nothing happened yet" test ! -s "$NOTES_FILE"
+  hh commit >/dev/null 2>&1
+  check "...until you commit" grep -qx asked "$NOTES_FILE"
+  rm -f mcp-client
+  unset NOTES_FILE
+  : > "$CFG"
+fi
+
 section "project rules (.agentos.cedar): they can only forbid"
 reset_proj
 cd "$PROJ"

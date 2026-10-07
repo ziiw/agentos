@@ -193,7 +193,7 @@ fn task(store: &Store, id: &str) -> Result<Value> {
     let pushes = if t.is_open() { crate::held_pushes(&t)? } else { Vec::new() };
     let events = t.journal().read().unwrap_or_default();
     let mut v = task_json(&t);
-    v["diff"] = json!(render::diff(Paint::plain(), &t, &changes, &pushes, false, false));
+    v["diff"] = json!(render::diff(Paint::plain(), &t, &changes, &pushes, &(if t.is_open() { agentos::held::pending(&t.dir).unwrap_or_default() } else { Vec::new() }), false, false));
     v["log"] = json!(render::log(Paint::plain(), &t, &events));
     v["output"] = json!(output_tail(&t, 16 * 1024));
     // What you granted while it runs, to take back.
@@ -341,6 +341,7 @@ fn decide(store: &Store, id: &str, body: &str) -> Result<Value> {
     let decision = match v["decision"].as_str() {
         Some("once") => Decision::Once,
         Some("call") => Decision::Call,
+        Some("hold") => Decision::Hold,
         Some("always") => Decision::Always,
         Some("deny") => Decision::Deny,
         // A budget question: how far to raise it.
@@ -495,7 +496,7 @@ fn notifier(root: PathBuf, url: String) {
                     running.insert(id);
                 } else if running.remove(&id) {
                     let held = changes::scan(&t.layers()).map(|c| Summary::of(&c).total()).unwrap_or(0);
-                    let pushes = outbox::pending(&t.dir).map(|p| p.len()).unwrap_or(0);
+                    let pushes = outbox::pending(&t.dir).map(|p| p.len()).unwrap_or(0) + agentos::held::pending(&t.dir).map(|c| c.len()).unwrap_or(0);
                     let mut what = format!("{}: {}", render::title(&t), t.status_label());
                     if held + pushes > 0 {
                         what.push_str(&format!(" · {held} changes and {pushes} pushes held for review"));

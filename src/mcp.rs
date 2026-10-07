@@ -25,7 +25,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Protocol versions we speak; tools work the same in all of them.
 const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -162,6 +162,10 @@ pub struct Server {
     /// agentos runs on this machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taint: Option<bool>,
+    /// Hold every tool of this server that isn't read-only (unless `tools`
+    /// says otherwise), to be run when you commit the task.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
     /// Per tool. Without an entry: allowed when the server marks the tool
     /// read-only, asked otherwise.
     #[serde(default)]
@@ -173,6 +177,9 @@ pub struct Server {
 pub enum Policy {
     Allow,
     Ask,
+    /// Don't run it now: queue it for your review, to run when you commit
+    /// (for calls whose result the agent doesn't need).
+    Hold,
     Deny,
 }
 
@@ -305,6 +312,14 @@ pub struct Gateway {
     /// What the task has read that it shouldn't trust.
     pub taint: Arc<crate::taint::Taint>,
     children: Mutex<Vec<u32>>,
+}
+
+/// What a held call came to when it ran.
+#[derive(Debug)]
+pub struct Released {
+    pub text: String,
+    /// The server ran it and said it failed (the call stays held).
+    pub is_error: bool,
 }
 
 /// One relayed session's bookkeeping.
@@ -693,6 +708,102 @@ impl Gateway {
         line
     }
 
+    /// Queues a call for review and tells the agent so.
+    fn hold_call(&self, server: &str, tool: &str, args: &Value, how: &str, id: &Value, to_agent: &Arc<Mutex<UnixStream>>) {
+        let target = format!("{server}.{tool}");
+        let (text, error) = match crate::held::hold(&self.log_dir, server, tool, args) {
+            Ok(h) => {
+                let _ = self.journal.append(
+                    "mcp.call",
+                    json!({ "server": server, "tool": tool, "arguments": summary(args, 1000), "decision": how, "held": h.seq, "error": false, "bytes": 0, "ms": 0 }),
+                );
+                (
+                    format!(
+                        "Queued, not done yet: {target} is held for the user to review with this task's changes, and runs only if they approve. \
+                         It has NOT happened and you can't see its result, so don't wait for it or build on it. Carry on, and mention it in your summary."
+                    ),
+                    false,
+                )
+            }
+            Err(e) => (format!("agentos: couldn't hold {target} for review ({e:#}), so it was not run."), true),
+        };
+        send(to_agent, &json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": text }], "isError": error } }));
+    }
+
+    /// Runs one held call now, from this process (`agent commit`): starts
+    /// the server (or connects to the remote one), calls the tool, hangs up.
+    pub fn release(&self, name: &str, tool: &str, args: &Value) -> Result<Released> {
+        let server = self.servers.iter().find(|s| s.name == name).cloned().with_context(|| format!("no MCP server named {name} in your config any more"))?;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut child = None;
+        let upstream: Arc<dyn Upstream> = match &server.url {
+            Some(url) => {
+                let auth = match &server.token {
+                    Some(var) => Auth::Token(std::env::var(var).with_context(|| format!("{var} isn't set in your environment"))?),
+                    None => Auth::SignIn(self.store_root.clone()),
+                };
+                Arc::new(Remote {
+                    name: name.to_string(),
+                    url: url.clone(),
+                    http: crate::oauth::http(),
+                    auth,
+                    session_id: Mutex::new(None),
+                    version: Mutex::new(None),
+                    deliver: Box::new(move |line| {
+                        let _ = tx.send(line);
+                    }),
+                    say: self.say.clone(),
+                    told: std::sync::atomic::AtomicBool::new(false),
+                })
+            }
+            None => {
+                let mut c = self.spawn(&server)?;
+                let (Some(stdin), Some(stdout)) = (c.stdin.take(), c.stdout.take()) else {
+                    let _ = c.kill();
+                    bail!("couldn't talk to {name}");
+                };
+                std::thread::spawn(move || {
+                    for line in BufReader::new(stdout).lines() {
+                        let Ok(line) = line else { break };
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                });
+                child = Some(c);
+                Arc::new(Stdin(Mutex::new(stdin)))
+            }
+        };
+        let rpc = |id: u32, method: &str, params: Value| -> Result<Value> {
+            upstream.clone().send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let line = rx.recv_timeout(left).map_err(|_| anyhow::anyhow!("{name} didn't answer {method}"))?;
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                if msg.get("method").is_none() && msg["id"] == json!(id) {
+                    if let Some(e) = msg.get("error") {
+                        bail!("{name}: {}", e["message"].as_str().unwrap_or("error"));
+                    }
+                    return Ok(msg["result"].clone());
+                }
+            }
+        };
+        let result = (|| {
+            rpc(1, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "agentos", "version": env!("CARGO_PKG_VERSION") } }))?;
+            upstream.clone().send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+            rpc(2, "tools/call", json!({ "name": tool, "arguments": args }))
+        })();
+        upstream.close();
+        if let Some(mut c) = child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let result = result?;
+        let text: Vec<&str> = result["content"].as_array().map(|c| c.iter().filter_map(|p| p["text"].as_str()).collect()).unwrap_or_default();
+        Ok(Released { text: text.join("\n"), is_error: result["isError"].as_bool() == Some(true) })
+    }
+
     fn from_agent(self: Arc<Self>, server: &Server, session: &Arc<Mutex<Session>>, to_server: &Arc<dyn Upstream>, to_agent: &Arc<Mutex<UnixStream>>, line: String) {
         let refuse = |id: &Value, code: i64, message: String| {
             send(to_agent, &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }));
@@ -760,7 +871,9 @@ impl Gateway {
                     }
                     (_, Verdict::Permit(rule)) => return forward("rule", Some(rule.clone())),
                     (Some(p), _) => *p,
-                    (None, _) if read_only || self.remembered.contains(&target) => Policy::Allow,
+                    (None, _) if read_only => Policy::Allow,
+                    (None, _) if server.hold => Policy::Hold,
+                    (None, _) if self.remembered.contains(&target) => Policy::Allow,
                     (None, _) => Policy::Ask,
                 };
                 // A task that has read untrusted input is asked before anything
@@ -768,6 +881,7 @@ impl Gateway {
                 // "always" said. Only a rule of yours permits it silently.
                 let policy = if policy == Policy::Allow && !read_only && self.taint.is_tainted() { Policy::Ask } else { policy };
                 match policy {
+                    Policy::Hold => self.hold_call(&server.name, &tool, &args, "held", &id, to_agent),
                     Policy::Allow if read_only => forward("read-only", None),
                     Policy::Allow => forward("allowed", None),
                     Policy::Deny => deny("denied by config", None, format!("agentos: the user's config doesn't allow {target}.")),
@@ -777,6 +891,7 @@ impl Gateway {
                         std::thread::spawn(move || {
                             let req = Request { kind: Kind::Tool, target: target.clone(), reason: Some(summary(&args, 300)), taint: gw.taint.describe() };
                             match (gw.ask)(&req) {
+                                Some(Decision::Hold) => gw.hold_call(&server.name, &tool, &args, "held by you", &id, &to_agent),
                                 Some(d) if d.allows() => {
                                     if let Ok(mut s) = session.lock() {
                                         s.calls.insert(id.to_string(), Pending { tool, args, how: d.label(), rule: None, started: Instant::now() });
