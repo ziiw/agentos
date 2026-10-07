@@ -15,6 +15,7 @@ pub mod gateway;
 pub mod journal;
 pub mod limits;
 pub mod mcp;
+pub mod oauth;
 pub mod outbox;
 pub mod policy;
 pub mod profiles;

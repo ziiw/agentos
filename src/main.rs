@@ -211,6 +211,16 @@ enum Command {
         #[command(subcommand)]
         command: Option<PolicyCommand>,
     },
+    /// Sign in to one of your remote MCP servers (OAuth), so agents can use
+    /// it through agentos without ever holding the token; with no NAME, list
+    /// your remote servers
+    Connect {
+        /// The server, as named under [mcp.NAME] in your config
+        name: Option<String>,
+        /// Forget the sign-in instead
+        #[arg(long)]
+        forget: bool,
+    },
     /// MCP server for agents, run inside their sandbox: agentos's own, or
     /// the gateway to one of yours
     #[command(hide = true)]
@@ -470,6 +480,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             cmd_raise(&store, amount, task, period, project)
         }
         Command::Revoke { target, task } => cmd_revoke(&store, target, task),
+        Command::Connect { name, forget } => cmd_connect(&store, name, forget),
         Command::Mcp { .. } => unreachable!(),
     }
 }
@@ -1152,6 +1163,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             rules.clone(),
             approvals::remembered_tools(store.root(), &project).unwrap_or_default(),
             journal.clone(),
+            store.root(),
             err,
         ));
         gateway_slot = Some(gateway.clone());
@@ -1440,12 +1452,13 @@ fn gateway_for(
     rules: Option<Arc<policy::Policy>>,
     remembered: Vec<String>,
     journal: Journal,
+    store_root: &Path,
     err: Paint,
 ) -> agentos::mcp::Gateway {
     let ask: Box<dyn Fn(&Request) -> Option<approvals::Decision> + Send + Sync> =
         Box::new(move |req: &Request| asker.as_ref().map(|a| a.ask(req, |s| err.cyan(s)).0));
-    let tell: Box<dyn Fn(String) + Send + Sync> = Box::new(move |text| say(format!("{} {text}", err.yellow("agent: warning:"))));
-    agentos::mcp::Gateway::new(servers, cwd.to_path_buf(), task_dir.to_path_buf(), ask, rules, remembered, journal, tell)
+    let tell: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text| say(format!("{} {text}", err.yellow("agent: warning:"))));
+    agentos::mcp::Gateway::new(servers, cwd.to_path_buf(), task_dir.to_path_buf(), ask, rules, remembered, journal, tell, store_root.to_path_buf())
 }
 
 /// Answers what the agent asks agentos from inside its sandbox (through
@@ -2475,6 +2488,73 @@ fn cmd_raise(store: &Store, amount: Budget, task: Option<String>, period: Option
         return Ok(0);
     };
     println!("{}", raise_shared(store, &home_dir()?, &std::env::current_dir()?, period, project, amount, approvals::AT_TERMINAL)?);
+    Ok(0)
+}
+
+fn cmd_connect(store: &Store, name: Option<String>, forget: bool) -> Result<i32> {
+    let (home, cwd) = (home_dir()?, std::env::current_dir()?);
+    let servers = config::load(store.root(), &cwd, &home)?.mcp;
+    let out = Paint::stdout();
+    let Some(name) = name else {
+        let remote: Vec<_> = servers.iter().filter(|s| s.url.is_some()).collect();
+        if remote.is_empty() {
+            println!("no remote MCP servers in your config: add one with [mcp.NAME] url = \"https://…\"");
+        }
+        for s in remote {
+            let url = s.url.as_deref().unwrap_or_default();
+            let state = match (&s.token, agentos::oauth::load(store.root(), &s.name).filter(|t| t.url == url)) {
+                (Some(var), _) if std::env::var_os(var).is_some() => out.green(format!("token from ${var}")),
+                (Some(var), _) => out.yellow(format!("token from ${var}, which isn't set")),
+                (None, Some(t)) => out.green(format!("signed in at {}", t.issuer)),
+                (None, None) => out.dim(format!("not signed in: agent connect {} (if it needs it)", s.name)),
+            };
+            println!("{:<12} {url}  {state}", s.name);
+        }
+        return Ok(0);
+    };
+    let server = servers.iter().find(|s| s.name == name).with_context(|| format!("no [mcp.{name}] in your config"))?;
+    let Some(url) = &server.url else {
+        bail!("{name} is a server agentos runs ({}): it gets its credentials through env, there's nothing to sign in to", server.describe());
+    };
+    if forget {
+        if agentos::oauth::forget(store.root(), &name) {
+            println!("forgot your sign-in to {name}");
+        } else {
+            println!("you weren't signed in to {name}");
+        }
+        return Ok(0);
+    }
+    if let Some(var) = &server.token {
+        bail!("{name} uses the token in ${var} (token = in your config): remove that line to sign in instead");
+    }
+    let http = agentos::oauth::http();
+    let tell = |text: &str| println!("  {text}");
+    println!("{} signing in to {name} ({url})", out.cyan("agent ▸"));
+    let Some(auth) = agentos::oauth::discover(&http, url)? else {
+        println!("{} {name} answers without a sign-in: agents can use it as it is", out.cyan("agent ▸"));
+        return Ok(0);
+    };
+    tell(&format!("authorization server: {}", auth.issuer));
+    agentos::oauth::sign_in(store.root(), &name, url, &auth, &tell)?;
+    // Check it works, as the gateway will use it.
+    let token = agentos::oauth::access_token(store.root(), &name, url, false)?.context("signed in, but no token was kept")?;
+    let probe = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "agentos", "version": env!("CARGO_PKG_VERSION") } } });
+    let resp = http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", &format!("Bearer {token}"))
+        .send(probe.to_string().as_bytes())?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        bail!("signed in, but {name} still refuses the token (HTTP {status})");
+    }
+    let body = resp.into_body().read_to_string().unwrap_or_default();
+    let server_name = body.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l.strip_prefix("data:").unwrap_or(l).trim()).ok())
+        .find_map(|m| m["result"]["serverInfo"]["name"].as_str().map(str::to_string));
+    let which = server_name.map(|n| format!(" ({n})")).unwrap_or_default();
+    println!("{} signed in to {name}{which}: agents reach it through agentos, and never hold the token", out.cyan("agent ▸"));
     Ok(0)
 }
 

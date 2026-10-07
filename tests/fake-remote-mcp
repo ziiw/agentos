@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# A stand-in remote MCP server for tests (Streamable HTTP), with its own
+# OAuth authorization server, as MCP's authorization spec has it:
+#   fake-remote-mcp PORT_FILE LOG_FILE
+# Protected resource and authorization server metadata, dynamic client
+# registration, an /authorize that approves at once (PKCE required), and a
+# token endpoint whose first access token expires at once, so the gateway
+# has to refresh it (POST /test/expire makes the server refuse the access
+# tokens it gave, as if revoked). Bearer "static-secret" works too (a token from the
+# user's environment). Tools: whoami (read-only, JSON answer) and
+# create_issue (streamed answer, with a notification before the result).
+import base64
+import hashlib
+import json
+import secrets
+import sys
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT_FILE, LOG_FILE = sys.argv[1], sys.argv[2]
+clients, codes, access, refresh, sessions = {}, {}, {}, {}, set()
+issues = []
+
+
+def log(line):
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def base(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def reply(self, status, body=None, headers=None, content_type="application/json"):
+        data = b"" if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
+        self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        if body is not None:
+            self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        q = dict(urllib.parse.parse_qsl(url.query))
+        if url.path == "/.well-known/oauth-protected-resource/mcp":
+            return self.reply(200, {"resource": f"{self.base()}/mcp", "authorization_servers": [self.base()], "scopes_supported": ["issues"]})
+        if url.path == "/.well-known/oauth-authorization-server":
+            b = self.base()
+            return self.reply(200, {"issuer": b, "authorization_endpoint": f"{b}/authorize", "token_endpoint": f"{b}/token",
+                                    "registration_endpoint": f"{b}/register", "code_challenge_methods_supported": ["S256"]})
+        if url.path == "/authorize":
+            client = clients.get(q.get("client_id"))
+            ok = client and q.get("redirect_uri") in client["redirect_uris"] and q.get("code_challenge_method") == "S256" \
+                and q.get("code_challenge") and q.get("resource") == f"{self.base()}/mcp" and q.get("scope") == "issues"
+            log(f"authorize ok={bool(ok)}")
+            if not ok:
+                return self.reply(400, {"error": "invalid_request"})
+            code = secrets.token_hex(8)
+            codes[code] = q
+            sep = "&" if "?" in q["redirect_uri"] else "?"
+            return self.reply(302, headers={"Location": f"{q['redirect_uri']}{sep}code={code}&state={q['state']}"})
+        self.reply(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        sessions.discard(self.headers.get("Mcp-Session-Id"))
+        log("session ended")
+        self.reply(204)
+
+    def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        raw = self.body()
+        if url.path == "/register":
+            reg = json.loads(raw)
+            cid = "client-" + secrets.token_hex(4)
+            clients[cid] = reg
+            log(f"registered {reg.get('client_name')} {reg.get('redirect_uris')}")
+            return self.reply(201, {"client_id": cid, **reg})
+        if url.path == "/token":
+            form = dict(urllib.parse.parse_qsl(raw.decode()))
+            grant = form.get("grant_type")
+            log(f"token grant_type={grant} resource={form.get('resource')}")
+            if grant == "authorization_code":
+                q = codes.pop(form.get("code"), None)
+                verifier = form.get("code_verifier", "")
+                challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+                if not q or q["code_challenge"] != challenge or form.get("redirect_uri") != q["redirect_uri"]:
+                    return self.reply(400, {"error": "invalid_grant"})
+                n, life = 1, 1  # expires at once: the gateway has to refresh
+            elif grant == "refresh_token":
+                n = refresh.pop(form.get("refresh_token"), None)
+                if n is None:
+                    return self.reply(400, {"error": "invalid_grant", "error_description": "refresh token already used"})
+                n, life = n + 1, 3600
+            else:
+                return self.reply(400, {"error": "unsupported_grant_type"})
+            at, rt = f"at-{n}-{secrets.token_hex(4)}", f"rt-{n}-{secrets.token_hex(4)}"
+            access[at], refresh[rt] = "alice", n
+            return self.reply(200, {"access_token": at, "refresh_token": rt, "expires_in": life, "token_type": "Bearer"})
+        if url.path == "/test/expire":
+            # Every access token stops working (refresh tokens still do).
+            access.clear()
+            log("access tokens expired")
+            return self.reply(204)
+        if url.path != "/mcp":
+            return self.reply(404, {"error": "not found"})
+
+        token = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
+        who = "bot" if token == "static-secret" else access.get(token)
+        if not who:
+            log(f"mcp refused token={'yes' if token else 'no'}")
+            challenge = f'Bearer resource_metadata="{self.base()}/.well-known/oauth-protected-resource/mcp", scope="issues"'
+            return self.reply(401, {"error": "invalid_token"}, {"WWW-Authenticate": challenge})
+        msg = json.loads(raw)
+        method = msg.get("method")
+        log(f"mcp {method or 'response'} as {who}")
+        if method == "initialize":
+            sid = secrets.token_hex(8)
+            sessions.add(sid)
+            result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-tracker", "version": "1"}}
+            return self.reply(200, {"jsonrpc": "2.0", "id": msg["id"], "result": result}, {"Mcp-Session-Id": sid})
+        if self.headers.get("Mcp-Session-Id") not in sessions:
+            log("mcp missing session")
+            return self.reply(400, {"jsonrpc": "2.0", "id": msg.get("id"), "error": {"code": -32000, "message": "no session"}})
+        if self.headers.get("MCP-Protocol-Version") != "2025-06-18":
+            log("mcp missing protocol version")
+            return self.reply(400, {"jsonrpc": "2.0", "id": msg.get("id"), "error": {"code": -32000, "message": "protocol version?"}})
+        if "id" not in msg or method is None:
+            return self.reply(202)
+        if method == "tools/list":
+            tools = [
+                {"name": "whoami", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}},
+                {"name": "create_issue", "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}}},
+            ]
+            return self.reply(200, {"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": tools}})
+        if method == "tools/call":
+            name, args = msg["params"]["name"], msg["params"].get("arguments", {})
+            if name == "whoami":
+                result = {"content": [{"type": "text", "text": f"signed in as {who}"}]}
+                return self.reply(200, {"jsonrpc": "2.0", "id": msg["id"], "result": result})
+            if name == "create_issue":
+                issues.append(args.get("title"))
+                log(f"created issue {args.get('title')}")
+                note = {"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "creating"}}
+                result = {"jsonrpc": "2.0", "id": msg["id"], "result": {"content": [{"type": "text", "text": f"created issue {len(issues)}: {args.get('title')}"}]}}
+                stream = f"event: message\ndata: {json.dumps(note)}\n\nevent: message\ndata: {json.dumps(result)}\n\n".encode()
+                return self.reply(200, stream, content_type="text/event-stream")
+        self.reply(200, {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": f"no {method}"}})
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(PORT_FILE, "w") as f:
+    f.write(str(server.server_address[1]))
+server.serve_forever()

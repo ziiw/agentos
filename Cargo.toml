@@ -32,6 +32,8 @@ sha2 = "0.10"
 tiny_http = "0.12"
 similar = "2"
 toml = "0.8"
+# Remote MCP servers and their OAuth sign-in (rustls with ring, as above).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 webpki-roots = "1"
 
 [dev-dependencies]

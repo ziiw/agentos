@@ -684,6 +684,61 @@ TOML
   : > "$CFG"
 fi
 
+section "remote MCP servers (Streamable HTTP, OAuth sign-in)"
+if ! command -v python3 >/dev/null; then
+  skip "the stand-in remote MCP server needs python3"
+else
+  reset_proj
+  cd "$PROJ"
+  cp "$HERE/mcp-client" ./mcp-client
+  : > "$WORK/remote.log"
+  rm -f "$WORK/remote.port"
+  python3 "$HERE/fake-remote-mcp" "$WORK/remote.port" "$WORK/remote.log" &
+  REMOTE_PID=$!
+  for _ in $(seq 50); do [ -s "$WORK/remote.port" ] && break; sleep 0.1; done
+  R="http://127.0.0.1:$(cat "$WORK/remote.port")"
+  cat > "$CFG" <<TOML
+[mcp.tracker]
+url = "$R/mcp"
+tools = { create_issue = "allow" }
+
+[mcp.bot]
+url = "$R/mcp"
+token = "TRACKER_TOKEN"
+TOML
+  rc() { AGENTOS_CONFIG="$CFG" "$AGENT" "$@"; }
+  check "agent connect lists your remote servers" grep -q "tracker .*$R/mcp  not signed in" <<<"$(rc connect)"
+  out="$(rc run -- python3 ./mcp-client tracker tools/list 2>&1 </dev/null)"
+  check "before you sign in, the agent is told to ask you to" grep -q 'it needs the user to sign in first: they can run `agent connect tracker`' <<<"$out"
+  out="$(BROWSER="curl -sSL -o /dev/null" rc connect tracker 2>&1 </dev/null)"
+  check "agent connect signs in: discovery, registration, PKCE, the browser's return" grep -q "signed in to tracker (fake-tracker)" <<<"$out"
+  check "...asking for the server as the token's resource, with its scope" grep -q 'authorize ok=True' "$WORK/remote.log"
+  check "...registered as agentos, with a loopback address to come back to" grep -q "registered agentos \['http://127.0.0.1:[0-9]*/callback'\]" "$WORK/remote.log"
+  check "...keeping the tokens in the vault, outside every sandbox" test -f "$AGENTOS_HOME/vault/mcp-tracker.json"
+  check "agent connect shows it" grep -q "tracker .*signed in at $R" <<<"$(rc connect)"
+  out="$(rc run -- sh -c "python3 ./mcp-client tracker tools/list 'tools/call:whoami:{}' 'tools/call:create_issue:{\"title\":\"flaky test\"}'; curl -sS -m 5 -o /dev/null $R/mcp 2>/dev/null && echo reachable || echo unreachable" 2>&1 </dev/null)"
+  events="$(latest_task_dir)/events.jsonl"
+  check "the agent uses the remote server through agentos" grep -q 'whoami: signed in as alice' <<<"$out"
+  check "...streamed answers too" grep -q 'create_issue: created issue 1: flaky test' <<<"$out"
+  check "...while the server itself is out of the sandbox's reach" grep -q unreachable <<<"$out"
+  check "a token about to expire is refreshed first" grep -q 'token grant_type=refresh_token resource=http' "$WORK/remote.log"
+  check "the session ends when the agent hangs up" grep -q 'session ended' "$WORK/remote.log"
+  check "calls are journaled, like a local server's" grep -q '"kind":"mcp.call".*"tool":"create_issue"' "$events"
+  check "...and so is the server's URL" grep -q '"kind":"mcp.start".*"url":"http' "$events"
+  check "no token in the task store's journals or logs" bash -c "! grep -rqE '(at|rt)-[0-9]+-[0-9a-f]{8}' '$AGENTOS_HOME/tasks'"
+  curl -sS -X POST "$R/test/expire" >/dev/null
+  out="$(rc run -- python3 ./mcp-client tracker tools/list 'tools/call:whoami:{}' 2>&1 </dev/null)"
+  check "a token the server refuses is renewed, and the call goes through" grep -q 'whoami: signed in as alice' <<<"$out"
+  check "...with the refresh token rotated" test "$(grep -c 'token grant_type=refresh_token' "$WORK/remote.log")" = 2
+  out="$(TRACKER_TOKEN=static-secret rc run -- sh -c 'echo "token: ${TRACKER_TOKEN:-unset}"; python3 ./mcp-client bot tools/list "tools/call:whoami:{}"' 2>&1 </dev/null)"
+  check "a token from your environment works too" grep -q 'whoami: signed in as bot' <<<"$out"
+  check "...and stays out of the sandbox" grep -q 'token: unset' <<<"$out"
+  check "agent connect --forget forgets the sign-in" grep -q 'forgot your sign-in to tracker' <<<"$(rc connect tracker --forget)"
+  check "...for good" test ! -e "$AGENTOS_HOME/vault/mcp-tracker.json"
+  kill $REMOTE_PID 2>/dev/null; wait $REMOTE_PID 2>/dev/null
+  : > "$CFG"
+fi
+
 section "your rules (policy.cedar)"
 reset_proj
 cd "$PROJ"

@@ -92,6 +92,7 @@ scripts/dev.sh shell
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 | `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
+| `agent connect [NAME] [--forget]` | Sign in to one of your remote MCP servers, or list them |
 | `agent spend` | What agents spent today, this week and this month, against your budgets |
 | `agent raise AMOUNT [--task ID \| --today \| --this-week \| --this-month [--project]]` | Raise a budget that's used up: a running task's, or one across tasks until it resets |
 
@@ -230,7 +231,27 @@ Claude gets it automatically, as `github`; other agents reach it inside the sand
 - `tools` sets a tool to `allow`, `ask` or `deny`; denied tools aren't even listed to the agent;
 - every call is journaled: the tool, its arguments, how it was allowed, and whether it failed.
 
-Only your own config can declare servers: a project's `.agentos.toml` can't make agentos run anything on your machine. A server runs as you, with your access; agentos governs the calls the agent makes, not what the server can reach. Remote (HTTP) servers work through a stdio bridge such as `mcp-remote` for now.
+Only your own config can declare servers: a project's `.agentos.toml` can't make agentos run anything on your machine. A server runs as you, with your access; agentos governs the calls the agent makes, not what the server can reach.
+
+**Remote servers** too. agentos connects to them itself, outside the sandbox, so the sandbox can't reach them and never holds their token. Their tools go through the same questions and journal:
+
+```toml
+[mcp.linear]
+url = "https://mcp.linear.app/mcp"
+
+[mcp.github]
+url = "https://api.githubcopilot.com/mcp/"
+token = "GITHUB_TOKEN"                     # a bearer token from your environment
+```
+
+A server that wants you to sign in (OAuth) gets it once, from your terminal:
+
+```bash
+agent connect linear      # opens your browser; you approve; done
+agent connect             # your remote servers, and whether you're signed in
+```
+
+agentos finds where to sign in from the server itself, registers there as a client, and has you approve in your browser, which comes back to agentos on a loopback address. Over SSH, open the printed link anywhere and paste back the address your browser ends up on. The tokens are kept in the task store's vault, which no sandbox can see. They're refreshed when they expire, or when the server refuses them. `agent connect NAME --forget` forgets them.
 
 ## Rules: answers you've already given
 
@@ -430,6 +451,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **The agent writes its own reasons.** An agent steered by something it read can write a convincing one. Judge the request, not the prose.
 - **Taking a folder back unmounts it, but files a process already has open there stay open**, and a shell already inside it keeps its working directory.
 - **An MCP server marks its own tools read-only**, and agentos trusts that hint since the server is yours. If you don't, set the tool to `ask`.
+- **Remote MCP servers speak Streamable HTTP.** The older HTTP+SSE transport isn't supported, and messages a server sends outside an answer (on its own stream) aren't relayed yet. Signing in needs a server whose authorization server lets clients register themselves, as MCP recommends; for others, use a token from your environment.
 - **Budgets meter what they can read.** A Chat Completions stream without `stream_options.include_usage` reports no usage, so it isn't counted (you get a warning). Paid calls no response reports (batches and the others under Budgets) are refused under a budget only on Anthropic's and OpenAI's own hosts, from a list: an endpoint added after it isn't known. Model calls go one at a time only from 80% of a budget, so calls started in parallel just before that can still overshoot together. US-only inference (`inference_geo`, 1.1×) is priced at the standard rate.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
 - **The syscall filter is a denylist** (seccomp): it blocks typing into your terminal (TIOCSTI), new namespaces, mounts, kernel modules, bpf, io_uring, keyrings and userfaultfd. Kernel bugs reachable through the remaining syscalls are out of scope until the microVM tier.
@@ -457,6 +479,7 @@ src/broker.rs    credential broker (per-task CA, HTTP/1.1 relay)
 src/gateway.rs   model gateway: usage metering, prices, budgets
 src/control.rs   the agent's requests from inside (control socket), and what may be granted
 src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway to yours
+src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refresh
 src/policy.rs    your rules (Cedar): answers given in advance
 src/main.rs      CLI          src/render.rs   output
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude

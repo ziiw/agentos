@@ -34,6 +34,10 @@
 //! env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]  # the agent reaches it through agentos
 //! tools = { delete_file = "deny" }        # allow | ask | deny (default: read-only tools allowed, others asked)
 //!
+//! [mcp.linear]                            # a remote one: agentos connects to it,
+//! url = "https://mcp.linear.app/mcp"      # never the sandbox; `agent connect linear`
+//!                                         # signs in (or: token = "ENV_VAR")
+//!
 //! [console]                               # your file only: where agentd's console can
 //! projects = ["~/code/app"]               # start tasks (besides folders you've used)
 //!
@@ -436,6 +440,9 @@ mod tests {
         let file: ConfigFile = toml::from_str("[mcp.notes]\ncommand = [\"notes-mcp\"]\nenv = [\"NOTES_TOKEN\"]\ntools = { drop = \"deny\" }\n").unwrap();
         apply(&mut s, file, Path::new("config.toml"), None, &e.home).unwrap();
         assert_eq!((s.mcp[0].name.as_str(), s.mcp[0].tools.get("drop")), ("notes", Some(&crate::mcp::Policy::Deny)));
+        let file: ConfigFile = toml::from_str("[mcp.tracker]\nurl = \"https://mcp.example.com/mcp\"\ntoken = \"TRACKER_TOKEN\"\n").unwrap();
+        apply(&mut s, file, Path::new("config.toml"), None, &e.home).unwrap();
+        assert_eq!(s.mcp[1].describe(), "https://mcp.example.com/mcp");
 
         for bad in [
             "[limits]\nbudget = \"lots\"\n",
@@ -445,6 +452,13 @@ mod tests {
             "[mcp.\"a b\"]\ncommand = [\"x\"]\n",
             "[mcp.agentos]\ncommand = [\"x\"]\n",
             "[mcp.x]\ncommand = [\"x\"]\ntools = { t = \"maybe\" }\n",
+            "[mcp.x]\n",
+            "[mcp.x]\nurl = \"https://a.dev/mcp\"\ncommand = [\"x\"]\n",
+            "[mcp.x]\nurl = \"http://a.dev/mcp\"\n",
+            "[mcp.x]\nurl = \"http://localhost.evil.dev/mcp\"\n",
+            "[mcp.x]\nurl = \"https://a.dev/mcp\"\nenv = [\"A\"]\n",
+            "[mcp.x]\nurl = \"https://a.dev/mcp\"\ntoken = \"$A\"\n",
+            "[mcp.x]\ncommand = [\"x\"]\ntoken = \"A\"\n",
         ] {
             let parsed = toml::from_str::<ConfigFile>(bad);
             let applied = parsed.map_err(anyhow::Error::from).and_then(|f| apply(&mut Settings::default(), f, Path::new("c"), None, &e.home));
