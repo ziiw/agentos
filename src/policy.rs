@@ -30,6 +30,11 @@
 //!   asked), args (a tool call's arguments)}.
 //!
 //! `"~/…"` in a string means your home folder.
+//!
+//! A project can ship rules too, in `.agentos.cedar` at its root. They can
+//! only forbid, so they apply to every task there without your review (a
+//! `permit` in one is refused, and so is a file that doesn't parse: a
+//! protection the project asked for is never silently dropped).
 
 use anyhow::{Context as _, Result};
 use cedar_policy::{Authorizer, Context, Decision, Effect, Entities, EntityId, EntityTypeName, EntityUid, PolicyId, PolicySet, Request};
@@ -39,6 +44,10 @@ use std::str::FromStr;
 
 /// Next to your config.toml.
 pub const FILE: &str = "policy.cedar";
+/// A project's own rules, at its root.
+pub const PROJECT_FILE: &str = ".agentos.cedar";
+/// Prefix of a project rule's id, once combined with yours.
+const PROJECT: &str = "project:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -134,29 +143,73 @@ pub fn load(path: &Path, home: &Path) -> Result<Option<PolicySet>> {
     Ok(Some(set))
 }
 
-/// A rule's name: its `@id("…")`, else "rule N" in file order.
-pub fn rule_name(set: &PolicySet, id: &PolicyId) -> String {
-    if let Some(name) = set.annotation(id, "id") {
-        return name.to_string();
+/// A project's rules, which may only forbid.
+pub fn load_project(path: &Path, home: &Path) -> Result<PolicySet> {
+    let set = load(path, home)?.with_context(|| format!("{}: no such file", path.display()))?;
+    if set.templates().next().is_some() {
+        anyhow::bail!("{}: templates aren't supported in project rules", path.display());
     }
+    if let Some(p) = set.policies().find(|p| p.effect() == Effect::Permit) {
+        anyhow::bail!(
+            "{}: project rules can only forbid, and \u{201c}{}\u{201d} permits; only your own rules ({FILE}) can allow",
+            path.display(),
+            rule_name(&set, p.id())
+        );
+    }
+    Ok(set)
+}
+
+/// Your rules and a project's, in one set.
+pub fn combine(yours: Option<PolicySet>, project: Option<PolicySet>) -> Result<Option<PolicySet>> {
+    let Some(project) = project else { return Ok(yours) };
+    let mut set = yours.unwrap_or_default();
+    for policy in project.policies() {
+        set.add(policy.new_id(PolicyId::new(format!("{PROJECT}{}", policy.id()))))
+            .map_err(|e| anyhow::anyhow!("combining the project's rules with yours: {e}"))?;
+    }
+    Ok(Some(set))
+}
+
+/// A rule's name: its `@id("…")`, else "rule N" in file order; a project's
+/// rules start with "project: ".
+pub fn rule_name(set: &PolicySet, id: &PolicyId) -> String {
     let raw = id.to_string();
+    let (prefix, raw) = match raw.strip_prefix(PROJECT) {
+        Some(rest) => ("project: ", rest.to_string()),
+        None => ("", raw),
+    };
+    if let Some(name) = set.annotation(id, "id") {
+        return format!("{prefix}{name}");
+    }
     match raw.strip_prefix("policy").and_then(|n| n.parse::<usize>().ok()) {
-        Some(n) => format!("rule {}", n + 1),
-        None => raw,
+        Some(n) => format!("{prefix}rule {}", n + 1),
+        None => format!("{prefix}{raw}"),
     }
 }
 
-/// Every rule: (name, "permit" or "forbid").
+/// Whose rule it is, and its own name: ("your", name) or ("the project's", name).
+pub fn whose(rule: &str) -> (&'static str, &str) {
+    match rule.strip_prefix("project: ") {
+        Some(name) => ("the project's", name),
+        None => ("your", rule),
+    }
+}
+
+/// Every rule: (name, "permit" or "forbid"), yours then the project's, in
+/// file order.
 pub fn rules(set: &PolicySet) -> Vec<(String, &'static str)> {
-    let mut out: Vec<(String, String, &'static str)> = set
+    let mut out: Vec<((bool, usize), String, &'static str)> = set
         .policies()
         .map(|p| {
             let effect = if p.effect() == Effect::Forbid { "forbid" } else { "permit" };
-            (p.id().to_string(), rule_name(set, p.id()), effect)
+            let id = p.id().to_string();
+            let project = id.starts_with(PROJECT);
+            // policy0, policy1, …, policy10: file order.
+            let n = id.trim_start_matches(PROJECT).strip_prefix("policy").and_then(|n| n.parse::<usize>().ok()).unwrap_or(usize::MAX);
+            ((project, n), rule_name(set, p.id()), effect)
         })
         .collect();
-    // policy0, policy1, …, policy10: file order.
-    out.sort_by_key(|(id, _, _)| id.strip_prefix("policy").and_then(|n| n.parse::<usize>().ok()).unwrap_or(usize::MAX));
+    out.sort_by_key(|(key, _, _)| *key);
     out.into_iter().map(|(_, name, effect)| (name, effect)).collect()
 }
 
@@ -262,6 +315,29 @@ mod tests {
         assert_eq!(call(json!({})), Verdict::Undecided, "a rule that can't be evaluated doesn't match");
         assert_eq!(rules(&p.set).len(), 5);
         assert_eq!(rules(&p.set)[1], ("rule 2".to_string(), "forbid"));
+    }
+
+    #[test]
+    fn project_rules_only_tighten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (yours, theirs) = (dir.path().join(FILE), dir.path().join(PROJECT_FILE));
+        std::fs::write(&yours, "@id(\"pypi\")\npermit (principal, action == Action::\"connect\", resource == Host::\"pypi.org\");").unwrap();
+        std::fs::write(&theirs, "@id(\"never prod\")\nforbid (principal, action == Action::\"connect\", resource) when { resource.name like \"*.prod.example\" };\nforbid (principal, action == Action::\"connect\", resource == Host::\"pypi.org\");").unwrap();
+        let home = Path::new("/home/you");
+        let set = combine(load(&yours, home).unwrap(), Some(load_project(&theirs, home).unwrap())).unwrap().unwrap();
+        let p = Policy::new(set, "claude", "t", home);
+        assert_eq!(p.decide(&Question::connect("db.prod.example", 443)), Verdict::Forbid("project: never prod".into()));
+        assert_eq!(p.decide(&Question::connect("pypi.org", 443)), Verdict::Forbid("project: rule 2".into()), "the project's forbid beats your permit");
+        assert_eq!(whose("project: never prod"), ("the project's", "never prod"));
+        assert_eq!(whose("pypi"), ("your", "pypi"));
+        let names: Vec<String> = rules(&p.set).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["pypi", "project: never prod", "project: rule 2"]);
+
+        std::fs::write(&theirs, "forbid (principal, action, resource == Host::\"x\");\npermit (principal, action, resource);").unwrap();
+        assert!(load_project(&theirs, home).unwrap_err().to_string().contains("can only forbid"));
+        std::fs::write(&theirs, "forbid (principal, action, resource").unwrap();
+        assert!(load_project(&theirs, home).is_err(), "a broken file isn't skipped");
+        assert!(combine(None, None).unwrap().is_none());
     }
 
     #[test]

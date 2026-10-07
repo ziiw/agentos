@@ -251,7 +251,17 @@ What a rule sees:
 | resources | `Host::"pypi.org"` {name, port}, `Path::"/home/you/code/lib"` {path}, `Tool::"github.create_issue"` {server, name} |
 | context | `agent`, `task`, `project`, `reason` (the agent's own words, when it asked), `args` (a tool call's arguments) |
 
-`"~/…"` in a string means your home. `agent policy` lists your rules, and `agent policy check read ~/code/lib` (or `connect pypi.org`, or `call github.create_issue --args '{"repo":"x"}'`) tells you what they'd say. Every decision a rule makes is journaled with the rule's name. A rules file that doesn't parse stops tasks rather than being skipped, and agents can never be granted it.
+**A project can ship rules too**, in `.agentos.cedar` at its root, for anyone who runs agents there:
+
+```cedar
+@id("never production")
+forbid (principal, action == Action::"connect", resource)
+when { resource.name like "*.prod.example.com" };
+```
+
+Project rules can only forbid, so they apply without review, and they beat your own `permit` and `--allow`. A project file with a `permit` in it, or one that doesn't parse, stops the task: a protection the project asked for is never silently dropped. An agent can't loosen them for itself: rules are read when the task starts, and `agent diff` flags any change it makes to the file.
+
+`"~/…"` in a string means your home. `agent policy` lists your rules and the project's, and `agent policy check read ~/code/lib` (or `connect pypi.org`, or `call github.create_issue --args '{"repo":"x"}'`) tells you what they'd say. Every decision a rule makes is journaled with the rule's name. A rules file that doesn't parse stops tasks rather than being skipped, and agents can never be granted it.
 
 ## Budgets
 

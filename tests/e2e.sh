@@ -670,7 +670,7 @@ CEDAR
 run_rules() { AGENTOS_CONFIG="$CFG" "$AGENT" "$@"; }
 check "agent policy lists your rules" grep -q 'forbid  not example.com' <<<"$(run_rules policy)"
 check "agent policy check: permitted" grep -q 'permitted by “read what we asked”' <<<"$(run_rules policy check read "$ASKED/rules-read")"
-check "...forbidden" grep -q 'forbidden by “not example.com”' <<<"$(run_rules policy check connect example.com)"
+check "...forbidden" grep -q 'forbidden by your rule “not example.com”' <<<"$(run_rules policy check connect example.com)"
 check "...a tool call, by its arguments" grep -q 'permitted by “ok notes”' <<<"$(run_rules policy check call notes.post_note --args '{"text":"ok"}')"
 check "...or no rule at all" grep -q 'no rule matches' <<<"$(run_rules policy check connect pypi.org)"
 export NOTES_FILE="$WORK/rule-notes.txt"
@@ -706,6 +706,36 @@ check "...rather than being skipped" test "$(run_rules run -- true >/dev/null 2>
 rm -f "$RULES" rules.sh mcp-client
 unset NOTES_FILE
 : > "$CFG"
+
+section "project rules (.agentos.cedar): they can only forbid"
+reset_proj
+cd "$PROJ"
+cat > .agentos.cedar <<'CEDAR'
+@id("not example.com")
+forbid (principal, action == Action::"connect", resource == Host::"example.com");
+CEDAR
+GET="curl -sS -m 20 -o /dev/null -w HTTP%{http_code} https://example.com"
+out="$("$AGENT" run --allow example.com -- $GET 2>&1)"
+check "a project's forbid applies, without review" grep -q 'blocked example.com:443: forbidden by the project.s rule “not example.com”' <<<"$out"
+check "...over your own --allow" lacks HTTP200 "$out"
+check "the task names the project's rules" grep -q 'project rules: .*\.agentos\.cedar (1 rule)' <<<"$out"
+check "agent policy shows them, as the project's" grep -q "this project's: forbids only" <<<"$("$AGENT" policy)"
+printf '@id("mine")\npermit (principal, action == Action::"connect", resource == Host::"example.com");\n' > "$(dirname "$CFG")/policy.cedar"
+check "a project's forbid beats your permit" grep -q "forbidden by the project.s rule" <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" policy check connect example.com)"
+rm -f "$(dirname "$CFG")/policy.cedar"
+printf 'permit (principal, action, resource);\n' >> .agentos.cedar
+out="$("$AGENT" run -- true 2>&1)"
+check "a project file that permits anything stops the task" grep -q 'project rules can only forbid' <<<"$out"
+echo 'forbid (principal, action, resource' > .agentos.cedar
+check "...and so does one that doesn't parse" test "$("$AGENT" run -- true >/dev/null 2>&1; echo $?)" != 0
+cat > .agentos.cedar <<'CEDAR'
+forbid (principal, action == Action::"connect", resource == Host::"example.com");
+CEDAR
+"$AGENT" run -- sh -c 'echo "// nothing to see" > .agentos.cedar' 2>/dev/null
+check "agent diff flags an agent's change to the project's rules" grep -q 'this task changes .agentos.cedar' <<<"$("$AGENT" diff)"
+check "...which didn't loosen anything in the meantime" grep -q 'forbid' .agentos.cedar
+"$AGENT" rollback >/dev/null
+rm -f .agentos.cedar
 
 section "start tasks from agentd's console"
 reset_proj

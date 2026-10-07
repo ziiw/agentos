@@ -479,7 +479,9 @@ impl Gateway {
                 let policy = match (server.tools.get(&tool), &verdict) {
                     (Some(Policy::Deny), _) => Policy::Deny,
                     (_, Verdict::Forbid(rule)) => {
-                        return deny("forbidden", Some(rule.clone()), format!("agentos: the user's rules forbid this call (\u{201c}{rule}\u{201d})."));
+                        let (who, name) = crate::policy::whose(rule);
+                        let who = if who == "your" { "the user's" } else { who };
+                        return deny("forbidden", Some(rule.clone()), format!("agentos: {who} rules forbid this call (\u{201c}{name}\u{201d})."));
                     }
                     (_, Verdict::Permit(rule)) => return forward("rule", Some(rule.clone())),
                     (Some(p), _) => *p,

@@ -800,9 +800,13 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
     }
     let allowlist = Allowlist::parse(&allow)?;
-    // Your rules: a file that doesn't parse stops the task, never skipped.
+    // Your rules, and the project's (forbids only): a file that doesn't
+    // parse stops the task, never skipped.
     let policy_file = config::policy_path(&home);
-    let rules = policy::load(&policy_file, &home)?;
+    let yours = policy::load(&policy_file, &home)?;
+    let project_rules = config::find_project_rules(&cwd, &home);
+    let theirs = project_rules.as_deref().map(|f| policy::load_project(f, &home)).transpose()?;
+    let rules = policy::combine(yours, theirs)?;
     // The model gateway meters calls on the hosts the broker relays. With a
     // budget, it relays the model APIs this task can reach even when it has
     // no credential to add for them.
@@ -913,9 +917,18 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     eprintln!("{}", render::banner(err, &task, outbox.is_some(), plan.login.as_ref().is_some_and(|l| l.brokered)));
     let project = approvals::project_root(&cwd, &home);
     let rules = rules.map(|set| {
-        let names: Vec<String> = policy::rules(&set).into_iter().map(|(name, effect)| format!("{effect} {name}")).collect();
-        let _ = journal.append("task.policy", json!({ "file": policy_file, "rules": names }));
-        eprintln!("  {}", err.dim(format!("your rules: {} ({})", display_path(&policy_file), plural(names.len(), "rule"))));
+        let all = policy::rules(&set);
+        let names: Vec<String> = all.iter().map(|(name, effect)| format!("{effect} {name}")).collect();
+        let _ = journal.append("task.policy", json!({ "file": policy_file, "project_file": project_rules, "rules": names }));
+        let theirs = all.iter().filter(|(name, _)| name.starts_with("project: ")).count();
+        let mut shown = Vec::new();
+        if all.len() > theirs {
+            shown.push(format!("your rules: {} ({})", display_path(&policy_file), plural(all.len() - theirs, "rule")));
+        }
+        if let Some(f) = &project_rules {
+            shown.push(format!("project rules: {} ({})", display_path(f), plural(theirs, "rule")));
+        }
+        eprintln!("  {}", err.dim(shown.join(" · ")));
         Arc::new(policy::Policy::new(set, plan.agent.as_deref().unwrap_or("command"), task.id(), &project))
     });
     if let Some(l) = limits::current() {
@@ -1167,7 +1180,10 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Gate {
     Arc::new(move |host: &str, port: u16, listed: bool| {
         match rules.as_ref().map(|r| r.decide(&Question::connect(host, port))) {
-            Some(Verdict::Forbid(rule)) => return Err(format!("forbidden by your rule \u{201c}{rule}\u{201d}")),
+            Some(Verdict::Forbid(rule)) => {
+                let (who, name) = policy::whose(&rule);
+                return Err(format!("forbidden by {who} rule \u{201c}{name}\u{201d}"));
+            }
             Some(Verdict::Permit(rule)) if !listed => {
                 let _ = journal.append("net.approval", json!({ "host": host, "port": port, "decision": "rule", "rule": rule }));
                 return Ok(true);
@@ -1318,8 +1334,10 @@ impl Control {
             }
             Some(Verdict::Forbid(rule)) => {
                 record_rule("forbidden", Some(&rule));
+                let (who, name) = policy::whose(&rule);
+                let who = if who == "your" { "the user's" } else { who };
                 return Err(Reply::answer(format!(
-                    "Denied by the user's rules (\u{201c}{rule}\u{201d}). Carry on without it, and don't try to get it another way."
+                    "Denied by {who} rules (\u{201c}{name}\u{201d}). Carry on without it, and don't try to get it another way."
                 )));
             }
             _ => {}
@@ -1987,16 +2005,25 @@ fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
     let home = home_dir()?;
     let file = config::policy_path(&home);
     let out = Paint::stdout();
-    let Some(set) = policy::load(&file, &home)? else {
+    let project_file = config::find_project_rules(&std::env::current_dir()?, &home);
+    let theirs = project_file.as_deref().map(|f| policy::load_project(f, &home)).transpose()?;
+    let Some(set) = policy::combine(policy::load(&file, &home)?, theirs)? else {
         println!("no rules yet: write them in {} (see README: Rules)", display_path(&file));
         return Ok(0);
     };
     match command {
         None => {
-            println!("{}", out.bold(display_path(&file)));
-            for (name, effect) in policy::rules(&set) {
-                let effect = if effect == "forbid" { out.red(effect) } else { out.green(effect) };
-                println!("  {effect}  {name}");
+            let all = policy::rules(&set);
+            for (title, project) in [(display_path(&file), false), (project_file.as_deref().map(display_path).unwrap_or_default(), true)] {
+                let mine: Vec<_> = all.iter().filter(|(name, _)| name.starts_with("project: ") == project).collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                println!("{}{}", out.bold(title), if project { out.dim(" (this project's: forbids only)") } else { String::new() });
+                for (name, effect) in mine {
+                    let effect = if *effect == "forbid" { out.red(*effect) } else { out.green(*effect) };
+                    println!("  {effect}  {}", name.trim_start_matches("project: "));
+                }
             }
         }
         Some(PolicyCommand::Check { action, target, args, agent }) => {
@@ -2022,7 +2049,10 @@ fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
             let project = approvals::project_root(&std::env::current_dir()?, &home);
             match policy::Policy::new(set, &agent, "check", &project).decide(&question) {
                 Verdict::Permit(rule) => println!("{} by \u{201c}{rule}\u{201d}: no question asked", out.green("permitted")),
-                Verdict::Forbid(rule) => println!("{} by \u{201c}{rule}\u{201d}", out.red("forbidden")),
+                Verdict::Forbid(rule) => {
+                    let (who, name) = policy::whose(&rule);
+                    println!("{} by {who} rule \u{201c}{name}\u{201d}", out.red("forbidden"));
+                }
                 Verdict::Undecided => println!("no rule matches: the allowlist and your config decide, or you're asked"),
             }
         }

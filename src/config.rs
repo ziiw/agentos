@@ -155,9 +155,18 @@ pub fn policy_path(home: &Path) -> PathBuf {
 
 /// The nearest `.agentos.toml` from `cwd` upwards, stopping before `$HOME` and `/`.
 pub fn find_project_config(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    find_in_project(cwd, home, PROJECT_FILE)
+}
+
+/// The nearest project rules (`.agentos.cedar`), the same way.
+pub fn find_project_rules(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    find_in_project(cwd, home, crate::policy::PROJECT_FILE)
+}
+
+fn find_in_project(cwd: &Path, home: &Path, name: &str) -> Option<PathBuf> {
     cwd.ancestors()
         .take_while(|dir| *dir != home && *dir != Path::new("/"))
-        .map(|dir| dir.join(PROJECT_FILE))
+        .map(|dir| dir.join(name))
         .find(|p| p.is_file())
 }
 

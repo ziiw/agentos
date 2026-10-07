@@ -380,6 +380,14 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], stat
             agentos::config::PROJECT_FILE
         );
     }
+    if shown.iter().any(|c| c.path.file_name().is_some_and(|n| n == agentos::policy::PROJECT_FILE)) {
+        let _ = writeln!(
+            out,
+            "\n{} this task changes {} (the project's rules, which apply to every task here without review). Read the change before you commit it.",
+            p.yellow("!"),
+            agentos::policy::PROJECT_FILE
+        );
+    }
     if stat_only {
         return out;
     }
@@ -625,7 +633,10 @@ fn describe(p: Paint, e: &Event) -> String {
             let rule = s(&d["rule"]);
             let answer = match d["decision"].as_str().unwrap_or_default() {
                 "rule" => p.green(format!("allowed by your rule \u{201c}{rule}\u{201d}")),
-                "forbidden" => p.yellow(format!("forbidden by your rule \u{201c}{rule}\u{201d}")),
+                "forbidden" => {
+                    let (who, name) = agentos::policy::whose(&rule);
+                    p.yellow(format!("forbidden by {who} rule \u{201c}{name}\u{201d}"))
+                }
                 "once" => p.green("you allowed it"),
                 "always" => p.green("you allowed it, always, for this project"),
                 "timeout" => p.yellow("no answer, not granted"),
@@ -640,7 +651,10 @@ fn describe(p: Paint, e: &Event) -> String {
             let rule = s(&d["rule"]);
             let how = match d["decision"].as_str().unwrap_or_default() {
                 "rule" => p.green(format!("allowed by your rule \u{201c}{rule}\u{201d}")),
-                "forbidden" => p.yellow(format!("forbidden by your rule \u{201c}{rule}\u{201d}")),
+                "forbidden" => {
+                    let (who, name) = agentos::policy::whose(&rule);
+                    p.yellow(format!("forbidden by {who} rule \u{201c}{name}\u{201d}"))
+                }
                 "read-only" => p.dim("read-only"),
                 "allowed" => p.dim("allowed by your config"),
                 "call" => p.green("you allowed this call"),
