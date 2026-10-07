@@ -39,9 +39,22 @@ pub struct Journal {
     path: PathBuf,
 }
 
+/// `v` with object keys sorted at every level: the form that is hashed and
+/// written. (serde_json sorts keys by default, but a dependency can turn on
+/// its `preserve_order` feature, so the journal doesn't rely on that.)
+fn canonical(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&String, Value> = map.iter().map(|(k, v)| (k, canonical(v))).collect();
+            Value::Object(sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
 fn digest(seq: u64, ts_ms: u64, kind: &str, data: &Value, prev: &str) -> String {
-    // serde_json maps are sorted by key, so this serialization is canonical.
-    let body = json!({ "seq": seq, "ts_ms": ts_ms, "kind": kind, "data": data }).to_string();
+    let body = canonical(&json!({ "seq": seq, "ts_ms": ts_ms, "kind": kind, "data": data })).to_string();
     let mut h = Sha256::new();
     h.update(prev.as_bytes());
     h.update(b"\n");
@@ -92,6 +105,7 @@ impl Journal {
             None => (0, GENESIS.to_string()),
         };
         let ts_ms = now_ms();
+        let data = canonical(&data);
         let hash = digest(seq, ts_ms, kind, &data, &prev);
         let event = Event { seq, ts_ms, kind: kind.to_string(), data, prev, hash };
         writeln!(f, "{}", serde_json::to_string(&event)?)?;
@@ -156,6 +170,22 @@ mod tests {
             .collect();
         threads.into_iter().for_each(|t| t.join().unwrap());
         assert!(matches!(j.verify().unwrap(), Integrity::Intact { events: 200, .. }));
+    }
+
+    #[test]
+    fn hashes_are_independent_of_key_order() {
+        // An event written before agentos sorted keys itself (serde_json did).
+        let data = json!({ "b": 1, "a": { "y": [{ "q": 1, "p": 2 }], "x": true } });
+        let old = {
+            let body = r#"{"data":{"a":{"x":true,"y":[{"p":2,"q":1}]},"b":1},"kind":"k","seq":0,"ts_ms":5}"#;
+            let mut h = Sha256::new();
+            h.update(GENESIS.as_bytes());
+            h.update(b"\n");
+            h.update(body.as_bytes());
+            hex(&h.finalize())
+        };
+        assert_eq!(digest(0, 5, "k", &data, GENESIS), old);
+        assert_eq!(canonical(&data).to_string(), r#"{"a":{"x":true,"y":[{"p":2,"q":1}]},"b":1}"#);
     }
 
     #[test]

@@ -134,6 +134,11 @@ pub fn user_config_path(home: &Path) -> PathBuf {
     base.join("agentos").join("config.toml")
 }
 
+/// Your rules (Cedar), next to your config.
+pub fn policy_path(home: &Path) -> PathBuf {
+    user_config_path(home).with_file_name(crate::policy::FILE)
+}
+
 /// The nearest `.agentos.toml` from `cwd` upwards, stopping before `$HOME` and `/`.
 pub fn find_project_config(cwd: &Path, home: &Path) -> Option<PathBuf> {
     cwd.ancestors()

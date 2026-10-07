@@ -529,6 +529,7 @@ fn describe(p: Paint, e: &Event) -> String {
         "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
         "login.sealed" => format!("{} tokens moved to the vault", d["tokens"]),
+        "task.policy" => format!("your rules: {}", list(&d["rules"])),
         "task.limits" => {
             let l: agentos::limits::Limits = serde_json::from_value(d["limits"].clone()).unwrap_or_default();
             format!("{} ({})", l.describe(), s(&d["scope"]))
@@ -606,6 +607,7 @@ fn describe(p: Paint, e: &Event) -> String {
         "net.approval" => {
             let target = format!("{}:{}", s(&d["host"]), d["port"]);
             match d["decision"].as_str().unwrap_or_default() {
+                "rule" => format!("{} {target} · allowed by your rule \u{201c}{}\u{201d}", p.green("✓"), s(&d["rule"])),
                 "once" => format!("{} {target} · you allowed it for this task", p.green("?")),
                 "always" => format!("{} {target} · you allowed it, always, for this project", p.green("?")),
                 "timeout" => format!("{} {target} · no answer, denied", p.yellow("?")),
@@ -620,7 +622,10 @@ fn describe(p: Paint, e: &Event) -> String {
                 Some("write") => format!("change {}", s(&d["target"])),
                 _ => format!("reach {}", s(&d["target"])),
             };
+            let rule = s(&d["rule"]);
             let answer = match d["decision"].as_str().unwrap_or_default() {
+                "rule" => p.green(format!("allowed by your rule \u{201c}{rule}\u{201d}")),
+                "forbidden" => p.yellow(format!("forbidden by your rule \u{201c}{rule}\u{201d}")),
                 "once" => p.green("you allowed it"),
                 "always" => p.green("you allowed it, always, for this project"),
                 "timeout" => p.yellow("no answer, not granted"),
@@ -632,7 +637,10 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "mcp.start" => format!("started your MCP server {} ({})", s(&d["server"]), s(&d["command"])),
         "mcp.call" => {
+            let rule = s(&d["rule"]);
             let how = match d["decision"].as_str().unwrap_or_default() {
+                "rule" => p.green(format!("allowed by your rule \u{201c}{rule}\u{201d}")),
+                "forbidden" => p.yellow(format!("forbidden by your rule \u{201c}{rule}\u{201d}")),
                 "read-only" => p.dim("read-only"),
                 "allowed" => p.dim("allowed by your config"),
                 "call" => p.green("you allowed this call"),

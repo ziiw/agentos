@@ -613,7 +613,8 @@ TOML
   check "...but the server, run outside, has it" grep -q "read_note: .*token: set" <<<"$out"
   check "tools your config denies aren't even listed" grep -q '^tools: read_note,post_note$' <<<"$out"
   check "read-only tools run without asking" lacks '"target":"notes.read_note"' "$(cat "$WORK/questions")"
-  check "you're asked before a tool that changes things, with its arguments" grep -q '"kind":"tool".*"reason":"{\\"text\\":\\"hello\\"}".*"target":"notes.post_note"' "$WORK/questions"
+  check "you're asked before a tool that changes things" grep -q '"target":"notes.post_note"' "$WORK/questions"
+  check "...with its arguments" grep -q '"kind":"tool".*"reason":"{\\"text\\":\\"hello\\"}"' "$WORK/questions"
   check "...and once you allow it, it happens" grep -qx hello "$NOTES_FILE"
   check "what you deny doesn't happen" lacks nope "$(cat "$NOTES_FILE")"
   check "...and the agent is told" grep -q 'post_note: agentos: the user denied this call.*\[error\]' <<<"$out"
@@ -626,12 +627,85 @@ TOML
   check "agent log shows them" grep -q 'notes.post_note {"text":"hello"} · you allowed this call · ok' <<<"$("$AGENT" log)"
   check "the credential isn't journaled" bash -c "! grep -rq notes-token-0123456789 '$AGENTOS_HOME/tasks'"
   AGENTOS_CONFIG="$CFG" "$AGENT" do use the notes >/dev/null 2>&1
-  check "Claude gets your servers too, through agentos" grep -q '"notes":{"args":\["mcp","notes"\]' "$AGENT_STATE/last-argv"
+  check "Claude gets your servers too, through agentos" grep -q '"notes":{[^}]*"args":\["mcp","notes"\]' "$AGENT_STATE/last-argv"
   kill $ANSWERER 2>/dev/null; wait $ANSWERER 2>/dev/null
   kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
   unset NOTES_TOKEN NOTES_FILE
   : > "$CFG"
 fi
+
+section "your rules (policy.cedar)"
+reset_proj
+cd "$PROJ"
+RULES="$(dirname "$CFG")/policy.cedar"
+mkdir -p "$ASKED/rules-read" "$ASKED/rules-write"
+echo "readable by rule" > "$ASKED/rules-read/file"
+cat > "$CFG" <<TOML
+[mcp.notes]
+command = ["python3", "$HERE/fake-mcp-server"]
+env = ["NOTES_FILE"]
+TOML
+cat > "$RULES" <<CEDAR
+@id("read what we asked")
+permit (principal, action == Action::"read", resource)
+when { resource.path like "$ASKED/rules-*" };
+
+@id("never change it")
+forbid (principal, action == Action::"write", resource)
+when { resource.path like "$ASKED/rules-*" };
+
+@id("example.org for commands")
+permit (principal == Agent::"command", action == Action::"connect", resource == Host::"example.org");
+
+@id("not example.com")
+forbid (principal, action == Action::"connect", resource == Host::"example.com");
+
+@id("ok notes")
+permit (principal, action == Action::"call", resource == Tool::"notes.post_note")
+when { context.args has text && context.args.text == "ok" };
+
+@id("no reading notes")
+forbid (principal, action == Action::"call", resource == Tool::"notes.read_note");
+CEDAR
+run_rules() { AGENTOS_CONFIG="$CFG" "$AGENT" "$@"; }
+check "agent policy lists your rules" grep -q 'forbid  not example.com' <<<"$(run_rules policy)"
+check "agent policy check: permitted" grep -q 'permitted by “read what we asked”' <<<"$(run_rules policy check read "$ASKED/rules-read")"
+check "...forbidden" grep -q 'forbidden by “not example.com”' <<<"$(run_rules policy check connect example.com)"
+check "...a tool call, by its arguments" grep -q 'permitted by “ok notes”' <<<"$(run_rules policy check call notes.post_note --args '{"text":"ok"}')"
+check "...or no rule at all" grep -q 'no rule matches' <<<"$(run_rules policy check connect pypi.org)"
+export NOTES_FILE="$WORK/rule-notes.txt"
+: > "$NOTES_FILE"
+cp "$HERE/mcp-client" ./mcp-client
+cat > rules.sh <<SH
+mcp() { printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"\$1\",\"arguments\":\$2}}" | /run/agentos/agent mcp | sed 's/.*"text":"\([^"]*\)".*/\1/'; echo; }
+curl -sS -m 20 -o /dev/null -w 'example.com: HTTP%{http_code}\n' https://example.com 2>&1
+curl -sS -m 20 -o /dev/null -w 'example.org: HTTP%{http_code}\n' https://example.org
+mcp request_path_access '{"path":"$ASKED/rules-read","access":"read","reason":"r"}'
+echo "file: \$(cat $ASKED/rules-read/file 2>&1)"
+mcp request_path_access '{"path":"$ASKED/rules-write","access":"write","reason":"w"}'
+python3 ./mcp-client notes tools/list "tools/call:read_note:{}" "tools/call:post_note:{\"text\":\"ok\"}" "tools/call:post_note:{\"text\":\"other\"}"
+SH
+out="$(run_rules run --allow example.com --allow example.net -- sh rules.sh 2>&1 </dev/null)"
+events="$(latest_task_dir)/events.jsonl"
+check "the task says which rules apply" grep -q 'your rules: .*policy.cedar (6 rules)' <<<"$out"
+check "a forbid wins over your allowlist" grep -q 'blocked example.com:443: forbidden by your rule “not example.com”' <<<"$out"
+check "...so the host is out of reach" lacks 'example.com: HTTP200' "$out"
+check "a permit opens a host nobody was asked about" grep -q 'example.org: HTTP200' <<<"$out"
+check "a permit grants a folder without asking" grep -q 'file: readable by rule' <<<"$out"
+check "a forbid refuses a request without asking" grep -q 'Denied by the user.s rules (“never change it”)' <<<"$out"
+check "a rule can allow a tool call by its arguments" grep -qx ok "$NOTES_FILE"
+check "...and only that one: the rest still needs someone to ask" grep -q 'post_note: .*nobody can be asked' <<<"$out"
+check "a forbid refuses even a read-only tool" grep -q 'read_note: agentos: the user.s rules forbid this call' <<<"$out"
+check "rules' decisions are journaled, with the rule" grep -q '"kind":"agent.request".*"decision":"rule".*"rule":"read what we asked"' "$events"
+check "...for tool calls too" grep -q '"kind":"mcp.call".*"decision":"forbidden".*"rule":"no reading notes"' "$events"
+check "agent log names the rule" grep -q 'allowed by your rule “example.org for commands”' <<<"$(run_rules log)"
+echo 'permit (principal, action, resource' > "$RULES"
+out="$(run_rules run -- true 2>&1)"
+check "a rules file that doesn't parse stops the task" grep -q 'policy.cedar' <<<"$out"
+check "...rather than being skipped" test "$(run_rules run -- true >/dev/null 2>&1; echo $?)" != 0
+rm -f "$RULES" rules.sh mcp-client
+unset NOTES_FILE
+: > "$CFG"
 
 section "budgets (the model gateway)"
 # A stand-in model API: httpbin's /base64/… answers with whatever body the

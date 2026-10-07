@@ -219,6 +219,40 @@ Claude gets it automatically, as `github`; other agents reach it inside the sand
 
 Only your own config can declare servers: a project's `.agentos.toml` can't make agentos run anything on your machine. A server runs as you, with your access; agentos governs the calls the agent makes, not what the server can reach. Remote (HTTP) servers work through a stdio bridge such as `mcp-remote` for now.
 
+## Rules: answers you've already given
+
+Everything agentos would ask you about (a host, a folder, a tool call) can be answered in advance, in `~/.config/agentos/policy.cedar`, next to your config. The rules are [Cedar](https://www.cedarpolicy.com) policies, the language behind AWS Verified Permissions, evaluated by deterministic code:
+
+```cedar
+@id("read code")
+permit (principal, action == Action::"read", resource)
+when { resource.path like "~/code/*" };
+
+@id("no paste sites")
+forbid (principal, action == Action::"connect", resource)
+when { resource.name like "*paste*" };
+
+@id("issues in our repo")
+permit (principal, action == Action::"call", resource == Tool::"github.create_issue")
+when { context.args has repo && context.args.repo == "agentos" };
+```
+
+- **A `forbid` that matches refuses**, and wins over everything: your allowlist, an agent's defaults, a read-only tool.
+- **A `permit` that matches allows without asking.**
+- **When nothing matches, you're asked**, as before.
+- Rules work without a terminal: background tasks and `--no-ask` tasks follow them too.
+
+What a rule sees:
+
+| | |
+|---|---|
+| principal | `Agent::"claude"` (the agent's name; `Agent::"command"` for `agent run`) |
+| actions | `Action::"connect"`, `"read"` and `"write"` (folders asked for mid-task), `"call"` (your MCP servers' tools) |
+| resources | `Host::"pypi.org"` {name, port}, `Path::"/home/you/code/lib"` {path}, `Tool::"github.create_issue"` {server, name} |
+| context | `agent`, `task`, `project`, `reason` (the agent's own words, when it asked), `args` (a tool call's arguments) |
+
+`"~/…"` in a string means your home. `agent policy` lists your rules, and `agent policy check read ~/code/lib` (or `connect pypi.org`, or `call github.create_issue --args '{"repo":"x"}'`) tells you what they'd say. Every decision a rule makes is journaled with the rule's name. A rules file that doesn't parse stops tasks rather than being skipped, and agents can never be granted it.
+
 ## Budgets
 
 ```bash
@@ -329,6 +363,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
 - **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
 - **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work. With a budget, that includes model APIs.
+- **Rules can't loosen the hard limits.** Credentials in your home, the task store and your config are never offered, whatever a `permit` says, and folders outside your home stay read-only mid-task when Landlock is on.
 - **The agent writes its own reasons.** An agent steered by something it read can write a convincing one. Judge the request, not the prose.
 - **A folder added mid-task stays until the task ends.**
 - **An MCP server marks its own tools read-only**, and agentos trusts that hint since the server is yours. If you don't, set the tool to `ask`.
@@ -359,6 +394,7 @@ src/broker.rs    credential broker (per-task CA, HTTP/1.1 relay)
 src/gateway.rs   model gateway: usage metering, prices, budgets
 src/control.rs   the agent's requests from inside (control socket), and what may be granted
 src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway to yours
+src/policy.rs    your rules (Cedar): answers given in advance
 src/main.rs      CLI          src/render.rs   output
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run

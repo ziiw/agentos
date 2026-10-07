@@ -16,6 +16,7 @@ pub mod journal;
 pub mod limits;
 pub mod mcp;
 pub mod outbox;
+pub mod policy;
 pub mod profiles;
 pub mod proxy;
 pub mod sandbox;

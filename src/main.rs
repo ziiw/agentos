@@ -8,6 +8,7 @@ use agentos::gateway::{self, Budget, Endpoint, Meter, Price};
 use agentos::journal::{Integrity, Journal};
 use agentos::limits::{self, Limits};
 use agentos::outbox;
+use agentos::policy::{self, Question, Verdict};
 use agentos::profiles::{self, AgentEvent, Output};
 use agentos::proxy::{self, Allowlist, NetEvent};
 use agentos::sandbox::{self, GrantMount, Mount, RunMount};
@@ -167,10 +168,33 @@ enum Command {
         /// The file (default: the nearest .agentos.toml from here)
         path: Option<PathBuf>,
     },
+    /// Your rules for what agents may do without asking (policy.cedar):
+    /// list them, or check what they say about a request
+    Policy {
+        #[command(subcommand)]
+        command: Option<PolicyCommand>,
+    },
     /// MCP server for agents, run inside their sandbox: agentos's own, or
     /// the gateway to one of yours
     #[command(hide = true)]
     Mcp { server: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// What your rules say about one request
+    Check {
+        /// connect, read, write or call
+        action: String,
+        /// HOST[:PORT], a path, or SERVER.TOOL
+        target: String,
+        /// A tool call's arguments, as JSON
+        #[arg(long, value_name = "JSON")]
+        args: Option<String>,
+        /// The agent asking
+        #[arg(long, default_value = "claude")]
+        agent: String,
+    },
 }
 
 #[derive(Args)]
@@ -396,6 +420,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
         Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
+        Command::Policy { command } => cmd_policy(command),
         Command::Mcp { .. } => unreachable!(),
     }
 }
@@ -772,6 +797,9 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
     }
     let allowlist = Allowlist::parse(&allow)?;
+    // Your rules: a file that doesn't parse stops the task, never skipped.
+    let policy_file = config::policy_path(&home);
+    let rules = policy::load(&policy_file, &home)?;
     // The model gateway meters calls on the hosts the broker relays. With a
     // budget, it relays the model APIs this task can reach even when it has
     // no credential to add for them.
@@ -879,6 +907,13 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         journal.append("outbox.ready", json!({ "remotes": o.remotes }))?;
     }
     eprintln!("{}", render::banner(err, &task, outbox.is_some(), plan.login.as_ref().is_some_and(|l| l.brokered)));
+    let project = approvals::project_root(&cwd, &home);
+    let rules = rules.map(|set| {
+        let names: Vec<String> = policy::rules(&set).into_iter().map(|(name, effect)| format!("{effect} {name}")).collect();
+        let _ = journal.append("task.policy", json!({ "file": policy_file, "rules": names }));
+        eprintln!("  {}", err.dim(format!("your rules: {} ({})", display_path(&policy_file), plural(names.len(), "rule"))));
+        Arc::new(policy::Policy::new(set, plan.agent.as_deref().unwrap_or("command"), task.id(), &project))
+    });
     if let Some(l) = limits::current() {
         eprintln!("  {}", err.dim(format!("limits: {}", l.describe())));
         journal.append("task.limits", json!({ "limits": l, "scope": limits::scope_name() }))?;
@@ -986,16 +1021,16 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             .flatten()
             .map(Arc::new);
         if let Some(listener) = proxy_listener.take() {
-            let approver = asker.clone().map(|a| approver(a, journal.clone(), expected_denials.clone(), err));
+            let gate = gate(asker.clone(), rules.clone(), journal.clone(), expected_denials.clone(), err);
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
-            proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, approver, sink));
+            proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, Some(gate), sink));
         }
-        let project = home_dir().map(|h| approvals::project_root(&cwd, &h)).unwrap_or_else(|_| cwd.clone());
         let gateway = Arc::new(gateway_for(
             mcp_servers.clone(),
             &cwd,
             &task.dir,
             asker.clone(),
+            rules.clone(),
             approvals::remembered_tools(store.root(), &project).unwrap_or_default(),
             journal.clone(),
             err,
@@ -1006,7 +1041,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
                 task_id: task.id().to_string(),
                 store_root: store.root().to_path_buf(),
                 // An agent that could change these would widen its next task.
-                private: vec![store.root().to_path_buf(), config::user_config_path(&home), agents_dir(&home)],
+                private: vec![store.root().to_path_buf(), config::user_config_path(&home), agents_dir(&home), config::policy_path(&home)],
                 hidden: task.meta.hidden.clone(),
                 home,
                 cwd: cwd.clone(),
@@ -1014,6 +1049,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
                 allow: (task.meta.net == Net::Proxy).then(|| live_allow.clone()),
                 net: task.meta.net,
                 asker: asker.clone(),
+                rules: rules.clone(),
                 no_asker: match ask {
                     Ask::Never => "this task runs without questions (--no-ask)",
                     _ => "there's no terminal to ask at and agentd isn't running",
@@ -1122,16 +1158,31 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
 
 /// Asks at the terminal about hosts outside the allowlist, if there's a
 /// terminal to ask at.
-fn approver(asker: Arc<Asker>, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Approver {
-    Arc::new(move |host: &str, port: u16| {
-        if expected.iter().any(|(h, _)| h == host) {
-            return false;
+/// Decides each connection through the proxy: your rules first (a forbid
+/// refuses even a listed host), then the allowlist, then you.
+fn gate(asker: Option<Arc<Asker>>, rules: Option<Arc<policy::Policy>>, journal: Journal, expected: Vec<(String, String)>, err: Paint) -> proxy::Gate {
+    Arc::new(move |host: &str, port: u16, listed: bool| {
+        match rules.as_ref().map(|r| r.decide(&Question::connect(host, port))) {
+            Some(Verdict::Forbid(rule)) => return Err(format!("forbidden by your rule \u{201c}{rule}\u{201d}")),
+            Some(Verdict::Permit(rule)) if !listed => {
+                let _ = journal.append("net.approval", json!({ "host": host, "port": port, "decision": "rule", "rule": rule }));
+                return Ok(true);
+            }
+            _ => {}
         }
+        let refused = || Err("not in the allowlist".to_string());
+        if listed {
+            return Ok(false);
+        }
+        if expected.iter().any(|(h, _)| h == host) {
+            return refused();
+        }
+        let Some(asker) = &asker else { return refused() };
         let (decision, asked) = asker.ask(&Request::host(host, port), |s| err.cyan(s));
         if asked {
             let _ = journal.append("net.approval", json!({ "host": host, "port": port, "decision": decision.label() }));
         }
-        decision.allows()
+        if decision.allows() { Ok(true) } else { refused() }
     })
 }
 
@@ -1142,6 +1193,7 @@ fn gateway_for(
     cwd: &Path,
     task_dir: &Path,
     asker: Option<Arc<Asker>>,
+    rules: Option<Arc<policy::Policy>>,
     remembered: Vec<String>,
     journal: Journal,
     err: Paint,
@@ -1149,7 +1201,7 @@ fn gateway_for(
     let ask: Box<dyn Fn(&Request) -> Option<approvals::Decision> + Send + Sync> =
         Box::new(move |req: &Request| asker.as_ref().map(|a| a.ask(req, |s| err.cyan(s)).0));
     let tell: Box<dyn Fn(String) + Send + Sync> = Box::new(move |text| say(format!("{} {text}", err.yellow("agent: warning:"))));
-    agentos::mcp::Gateway::new(servers, cwd.to_path_buf(), task_dir.to_path_buf(), ask, remembered, journal, tell)
+    agentos::mcp::Gateway::new(servers, cwd.to_path_buf(), task_dir.to_path_buf(), ask, rules, remembered, journal, tell)
 }
 
 /// Answers what the agent asks agentos from inside its sandbox (through
@@ -1167,6 +1219,8 @@ struct Control {
     allow: Option<proxy::LiveAllowlist>,
     net: Net,
     asker: Option<Arc<Asker>>,
+    /// Your rules, which answer before you're asked.
+    rules: Option<Arc<policy::Policy>>,
     /// Why nobody can be asked, when there's no asker.
     no_asker: &'static str,
     attacher: Arc<sandbox::Attacher>,
@@ -1235,7 +1289,8 @@ impl Control {
     }
 
     /// Asks you, and journals the request and your answer.
-    fn ask(&self, kind: Kind, target: &str, reason: &str) -> std::result::Result<approvals::Decision, Reply> {
+    /// Your rules answer first; then you're asked.
+    fn ask(&self, kind: Kind, target: &str, reason: &str, question: Question) -> std::result::Result<approvals::Decision, Reply> {
         let reason = approvals::sanitize(reason, 300);
         let req = Request { kind, target: approvals::sanitize(target, 200), reason: Some(reason.clone()) };
         let label = match kind {
@@ -1244,9 +1299,27 @@ impl Control {
             Kind::Write => "write",
             Kind::Tool => "tool",
         };
-        let record = |decision: &str| {
-            let _ = self.journal.append("agent.request", json!({ "kind": label, "target": req.target, "reason": reason, "decision": decision }));
+        let record_rule = |decision: &str, rule: Option<&str>| {
+            let mut data = json!({ "kind": label, "target": req.target, "reason": reason, "decision": decision });
+            if let Some(rule) = rule {
+                data["rule"] = json!(rule);
+            }
+            let _ = self.journal.append("agent.request", data);
         };
+        let record = |decision: &str| record_rule(decision, None);
+        match self.rules.as_ref().map(|r| r.decide(&question.with_reason(&reason))) {
+            Some(Verdict::Permit(rule)) => {
+                record_rule("rule", Some(&rule));
+                return Ok(approvals::Decision::Once);
+            }
+            Some(Verdict::Forbid(rule)) => {
+                record_rule("forbidden", Some(&rule));
+                return Err(Reply::answer(format!(
+                    "Denied by the user's rules (\u{201c}{rule}\u{201d}). Carry on without it, and don't try to get it another way."
+                )));
+            }
+            _ => {}
+        }
         let Some(asker) = &self.asker else {
             record("nobody to ask");
             say(format!("{} the agent asked for {} ({}), but {}", self.err.yellow("agent:"), req.target, label, self.no_asker));
@@ -1279,7 +1352,7 @@ impl Control {
         if allow.read().is_ok_and(|a| a.allows(&host, port)) {
             return Reply::answer(format!("{entry} is already allowed: connect to it over HTTPS (through $HTTPS_PROXY)."));
         }
-        match self.ask(Kind::Host, &entry, reason) {
+        match self.ask(Kind::Host, &entry, reason, Question::connect(&host, port)) {
             Ok(decision) => {
                 if let Ok(mut a) = allow.write() {
                     let _ = a.add(&entry);
@@ -1321,7 +1394,7 @@ impl Control {
             Ok(PathVerdict::AlreadyReadable) if !write => return Reply::answer(format!("You can already read {}.", path.display())),
             Ok(_) => {}
         }
-        if let Err(reply) = self.ask(if write { Kind::Write } else { Kind::Read }, &shown, reason) {
+        if let Err(reply) = self.ask(if write { Kind::Write } else { Kind::Read }, &shown, reason, Question::path(write, &path)) {
             return reply;
         }
         match self.grant(&path, write) {
@@ -1904,6 +1977,53 @@ fn cmd_log(store: &Store, selector: Option<&str>, raw: bool) -> Result<i32> {
             Ok(1)
         }
     }
+}
+
+fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
+    let home = home_dir()?;
+    let file = config::policy_path(&home);
+    let out = Paint::stdout();
+    let Some(set) = policy::load(&file, &home)? else {
+        println!("no rules yet: write them in {} (see README: Rules)", display_path(&file));
+        return Ok(0);
+    };
+    match command {
+        None => {
+            println!("{}", out.bold(display_path(&file)));
+            for (name, effect) in policy::rules(&set) {
+                let effect = if effect == "forbid" { out.red(effect) } else { out.green(effect) };
+                println!("  {effect}  {name}");
+            }
+        }
+        Some(PolicyCommand::Check { action, target, args, agent }) => {
+            let question = match policy::Action::parse(&action) {
+                Some(policy::Action::Connect) => {
+                    let (host, port) = target.rsplit_once(':').and_then(|(h, p)| Some((h, p.parse().ok()?))).unwrap_or((target.as_str(), 443));
+                    Question::connect(&host.to_ascii_lowercase(), port)
+                }
+                Some(a @ (policy::Action::Read | policy::Action::Write)) => {
+                    let path = control::resolve(&target, &home, &std::env::current_dir()?)?;
+                    Question::path(a == policy::Action::Write, &path)
+                }
+                Some(policy::Action::Call) => {
+                    let (server, tool) = target.split_once('.').context("call: give SERVER.TOOL, e.g. github.create_issue")?;
+                    let args: serde_json::Value = match args {
+                        Some(a) => serde_json::from_str(&a).context("--args: not JSON")?,
+                        None => json!({}),
+                    };
+                    Question::call(server, tool, &args)
+                }
+                None => bail!("{action}: expected connect, read, write or call"),
+            };
+            let project = approvals::project_root(&std::env::current_dir()?, &home);
+            match policy::Policy::new(set, &agent, "check", &project).decide(&question) {
+                Verdict::Permit(rule) => println!("{} by \u{201c}{rule}\u{201d}: no question asked", out.green("permitted")),
+                Verdict::Forbid(rule) => println!("{} by \u{201c}{rule}\u{201d}", out.red("forbidden")),
+                Verdict::Undecided => println!("no rule matches: the allowlist and your config decide, or you're asked"),
+            }
+        }
+    }
+    Ok(0)
 }
 
 fn cmd_doctor(store: &Store) -> Result<i32> {

@@ -12,6 +12,7 @@
 use crate::approvals::{Decision, Kind, Request};
 use crate::control::{self, Call, Reply};
 use crate::journal::Journal;
+use crate::policy::{Policy as Rules, Question, Verdict};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -247,6 +248,8 @@ pub struct Gateway {
     pub log_dir: PathBuf,
     /// Asks you; `None` when nobody can be asked.
     pub ask: Box<dyn Fn(&Request) -> Option<Decision> + Send + Sync>,
+    /// Your rules, which answer before you're asked.
+    pub rules: Option<Arc<Rules>>,
     /// `server.tool` approved "always" for this project.
     pub remembered: Vec<String>,
     pub journal: Journal,
@@ -262,8 +265,18 @@ struct Session {
     read_only: HashMap<String, bool>,
     /// Pending tools/list requests (ids).
     listing: HashSet<String>,
-    /// Pending tools/call requests: id → (tool, arguments, how it was allowed, when).
-    calls: HashMap<String, (String, Value, &'static str, Instant)>,
+    /// Pending tools/call requests, by id.
+    calls: HashMap<String, Pending>,
+}
+
+/// A tool call on its way to the server.
+struct Pending {
+    tool: String,
+    args: Value,
+    /// How it was allowed (journaled as `decision`).
+    how: &'static str,
+    rule: Option<String>,
+    started: Instant,
 }
 
 fn send(w: &Mutex<impl Write>, msg: &Value) {
@@ -284,11 +297,12 @@ impl Gateway {
         cwd: PathBuf,
         log_dir: PathBuf,
         ask: Box<dyn Fn(&Request) -> Option<Decision> + Send + Sync>,
+        rules: Option<Arc<Rules>>,
         remembered: Vec<String>,
         journal: Journal,
         say: Box<dyn Fn(String) + Send + Sync>,
     ) -> Gateway {
-        Gateway { servers, cwd, log_dir, ask, remembered, journal, say, children: Mutex::new(Vec::new()) }
+        Gateway { servers, cwd, log_dir, ask, rules, remembered, journal, say, children: Mutex::new(Vec::new()) }
     }
 
     /// Ends the servers still running (the task is over).
@@ -390,15 +404,16 @@ impl Gateway {
                 return msg.to_string();
             }
         }
-        if let Some((tool, args, how, started)) = s.calls.remove(&id) {
+        if let Some(p) = s.calls.remove(&id) {
             let failed = msg.get("error").is_some() || msg["result"]["isError"].as_bool() == Some(true);
-            let _ = self.journal.append(
-                "mcp.call",
-                json!({
-                    "server": server.name, "tool": tool, "arguments": summary(&args, 1000), "decision": how,
-                    "error": failed, "bytes": line.len(), "ms": started.elapsed().as_millis() as u64,
-                }),
-            );
+            let mut data = json!({
+                "server": server.name, "tool": p.tool, "arguments": summary(&p.args, 1000), "decision": p.how,
+                "error": failed, "bytes": line.len(), "ms": p.started.elapsed().as_millis() as u64,
+            });
+            if let Some(rule) = p.rule {
+                data["rule"] = json!(rule);
+            }
+            let _ = self.journal.append("mcp.call", data);
         }
         line
     }
@@ -445,28 +460,36 @@ impl Gateway {
                 let args = msg["params"]["arguments"].clone();
                 let read_only = session.lock().ok().and_then(|s| s.read_only.get(&tool).copied()).unwrap_or(false);
                 let target = format!("{}.{tool}", server.name);
-                let policy = match server.tools.get(&tool) {
-                    Some(p) => *p,
-                    None if read_only || self.remembered.contains(&target) => Policy::Allow,
-                    None => Policy::Ask,
-                };
-                let forward = |how: &'static str| {
+                let verdict = self.rules.as_ref().map(|r| r.decide(&Question::call(&server.name, &tool, &args))).unwrap_or(Verdict::Undecided);
+                let forward = |how: &'static str, rule: Option<String>| {
                     if let Ok(mut s) = session.lock() {
-                        s.calls.insert(id.to_string(), (tool.clone(), args.clone(), how, Instant::now()));
+                        s.calls.insert(id.to_string(), Pending { tool: tool.clone(), args: args.clone(), how, rule, started: Instant::now() });
                     }
                     send(to_server, &msg);
                 };
-                let deny = |how: &'static str, text: String| {
-                    let _ = self.journal.append(
-                        "mcp.call",
-                        json!({ "server": server.name, "tool": tool, "arguments": summary(&args, 1000), "decision": how, "error": true, "bytes": 0, "ms": 0 }),
-                    );
+                let deny = |how: &'static str, rule: Option<String>, text: String| {
+                    let mut data = json!({ "server": server.name, "tool": tool, "arguments": summary(&args, 1000), "decision": how, "error": true, "bytes": 0, "ms": 0 });
+                    if let Some(rule) = rule {
+                        data["rule"] = json!(rule);
+                    }
+                    let _ = self.journal.append("mcp.call", data);
                     send(to_agent, &json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": text }], "isError": true } }));
                 };
+                // Your config's deny, then your rules, then the rest.
+                let policy = match (server.tools.get(&tool), &verdict) {
+                    (Some(Policy::Deny), _) => Policy::Deny,
+                    (_, Verdict::Forbid(rule)) => {
+                        return deny("forbidden", Some(rule.clone()), format!("agentos: the user's rules forbid this call (\u{201c}{rule}\u{201d})."));
+                    }
+                    (_, Verdict::Permit(rule)) => return forward("rule", Some(rule.clone())),
+                    (Some(p), _) => *p,
+                    (None, _) if read_only || self.remembered.contains(&target) => Policy::Allow,
+                    (None, _) => Policy::Ask,
+                };
                 match policy {
-                    Policy::Allow if read_only => forward("read-only"),
-                    Policy::Allow => forward("allowed"),
-                    Policy::Deny => deny("denied by config", format!("agentos: the user's config doesn't allow {target}.")),
+                    Policy::Allow if read_only => forward("read-only", None),
+                    Policy::Allow => forward("allowed", None),
+                    Policy::Deny => deny("denied by config", None, format!("agentos: the user's config doesn't allow {target}.")),
                     Policy::Ask => {
                         // Asking can take a while; other messages keep flowing.
                         let (gw, server, session, to_server, to_agent) = (self.clone(), server.clone(), session.clone(), to_server.clone(), to_agent.clone());
@@ -475,7 +498,7 @@ impl Gateway {
                             match (gw.ask)(&req) {
                                 Some(d) if d.allows() => {
                                     if let Ok(mut s) = session.lock() {
-                                        s.calls.insert(id.to_string(), (tool, args, d.label(), Instant::now()));
+                                        s.calls.insert(id.to_string(), Pending { tool, args, how: d.label(), rule: None, started: Instant::now() });
                                     }
                                     send(&to_server, &msg);
                                 }

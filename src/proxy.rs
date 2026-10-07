@@ -144,8 +144,11 @@ pub struct NetEvent {
 
 pub type Sink = Arc<dyn Fn(NetEvent) + Send + Sync>;
 
-/// Decides about hosts outside the allowlist, e.g. by asking you. `true` allows.
-pub type Approver = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
+/// Decides about every connection; `listed` says whether the allowlist has
+/// the host. `Ok(approved)` lets it through (`approved`: although it isn't
+/// listed, e.g. you said yes); `Err(reason)` refuses it, even a listed host
+/// (your policy forbids it).
+pub type Gate = Arc<dyn Fn(&str, u16, bool) -> std::result::Result<bool, String> + Send + Sync>;
 
 pub struct Handle {
     active: Arc<AtomicUsize>,
@@ -175,15 +178,15 @@ pub type LiveAllowlist = Arc<std::sync::RwLock<Allowlist>>;
 /// Serves connections on background threads, reporting each one to `sink`.
 /// Hosts the `broker` holds credentials for are relayed through it.
 /// Threads must only be started after the sandbox has been forked.
-pub fn serve(listener: UnixListener, allow: LiveAllowlist, broker: Option<Arc<Broker>>, approver: Option<Approver>, sink: Sink) -> Handle {
+pub fn serve(listener: UnixListener, allow: LiveAllowlist, broker: Option<Arc<Broker>>, gate: Option<Gate>, sink: Sink) -> Handle {
     let active = Arc::new(AtomicUsize::new(0));
     let counter = active.clone();
     thread::spawn(move || {
         for client in listener.incoming().flatten() {
             counter.fetch_add(1, Ordering::SeqCst);
-            let (allow, broker, approver, sink, counter) = (allow.clone(), broker.clone(), approver.clone(), sink.clone(), counter.clone());
+            let (allow, broker, gate, sink, counter) = (allow.clone(), broker.clone(), gate.clone(), sink.clone(), counter.clone());
             thread::spawn(move || {
-                if let Some(event) = handle(client, &allow, broker.as_deref(), approver.as_ref()) {
+                if let Some(event) = handle(client, &allow, broker.as_deref(), gate.as_ref()) {
                     sink(event);
                 }
                 counter.fetch_sub(1, Ordering::SeqCst);
@@ -193,7 +196,7 @@ pub fn serve(listener: UnixListener, allow: LiveAllowlist, broker: Option<Arc<Br
     Handle { active }
 }
 
-fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>, approver: Option<&Approver>) -> Option<NetEvent> {
+fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>, gate: Option<&Gate>) -> Option<NetEvent> {
     let start = Instant::now();
     let head = read_head(&mut client).ok()?;
     let mut words = head.lines().next().unwrap_or_default().split_whitespace();
@@ -227,12 +230,12 @@ fn handle(mut client: UnixStream, allow: &LiveAllowlist, broker: Option<&Broker>
     };
     (event.host, event.port) = (host.clone(), port);
     let listed = allow.read().is_ok_and(|a| a.allows(&host, port));
-    if !listed {
-        // The agent's connection waits while you're asked.
-        if !approver.is_some_and(|approve| approve(&host, port)) {
-            return refuse("403 Forbidden", "not in the allowlist", event);
-        }
-        event.approved = true;
+    // The agent's connection waits while you're asked.
+    match gate.map(|g| g(&host, port, listed)) {
+        Some(Ok(approved)) => event.approved = approved,
+        Some(Err(reason)) => return refuse("403 Forbidden", &reason, event),
+        None if listed => {}
+        None => return refuse("403 Forbidden", "not in the allowlist", event),
     }
     let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
         Ok(a) => a.filter(|a| is_public(a.ip())).collect(),
