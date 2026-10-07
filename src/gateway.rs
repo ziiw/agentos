@@ -35,13 +35,17 @@ pub enum Api {
     Anthropic,
     /// Chat Completions and Responses (`usage` with cached input details).
     Openai,
+    /// generateContent and streamGenerateContent (`usageMetadata`).
+    Gemini,
 }
 
 /// Where model calls go: requests to this host and path are metered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Endpoint {
     pub host: String,
-    /// The exact path, or a prefix when it ends with `*`. The query is ignored.
+    /// The exact path, or a prefix when it ends with `*`. A segment may also
+    /// start with `*` to match any model name before a fixed ending, as in
+    /// `/v1beta/models/*:generateContent`. The query is ignored.
     pub path: String,
     pub api: Api,
 }
@@ -64,8 +68,23 @@ impl Endpoint {
         self.host == host
             && match self.path.strip_suffix('*') {
                 Some(prefix) => path.starts_with(prefix),
+                None if self.path.contains("/*") => segments_match(&self.path, path),
                 None => path == self.path,
             }
+    }
+}
+
+/// Like `path_matches`, but a segment starting with `*` matches any segment
+/// that ends the same way (`*:generateContent`).
+fn segments_match(pattern: &str, path: &str) -> bool {
+    let (mut p, mut q) = (pattern.split('/'), path.trim_end_matches('/').split('/'));
+    loop {
+        match (p.next(), q.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) if a.strip_prefix('*').is_some_and(|end| b.len() > end.len() && b.ends_with(end)) => {}
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
     }
 }
 
@@ -77,6 +96,10 @@ pub fn builtin_endpoints() -> Vec<Endpoint> {
         ("api.openai.com", "/v1/chat/completions", Api::Openai),
         ("api.openai.com", "/v1/completions", Api::Openai),
         ("api.openai.com", "/v1/embeddings", Api::Openai),
+        ("generativelanguage.googleapis.com", "/v1beta/models/*:generateContent", Api::Gemini),
+        ("generativelanguage.googleapis.com", "/v1beta/models/*:streamGenerateContent", Api::Gemini),
+        ("generativelanguage.googleapis.com", "/v1/models/*:generateContent", Api::Gemini),
+        ("generativelanguage.googleapis.com", "/v1/models/*:streamGenerateContent", Api::Gemini),
     ]
     .map(|(host, path, api)| Endpoint { host: host.into(), path: path.into(), api })
     .to_vec()
@@ -96,6 +119,11 @@ const UNMETERABLE: &[(&str, &str, &str)] = &[
     ("api.openai.com", "/v1/threads/runs", "Assistants runs are billed as they run"),
     ("api.openai.com", "/v1/threads/*/runs", "Assistants runs are billed as they run"),
     ("api.openai.com", "/v1/realtime/*", "Realtime sessions are billed over a WebSocket"),
+    ("generativelanguage.googleapis.com", "/v1beta/models/*:batchGenerateContent", "Gemini batches are billed when they finish"),
+    ("generativelanguage.googleapis.com", "/v1beta/models/*:predict", "Imagen images are billed per image"),
+    ("generativelanguage.googleapis.com", "/v1beta/models/*:predictLongRunning", "Veo videos are billed per second"),
+    ("generativelanguage.googleapis.com", "/v1beta/models/*:embedContent", "embeddings responses report no usage"),
+    ("generativelanguage.googleapis.com", "/v1beta/models/*:batchEmbedContents", "embeddings responses report no usage"),
 ];
 
 /// Why a background Responses call can't be metered.
@@ -107,6 +135,7 @@ fn path_matches(pattern: &str, path: &str) -> bool {
         match (p.next(), q.next()) {
             (None, None) => return true,
             (Some("*"), Some(seg)) if !seg.is_empty() => {}
+            (Some(a), Some(b)) if a.strip_prefix('*').is_some_and(|end| b.len() > end.len() && b.ends_with(end)) => {}
             (Some(a), Some(b)) if a == b => {}
             _ => return false,
         }
@@ -634,7 +663,11 @@ impl Meter {
     /// report: why, and the API to answer in.
     pub fn unmeterable(&self, host: &str, path: &str) -> Option<(&'static str, Api)> {
         let (_, _, why) = UNMETERABLE.iter().find(|(h, p, _)| *h == host && path_matches(p, path))?;
-        let api = if host == "api.anthropic.com" { Api::Anthropic } else { Api::Openai };
+        let api = match host {
+            "api.anthropic.com" => Api::Anthropic,
+            "generativelanguage.googleapis.com" => Api::Gemini,
+            _ => Api::Openai,
+        };
         Some((why, api))
     }
 
@@ -770,6 +803,7 @@ fn error_response(api: Api, message: &str) -> (u16, &'static str, String) {
     let body = match api {
         Api::Anthropic => json!({ "type": "error", "error": { "type": "invalid_request_error", "message": message } }),
         Api::Openai => json!({ "error": { "message": message, "type": "invalid_request_error", "code": "budget_exhausted" } }),
+        Api::Gemini => json!({ "error": { "code": 400, "message": message, "status": "INVALID_ARGUMENT" } }),
     };
     (400, "Bad Request", body.to_string())
 }
@@ -1186,7 +1220,7 @@ impl Reader {
     /// are worth parsing (most are content deltas).
     fn event_line(&mut self, line: &[u8]) {
         let Some(data) = line.strip_prefix(b"data:") else { return };
-        if !data.windows(7).any(|w| w == b"\"usage\"") {
+        if !data.windows(6).any(|w| w == b"\"usage") {
             return;
         }
         if let Ok(v) = serde_json::from_slice::<Value>(data) {
@@ -1195,9 +1229,15 @@ impl Reader {
     }
 
     fn observe(&mut self, v: &Value) {
+        // Without `alt=sse`, a stream is one JSON array of chunks.
+        if let Some(chunks) = v.as_array() {
+            chunks.iter().for_each(|c| self.observe(c));
+            return;
+        }
         let found = match self.api {
             Api::Anthropic => anthropic(&mut self.seen, v),
             Api::Openai => openai(&mut self.seen, v),
+            Api::Gemini => gemini(&mut self.seen, v),
         };
         self.found |= found;
     }
@@ -1288,6 +1328,24 @@ fn openai(seen: &mut Seen, v: &Value) -> bool {
     true
 }
 
+/// A generateContent body or stream chunk. `usageMetadata` is cumulative, so
+/// the last chunk wins. The prompt count includes cached tokens; thinking
+/// and tool-use prompt tokens are billed too (as output and input).
+fn gemini(seen: &mut Seen, v: &Value) -> bool {
+    let usage = &v["usageMetadata"];
+    if !usage.is_object() {
+        return false;
+    }
+    if let Some(m) = v["modelVersion"].as_str() {
+        seen.model = Some(m.to_string());
+    }
+    let n = |k: &str| count(&usage[k]).unwrap_or(0);
+    let prompt = n("promptTokenCount") + n("toolUsePromptTokenCount");
+    let cached = n("cachedContentTokenCount").min(prompt);
+    seen.usage = Usage { input: prompt - cached, output: n("candidatesTokenCount") + n("thoughtsTokenCount"), cache_read: cached, ..Usage::default() };
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,6 +1418,33 @@ mod tests {
         );
         let seen = read(Api::Openai, "text/event-stream", responses, 13).unwrap();
         assert_eq!((seen.model.as_deref(), seen.usage.input, seen.usage.cache_read, seen.usage.output), (Some("gpt-y"), 30, 60, 7));
+    }
+
+    #[test]
+    fn gemini_shapes() {
+        let body = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":1000,"cachedContentTokenCount":400,"candidatesTokenCount":30,"thoughtsTokenCount":70,"totalTokenCount":1100},"modelVersion":"gemini-x"}"#;
+        let seen = read(Api::Gemini, "application/json", body, 5).unwrap();
+        assert_eq!(seen.model.as_deref(), Some("gemini-x"));
+        assert_eq!(seen.usage, Usage { input: 600, output: 100, cache_read: 400, ..Usage::default() });
+
+        let stream = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1},\"modelVersion\":\"gemini-x\"}\r\n\r\n",
+            "data: {\"candidates\":[],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":9,\"totalTokenCount\":19},\"modelVersion\":\"gemini-x\"}\r\n\r\n",
+        );
+        assert_eq!(read(Api::Gemini, "text/event-stream", stream, 3).unwrap().usage, Usage { input: 10, output: 9, ..Usage::default() });
+        // Without alt=sse: one JSON array of chunks.
+        let array = r#"[{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1}},{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":9}}]"#;
+        assert_eq!(read(Api::Gemini, "application/json", array, 8).unwrap().usage.output, 9);
+        assert!(read(Api::Gemini, "application/json", r#"{"error":{"code":429}}"#, 8).is_err());
+
+        let meter = Meter::new(builtin_endpoints(), Vec::new(), None, Arc::new(|_| {}));
+        let host = "generativelanguage.googleapis.com";
+        assert_eq!(meter.endpoint(host, "/v1beta/models/gemini-2.5-pro:generateContent"), Some(Api::Gemini));
+        assert_eq!(meter.endpoint(host, "/v1beta/models/gemini-2.5-pro:streamGenerateContent"), Some(Api::Gemini));
+        assert_eq!(meter.endpoint(host, "/v1beta/models/gemini-2.5-pro:countTokens"), None, "free");
+        assert_eq!(meter.endpoint(host, "/v1beta/models/:generateContent"), None);
+        assert!(meter.unmeterable(host, "/v1beta/models/gemini-x:batchGenerateContent").is_some());
+        assert!(meter.unmeterable(host, "/v1beta/models/gemini-x:generateContent").is_none());
     }
 
     #[test]

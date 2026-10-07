@@ -1,4 +1,7 @@
-# OpenAI Codex CLI. UNTESTED SKETCH: check the flags against `codex --help`.
+# OpenAI Codex CLI. Flags checked against `codex --help`
+# (0.147.0); not yet run end to end under agentos. API-key mode only (not
+# "Sign in with ChatGPT"). Add a [prices] entry for your model, or calls count
+# at the highest rate.
 # Copy to ~/.config/agentos/agents/codex.toml, then: agent do --agent codex "…"
 #
 # agentos is the sandbox and the review step, so Codex's own approvals and

@@ -436,9 +436,9 @@ allow = ["api.openai.com"]                 # hosts it needs
 OPENAI_API_KEY = "api.openai.com"
 ```
 
-An agent calling a model API other than Anthropic's or OpenAI's can list it before the first `[section]`, so its calls are metered and count against budgets: `models = [{ url = "https://openrouter.ai/api/v1/chat/completions", api = "openai" }]` (`api` is `anthropic` or `openai`; a trailing `*` in the URL matches any path under it).
+An agent calling a model API other than Anthropic's or OpenAI's can list it before the first `[section]`, so its calls are metered and count against budgets: `models = [{ url = "https://openrouter.ai/api/v1/chat/completions", api = "openai" }]` (`api` is `anthropic`, `openai` or `gemini`; Gemini, Anthropic's and OpenAI's own APIs are built in; a trailing `*` in the URL matches any path under it).
 
-`agent do --agent codex "…"` runs it like Claude: same sandbox, transactions, outbox, allowlist and broker, and its own persistent home. `agent agents` lists what you have, and `agent = "codex"` in your config makes it the default. [examples/agents/](examples/agents) has starting points for Codex, Gemini CLI and Aider. They're untested sketches, so check their flags.
+`agent do --agent codex "…"` runs it like Claude: same sandbox, transactions, outbox, allowlist and broker, and its own persistent home. `agent agents` lists what you have, and `agent = "codex"` in your config makes it the default. [examples/agents/](examples/agents) has starting points for Codex, Gemini CLI and Aider. Codex and Gemini's flags are checked against their `--help`, but neither has been run end to end under agentos yet; Aider is an untested sketch.
 
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 

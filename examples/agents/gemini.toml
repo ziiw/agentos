@@ -1,7 +1,10 @@
-# Google Gemini CLI. UNTESTED SKETCH: check the flags against `gemini --help`.
+# Google Gemini CLI. Flags checked against `gemini --help` (0.55.1); not yet run
+# end to end under agentos. API-key mode only (not "Login with Google").
+# Model calls are metered; add a [prices] entry for your model, or they count
+# at the highest rate.
 # Copy to ~/.config/agentos/agents/gemini.toml, then: agent do --agent gemini "…"
-run = ["gemini", "--yolo", "-p", "{task}"]
-interactive = ["gemini", "--yolo"]
+run = ["gemini", "--yolo", "--skip-trust", "-p", "{task}"]
+interactive = ["gemini", "--yolo", "--skip-trust"]
 allow = ["generativelanguage.googleapis.com"]
 
 [secrets]
