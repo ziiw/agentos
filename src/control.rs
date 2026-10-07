@@ -38,6 +38,9 @@ pub enum Call {
         write: bool,
         reason: String,
     },
+    /// Talk MCP to one of your servers: after a reply line, the connection
+    /// carries the session (see `mcp::Gateway`).
+    Mcp { server: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,25 +64,34 @@ impl Reply {
 
 pub type Handler = Arc<dyn Fn(Call) -> Reply + Send + Sync>;
 
+/// Takes over a connection that asked for an MCP server by name.
+pub type Relay = Arc<dyn Fn(String, UnixStream) + Send + Sync>;
+
 /// Creates the socket; serve it with [`serve`] once the sandbox is forked.
 pub fn bind(path: &Path) -> Result<UnixListener> {
     let _ = std::fs::remove_file(path);
     UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))
 }
 
-/// One call per connection: a JSON line in, a JSON line out. Each runs on
-/// its own thread, since an answer can take as long as you do.
-pub fn serve(listener: UnixListener, handler: Handler) {
+/// One call per connection: a JSON line in, a JSON line out (or an MCP
+/// session, handed to `relay`). Each runs on its own thread, since an
+/// answer can take as long as you do.
+pub fn serve(listener: UnixListener, handler: Handler, relay: Relay) {
     thread::spawn(move || {
         for conn in listener.incoming().flatten() {
-            let handler = handler.clone();
+            let (handler, relay) = (handler.clone(), relay.clone());
             thread::spawn(move || {
-                let mut line = String::new();
-                let mut reader = BufReader::new((&conn).take(64 * 1024));
-                if reader.read_line(&mut line).is_err() {
-                    return;
+                // Byte by byte, so nothing after the first line is consumed.
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                while line.len() < 64 * 1024 && !line.ends_with(b"\n") {
+                    match (&conn).read(&mut byte) {
+                        Ok(1) => line.push(byte[0]),
+                        _ => return,
+                    }
                 }
-                let reply = match serde_json::from_str::<Call>(line.trim()) {
+                let reply = match serde_json::from_slice::<Call>(&line) {
+                    Ok(Call::Mcp { server }) => return relay(server, conn),
                     Ok(call) => handler(call),
                     Err(e) => Reply::error(format!("malformed request: {e}")),
                 };
@@ -277,6 +289,7 @@ mod tests {
                 Call::Network { host, .. } => Reply::answer(format!("denied: {host}")),
                 _ => Reply::answer("info"),
             }),
+            Arc::new(|_, _| {}),
         );
         let reply = call(&sock, &Call::Network { host: "pypi.org".into(), port: None, reason: "deps".into() }).unwrap();
         assert_eq!(reply, Reply::answer("denied: pypi.org"));

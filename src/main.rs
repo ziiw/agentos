@@ -167,9 +167,10 @@ enum Command {
         /// The file (default: the nearest .agentos.toml from here)
         path: Option<PathBuf>,
     },
-    /// MCP server for agents, run inside their sandbox
+    /// MCP server for agents, run inside their sandbox: agentos's own, or
+    /// the gateway to one of yours
     #[command(hide = true)]
-    Mcp,
+    Mcp { server: Option<String> },
 }
 
 #[derive(Args)]
@@ -351,6 +352,8 @@ struct Plan {
     prices: Vec<(String, Price)>,
     /// Model APIs the agent calls beyond the well-known ones.
     models: Vec<Endpoint>,
+    /// Your MCP servers, reached through agentos.
+    mcp: Vec<agentos::mcp::Server>,
 }
 
 fn main() -> ExitCode {
@@ -366,8 +369,12 @@ fn main() -> ExitCode {
 
 fn dispatch(cli: Cli) -> Result<i32> {
     // Inside a sandbox: no task store there, just the control socket.
-    if let Command::Mcp = cli.command {
-        agentos::mcp::serve_stdio(Path::new(control::SOCKET))?;
+    if let Command::Mcp { server } = &cli.command {
+        let socket = Path::new(control::SOCKET);
+        match server {
+            None => agentos::mcp::serve_stdio(socket)?,
+            Some(name) => agentos::mcp::relay_stdio(socket, name)?,
+        }
         return Ok(0);
     }
     let store = Store::open()?;
@@ -389,7 +396,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
         Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
-        Command::Mcp => unreachable!(),
+        Command::Mcp { .. } => unreachable!(),
     }
 }
 
@@ -405,6 +412,7 @@ struct Applied {
     secrets: Vec<Secret>,
     budget: Option<Budget>,
     prices: Vec<(String, Price)>,
+    mcp: Vec<agentos::mcp::Server>,
 }
 
 /// Merges your config and a trusted project config into this task's grants.
@@ -424,7 +432,7 @@ fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Applied> {
             secrets.push(Secret::parse(&format!("{name}={target}"))?);
         }
     }
-    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices })
+    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp })
 }
 
 /// The task's budget: --budget, else your config's. The gateway enforces it
@@ -568,12 +576,13 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         Some(a) => a,
         None => config::load(store.root(), &std::env::current_dir()?, &home)?.agent.unwrap_or_else(|| "claude".into()),
     };
-    let profile = profiles::load(&agent, task.as_deref(), interactive, &home, &agents_dir(&home))?;
+    let applied = apply_config(store, &mut args.grants)?;
+    let mcp_names: Vec<String> = applied.mcp.iter().map(|m| m.name.clone()).collect();
+    let profile = profiles::load(&agent, task.as_deref(), interactive, &home, &agents_dir(&home), &mcp_names)?;
     let title = match &task {
         Some(t) => format!("{}: {t}", profile.name),
         None => format!("{} (interactive)", profile.name),
     };
-    let applied = apply_config(store, &mut args.grants)?;
     let (config_allow, config_secrets) = (applied.allow, applied.secrets);
     let net = args.net.unwrap_or(profile.net);
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
@@ -629,6 +638,7 @@ fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             budget,
             prices: applied.prices,
             models: profile.models,
+            mcp: applied.mcp,
         },
     )
 }
@@ -683,6 +693,7 @@ fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             budget,
             prices: applied.prices,
             models: Vec::new(),
+            mcp: applied.mcp,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {
@@ -955,6 +966,8 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
     let mut proxy_handle = None;
     // Grow while the task runs, when the agent asks and you agree.
     let grants = Arc::new(Mutex::new(task.meta.grants.clone()));
+    let mcp_servers = plan.mcp;
+    let mut gateway_slot: Option<Arc<agentos::mcp::Gateway>> = None;
     let live_allow = Arc::new(std::sync::RwLock::new(allowlist));
     let result = sandbox::run(&spec, stdout_tx, |report, attacher| {
         let kind = if report.error.is_some() { "sandbox.failed" } else { "sandbox.ready" };
@@ -977,6 +990,17 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
             proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, approver, sink));
         }
+        let project = home_dir().map(|h| approvals::project_root(&cwd, &h)).unwrap_or_else(|_| cwd.clone());
+        let gateway = Arc::new(gateway_for(
+            mcp_servers.clone(),
+            &cwd,
+            &task.dir,
+            asker.clone(),
+            approvals::remembered_tools(store.root(), &project).unwrap_or_default(),
+            journal.clone(),
+            err,
+        ));
+        gateway_slot = Some(gateway.clone());
         if let (Some(listener), Ok(home)) = (control_listener.take(), home_dir()) {
             let control = Control {
                 task_id: task.id().to_string(),
@@ -999,9 +1023,11 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
                 journal: journal.clone(),
                 meter: meter.clone(),
                 outbox: outbox.is_some(),
+                mcp: mcp_servers.iter().map(|m| m.name.clone()).collect(),
                 err,
             };
-            control::serve(listener, Arc::new(move |call| control.handle(call)));
+            let relay: control::Relay = Arc::new(move |name, conn| gateway.clone().relay(&name, conn));
+            control::serve(listener, Arc::new(move |call| control.handle(call)), relay);
         }
         if let Some(limit) = plan.timeout {
             thread::spawn(move || {
@@ -1027,6 +1053,9 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
         let _ = fs::remove_file(path);
     }
     let _ = fs::remove_file(&control_socket);
+    if let Some(g) = &gateway_slot {
+        g.stop_all();
+    }
     if let Ok(g) = grants.lock() {
         task.meta.grants = g.clone();
     }
@@ -1106,6 +1135,23 @@ fn approver(asker: Arc<Asker>, journal: Journal, expected: Vec<(String, String)>
     })
 }
 
+/// The gateway to your MCP servers for this task: asks you as the proxy
+/// does, and tells you what it couldn't start.
+fn gateway_for(
+    servers: Vec<agentos::mcp::Server>,
+    cwd: &Path,
+    task_dir: &Path,
+    asker: Option<Arc<Asker>>,
+    remembered: Vec<String>,
+    journal: Journal,
+    err: Paint,
+) -> agentos::mcp::Gateway {
+    let ask: Box<dyn Fn(&Request) -> Option<approvals::Decision> + Send + Sync> =
+        Box::new(move |req: &Request| asker.as_ref().map(|a| a.ask(req, |s| err.cyan(s)).0));
+    let tell: Box<dyn Fn(String) + Send + Sync> = Box::new(move |text| say(format!("{} {text}", err.yellow("agent: warning:"))));
+    agentos::mcp::Gateway::new(servers, cwd.to_path_buf(), task_dir.to_path_buf(), ask, remembered, journal, tell)
+}
+
 /// Answers what the agent asks agentos from inside its sandbox (through
 /// `agent mcp`): what it has, and more when you agree.
 struct Control {
@@ -1128,6 +1174,8 @@ struct Control {
     journal: Journal,
     meter: Option<Arc<Meter>>,
     outbox: bool,
+    /// Your MCP servers, reachable through agentos.
+    mcp: Vec<String>,
     err: Paint,
 }
 
@@ -1137,6 +1185,7 @@ impl Control {
             Call::Info => Reply::answer(self.info()),
             Call::Network { host, port, reason } => self.network(&host, port.unwrap_or(443), &reason),
             Call::Path { path, write, reason } => self.path(&path, write, &reason),
+            Call::Mcp { .. } => Reply::error("MCP sessions are relayed, not answered"),
         }
     }
 
@@ -1163,6 +1212,12 @@ impl Control {
         });
         if self.outbox {
             out.push("git push works, but your pushes are held until the user reviews them.".into());
+        }
+        if !self.mcp.is_empty() {
+            out.push(format!(
+                "The user's MCP servers, run by agentos outside the sandbox: {}. Read-only tools run directly; the user is asked before the others.",
+                self.mcp.join(", ")
+            ));
         }
         if let Some(m) = &self.meter {
             let t = m.totals();
@@ -1191,6 +1246,7 @@ impl Control {
             Kind::Host => "host",
             Kind::Read => "read",
             Kind::Write => "write",
+            Kind::Tool => "tool",
         };
         let _ = self.journal.append("agent.request", json!({ "kind": kind, "target": req.target, "reason": reason, "decision": decision.label() }));
         match decision {

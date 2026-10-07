@@ -199,6 +199,26 @@ Some things are never offered, and the agent is told so without bothering you: y
 
 Other agents can use the same server: point their MCP configuration at `/run/agentos/agent`, with the argument `mcp`.
 
+## Your MCP servers, through agentos
+
+Declare an MCP server in your config, and agentos runs it for each task, outside the sandbox, with your credentials:
+
+```toml
+[mcp.github]
+command = ["github-mcp-server", "stdio"]
+env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]     # from your environment, to the server only
+tools = { delete_file = "deny", create_issue = "allow" }
+```
+
+Claude gets it automatically, as `github`; other agents reach it inside the sandbox with `/run/agentos/agent mcp github`. The agent never sees the token, and every tool call goes through agentos:
+
+- tools the server marks read-only run directly;
+- any other tool asks you first, showing the call's arguments: allow this call, allow it for the rest of the task, always in this project, or deny;
+- `tools` sets a tool to `allow`, `ask` or `deny`; denied tools aren't even listed to the agent;
+- every call is journaled: the tool, its arguments, how it was allowed, and whether it failed.
+
+Only your own config can declare servers: a project's `.agentos.toml` can't make agentos run anything on your machine. A server runs as you, with your access; agentos governs the calls the agent makes, not what the server can reach. Remote (HTTP) servers work through a stdio bridge such as `mcp-remote` for now.
+
 ## Budgets
 
 ```bash
@@ -246,11 +266,15 @@ memory = "8G"
 cpus = 4
 budget = "5usd"                       # model calls: dollars, or tokens ("2M")
 
+[mcp.github]                          # your file only: an MCP server, run outside the sandbox
+command = ["github-mcp-server", "stdio"]
+env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+
 [prices]                              # your file only; USD per million tokens
 "gpt-*" = { input = 1.25, output = 10 }   # example figures: use your provider's
 ```
 
-- **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]` and `[prices]`; they're brokered whenever the variable is set in your environment and the task uses the allowlist network.
+- **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`, `[mcp]` and `[prices]`; they're brokered whenever the variable is set in your environment and the task uses the allowlist network.
 - **`.agentos.toml` in a project** (the current directory or a parent, below `$HOME`) can allow hosts, and hide or grant read-only paths *inside the project*. It comes with the repo, so agentos ignores it until you've read it and run `agent trust`, and again after any change. That includes a change an agent made and you committed: `agent diff` flags it. Without this, an agent could widen its own permissions for the next run, and a cloned repo could send your tokens anywhere.
 
 With an allowlist from either file, `agent run` uses the proxied network instead of none.
@@ -307,6 +331,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work. With a budget, that includes model APIs.
 - **The agent writes its own reasons.** An agent steered by something it read can write a convincing one. Judge the request, not the prose.
 - **A folder added mid-task stays until the task ends.**
+- **An MCP server marks its own tools read-only**, and agentos trusts that hint since the server is yours. If you don't, set the tool to `ask`.
 - **Budgets meter what they can read.** A Chat Completions stream without `stream_options.include_usage` reports no usage, so it isn't counted (you get a warning). The batch APIs are billed later and aren't metered. US-only inference (`inference_geo`, 1.1×) is priced at the standard rate.
 - **The agent's home persists between tasks.** That's what keeps its login, but a misbehaving task could leave something there for the next one. Nothing outside the sandbox runs from it.
 - **The syscall filter is a denylist** (seccomp): it blocks typing into your terminal (TIOCSTI), new namespaces, mounts, kernel modules, bpf, io_uring, keyrings and userfaultfd. Kernel bugs reachable through the remaining syscalls are out of scope until the microVM tier.
@@ -333,7 +358,7 @@ src/proxy.rs     egress proxy and allowlist
 src/broker.rs    credential broker (per-task CA, HTTP/1.1 relay)
 src/gateway.rs   model gateway: usage metering, prices, budgets
 src/control.rs   the agent's requests from inside (control socket), and what may be granted
-src/mcp.rs       `agent mcp`: agentos's MCP server for agents
+src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway to yours
 src/main.rs      CLI          src/render.rs   output
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run

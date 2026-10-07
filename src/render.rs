@@ -615,6 +615,7 @@ fn describe(p: Paint, e: &Event) -> String {
         "agent.tool" => format!("{} {}", s(&d["name"]), truncate(&s(&d["target"]), 80)),
         "agent.request" => {
             let what = match d["kind"].as_str() {
+                Some("tool") => format!("call {}", s(&d["target"])),
                 Some("read") => format!("read {}", s(&d["target"])),
                 Some("write") => format!("change {}", s(&d["target"])),
                 _ => format!("reach {}", s(&d["target"])),
@@ -627,6 +628,27 @@ fn describe(p: Paint, e: &Event) -> String {
                 _ => p.yellow("you denied it"),
             };
             format!("{} asked to {what} · \u{201c}{}\u{201d} · {answer}", p.cyan("?"), truncate(&s(&d["reason"]), 80))
+        }
+        "mcp.start" => format!("started your MCP server {} ({})", s(&d["server"]), s(&d["command"])),
+        "mcp.call" => {
+            let how = match d["decision"].as_str().unwrap_or_default() {
+                "read-only" => p.dim("read-only"),
+                "allowed" => p.dim("allowed by your config"),
+                "call" => p.green("you allowed this call"),
+                "once" => p.green("you allowed it for this task"),
+                "always" => p.green("you allowed it, always, for this project"),
+                "denied by config" => p.yellow("denied by your config"),
+                "nobody to ask" => p.yellow("not run: nobody to ask"),
+                "timeout" => p.yellow("not run: no answer"),
+                _ => p.yellow("you denied it"),
+            };
+            let outcome = if d["error"].as_bool() == Some(true) { p.red("error") } else { "ok".to_string() };
+            let ran = d["ms"].as_u64().unwrap_or(0) > 0 || d["bytes"].as_u64().unwrap_or(0) > 0;
+            let mut out = format!("{}.{} {} · {how}", s(&d["server"]), s(&d["tool"]), truncate(&s(&d["arguments"]), 70));
+            if ran {
+                let _ = write!(out, " · {outcome} · {}", util::duration(d["ms"].as_u64().unwrap_or(0)));
+            }
+            out
         }
         "grant.added" => {
             let access = if d["access"].as_str() == Some("rw") { "read-write" } else { "read-only" };

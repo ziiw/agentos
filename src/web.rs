@@ -192,9 +192,10 @@ fn run_cli(store: &Store, action: &str, id: &str) -> Result<Value> {
 fn decide(store: &Store, id: &str, body: &str) -> Result<Value> {
     let decision = match serde_json::from_str::<Value>(body).ok().and_then(|v| v["decision"].as_str().map(str::to_string)).as_deref() {
         Some("once") => Decision::Once,
+        Some("call") => Decision::Call,
         Some("always") => Decision::Always,
         Some("deny") => Decision::Deny,
-        _ => bail!("decision must be once, always or deny"),
+        _ => bail!("decision must be once, call, always or deny"),
     };
     approvals::answer(store.root(), id, decision)?;
     Ok(json!({ "ok": true }))

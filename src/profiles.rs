@@ -45,10 +45,11 @@ pub struct Profile {
 }
 
 /// `task: None` opens an interactive session. Agents other than the
-/// built-in ones are defined in `<agents_dir>/<name>.toml`.
-pub fn load(agent: &str, task: Option<&str>, interactive: bool, home: &Path, agents_dir: &Path) -> Result<Profile> {
+/// built-in ones are defined in `<agents_dir>/<name>.toml`. `mcp`: your MCP
+/// servers, which agents that take an MCP config get alongside agentos's own.
+pub fn load(agent: &str, task: Option<&str>, interactive: bool, home: &Path, agents_dir: &Path, mcp: &[String]) -> Result<Profile> {
     if agent == "claude" {
-        return claude(task, interactive, home);
+        return claude(task, interactive, home, mcp);
     }
     let file = agents_dir.join(format!("{agent}.toml"));
     if !file.is_file() {
@@ -210,18 +211,29 @@ is an allowlist. If you need a folder or a host you don't have, don't work aroun
 with the agentos tools (request_path_access, request_network_access) and a one-sentence reason, and the user \
 decides. sandbox_info tells you what you have.";
 
-fn claude(task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile> {
+/// Claude's `--mcp-config`: agentos's own server, and the gateway to each of
+/// yours, all of them `agent mcp` inside the sandbox.
+pub fn mcp_config(servers: &[String]) -> String {
+    let mut all = serde_json::Map::new();
+    let entry = |args: Vec<&str>| serde_json::json!({ "type": "stdio", "command": crate::control::BINARY, "args": args });
+    all.insert("agentos".into(), entry(vec!["mcp"]));
+    for name in servers {
+        all.insert(name.clone(), entry(vec!["mcp", name]));
+    }
+    serde_json::json!({ "mcpServers": all }).to_string()
+}
+
+fn claude(task: Option<&str>, interactive: bool, home: &Path, mcp: &[String]) -> Result<Profile> {
     let bin = find_on_path("claude").context(
         "Claude Code isn't installed (no `claude` on your PATH). Install it with:\n  curl -fsSL https://claude.ai/install.sh | bash",
     )?;
     let bin = fs::canonicalize(&bin)?;
     // agentos's own tools, and a word about where it is. --mcp-config takes
     // several values, so an option must follow it, never the task.
-    let mcp = serde_json::json!({ "mcpServers": { "agentos": { "type": "stdio", "command": crate::control::BINARY, "args": ["mcp"] } } });
     let mut argv = vec![
         bin.display().to_string(),
         "--mcp-config".to_string(),
-        mcp.to_string(),
+        mcp_config(mcp),
         "--append-system-prompt".to_string(),
         BRIEFING.to_string(),
         "--dangerously-skip-permissions".to_string(),

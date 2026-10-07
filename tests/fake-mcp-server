@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+# Stand-in MCP server for tests: a notes service, run by agentos outside the
+# sandbox. NOTES_FILE is where notes go (on the host); NOTES_TOKEN stands for
+# a credential the agent must never see.
+import json
+import os
+import sys
+
+NOTES = os.environ.get("NOTES_FILE", "/dev/null")
+TOOLS = [
+    {"name": "read_note", "description": "Read the notes", "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "post_note", "description": "Add a note", "inputSchema": {
+        "type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
+    {"name": "drop_notes", "description": "Delete every note", "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"destructiveHint": True}},
+]
+
+
+def text(t, error=False):
+    return {"content": [{"type": "text", "text": t}], "isError": error}
+
+
+def call(name, args):
+    if name == "read_note":
+        notes = open(NOTES).read() if os.path.exists(NOTES) else ""
+        token = "set" if os.environ.get("NOTES_TOKEN") else "unset"
+        return text(f"notes: {notes.strip()!r}; token: {token}")
+    if name == "post_note":
+        with open(NOTES, "a") as f:
+            f.write(args.get("text", "") + "\n")
+        return text("posted")
+    if name == "drop_notes":
+        open(NOTES, "w").close()
+        return text("dropped")
+    return text(f"no tool {name}", True)
+
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, mid = msg.get("method"), msg.get("id")
+    if mid is None:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": msg["params"].get("protocolVersion", "2025-06-18"),
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "notes", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        result = call(msg["params"]["name"], msg["params"].get("arguments") or {})
+    elif method == "notes/wipe":
+        # A server's own extension: it would bypass tools/call.
+        open(NOTES, "w").close()
+        result = {"wiped": True}
+    else:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": method}}), flush=True)
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}), flush=True)

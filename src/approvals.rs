@@ -21,7 +21,10 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
+    /// For the rest of the task.
     Once,
+    /// This one tool call only (asked again next time).
+    Call,
     Always,
     Deny,
     /// Nobody answered in time.
@@ -30,12 +33,13 @@ pub enum Decision {
 
 impl Decision {
     pub fn allows(self) -> bool {
-        matches!(self, Decision::Once | Decision::Always)
+        matches!(self, Decision::Once | Decision::Call | Decision::Always)
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Decision::Once => "once",
+            Decision::Call => "call",
             Decision::Always => "always",
             Decision::Deny => "deny",
             Decision::Timeout => "timeout",
@@ -71,9 +75,19 @@ fn save_db(store_root: &Path, db: &BTreeMap<String, Vec<String>>) -> Result<()> 
     Ok(())
 }
 
+/// Remembered tools are stored as `tool:SERVER.TOOL`, next to hosts.
+const TOOL_PREFIX: &str = "tool:";
+
 /// Hosts approved "always" for `project`, as allowlist entries.
 pub fn remembered(store_root: &Path, project: &Path) -> Result<Vec<String>> {
-    Ok(load_db(store_root)?.remove(&project.display().to_string()).unwrap_or_default())
+    let all = load_db(store_root)?.remove(&project.display().to_string()).unwrap_or_default();
+    Ok(all.into_iter().filter(|e| !e.starts_with(TOOL_PREFIX)).collect())
+}
+
+/// MCP tools (`server.tool`) approved "always" for `project`.
+pub fn remembered_tools(store_root: &Path, project: &Path) -> Result<Vec<String>> {
+    let all = load_db(store_root)?.remove(&project.display().to_string()).unwrap_or_default();
+    Ok(all.iter().filter_map(|e| e.strip_prefix(TOOL_PREFIX)).map(str::to_string).collect())
 }
 
 pub fn remember(store_root: &Path, project: &Path, entry: &str) -> Result<()> {
@@ -139,6 +153,9 @@ pub enum Kind {
     Read,
     /// Changing a path (held for review, like everything else).
     Write,
+    /// Calling a tool of one of your MCP servers (`target` is `server.tool`,
+    /// `reason` its arguments).
+    Tool,
 }
 
 /// One question: what, and the agent's reason when it asked on purpose.
@@ -157,6 +174,15 @@ impl Request {
 
     fn key(&self) -> String {
         format!("{:?}:{}", self.kind, self.target)
+    }
+
+    /// What "always" remembers for this project, if anything.
+    fn remembered_as(&self) -> Option<String> {
+        match self.kind {
+            Kind::Host => Some(self.target.clone()),
+            Kind::Tool => Some(format!("{TOOL_PREFIX}{}", self.target)),
+            Kind::Read | Kind::Write => None,
+        }
     }
 }
 
@@ -218,10 +244,14 @@ pub fn answer(store_root: &Path, id: &str, decision: Decision) -> Result<()> {
     Ok(())
 }
 
-fn parse_decision(text: &str) -> Decision {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" | "o" | "once" => Decision::Once,
-        "a" | "always" => Decision::Always,
+/// An answer typed at the terminal, or sent by agentd (a decision's label).
+/// For a tool, [y] means this call and [t] the whole task.
+fn parse_decision(text: &str, kind: Kind) -> Decision {
+    match (text.trim().to_ascii_lowercase().as_str(), kind) {
+        ("y" | "yes" | "call", Kind::Tool) => Decision::Call,
+        ("t" | "task" | "once", Kind::Tool) => Decision::Once,
+        ("y" | "yes" | "o" | "once" | "call", _) => Decision::Once,
+        ("a" | "always", _) => Decision::Always,
         _ => Decision::Deny,
     }
 }
@@ -267,6 +297,7 @@ impl Asker {
     pub fn ask(&self, req: &Request, paint: impl Fn(&str) -> String) -> (Decision, bool) {
         let key = req.key();
         // Nobody answered last time: an agent asking again gets asked again.
+        // ("This call" answers aren't kept at all.)
         let cached = || self.answers.lock().ok().and_then(|a| a.get(&key).copied()).filter(|d| *d != Decision::Timeout);
         if let Some(d) = cached() {
             return (d, false);
@@ -302,11 +333,18 @@ impl Asker {
                 (Kind::Host, Some(_)) => format!("the agent asks to reach {}", req.target),
                 (Kind::Read, _) => format!("the agent asks to read {}", req.target),
                 (Kind::Write, _) => format!("the agent asks to change {} (held for your review)", req.target),
+                (Kind::Tool, _) => format!("the agent wants to call {}", req.target),
             };
-            let why = req.reason.as_deref().map(|r| format!("\n  its reason: \u{201c}{r}\u{201d}")).unwrap_or_default();
+            let why = match (req.kind, req.reason.as_deref()) {
+                (_, None) => String::new(),
+                (Kind::Tool, Some(args)) => format!("\n  with: {args}"),
+                (_, Some(r)) => format!("\n  its reason: \u{201c}{r}\u{201d}"),
+            };
+            let project = display_path(&self.project);
             let options = match req.kind {
-                Kind::Host => format!("[y] this task · [a] always, in {} · [N] deny", display_path(&self.project)),
-                _ => "[y] this task · [N] deny".to_string(),
+                Kind::Host => format!("[y] this task · [a] always, in {project} · [N] deny"),
+                Kind::Tool => format!("[y] this call · [t] this task · [a] always, in {project} · [N] deny"),
+                Kind::Read | Kind::Write => "[y] this task · [N] deny".to_string(),
             };
             // One write, so it can't interleave with the agent's own output.
             let question = format!("\n{} {what}{why}\n  {options}{elsewhere} › ", paint("agent ▸"));
@@ -321,7 +359,7 @@ impl Asker {
                 break Decision::Timeout;
             }
             if let Ok(text) = fs::read_to_string(&answer_file) {
-                let d = parse_decision(&text);
+                let d = parse_decision(&text, req.kind);
                 if let Some(t) = tty.as_mut() {
                     let _ = writeln!(t, "{} (answered in agentd)", d.label());
                 }
@@ -329,7 +367,7 @@ impl Asker {
             }
             match tty.as_mut() {
                 Some(t) => match read_line_for(t, &mut line, Duration::from_millis(250)) {
-                    Some(true) => break parse_decision(&String::from_utf8_lossy(&line)),
+                    Some(true) => break parse_decision(&String::from_utf8_lossy(&line), req.kind),
                     Some(false) => {}
                     None => break Decision::Deny,
                 },
@@ -338,22 +376,23 @@ impl Asker {
         };
         let _ = fs::remove_file(&pending);
         let _ = fs::remove_file(&answer_file);
-        // "Always" is for hosts; a path is granted for this task only.
-        let decision = if decision == Decision::Always && req.kind != Kind::Host { Decision::Once } else { decision };
+        // A path is granted for this task only.
+        let remembered = req.remembered_as();
+        let decision = if decision == Decision::Always && remembered.is_none() { Decision::Once } else { decision };
 
         if let Some(t) = tty.as_mut() {
             if decision == Decision::Timeout {
                 let _ = writeln!(t, "(no answer in {}s: denied)", ANSWER_TIMEOUT.as_secs());
             }
         }
-        if decision == Decision::Always {
-            if let Err(e) = remember(&self.store_root, &self.project, &req.target) {
+        if let (Decision::Always, Some(entry)) = (decision, &remembered) {
+            if let Err(e) = remember(&self.store_root, &self.project, entry) {
                 if let Some(t) = tty.as_mut() {
                     let _ = writeln!(t, "(couldn't remember it: {e:#}; allowed for this task)");
                 }
             }
         }
-        if let Ok(mut answers) = self.answers.lock() {
+        if let (Ok(mut answers), false) = (self.answers.lock(), decision == Decision::Call) {
             answers.insert(key, decision);
         }
         (decision, true)
@@ -409,6 +448,23 @@ mod tests {
         assert_eq!(sanitize("need\x1b[2Jthe\ndocs\r\t please", 100), "need [2Jthe docs please");
         assert_eq!(sanitize("abcdef", 3), "abc…");
         assert_eq!(Request::host("pypi.org", 443).key(), "Host:pypi.org");
+    }
+
+    #[test]
+    fn answers_mean_what_they_say_per_kind() {
+        assert_eq!(parse_decision("y", Kind::Tool), Decision::Call);
+        assert_eq!(parse_decision("t", Kind::Tool), Decision::Once);
+        assert_eq!(parse_decision("once", Kind::Tool), Decision::Once, "agentd's 'for this task'");
+        assert_eq!(parse_decision("y", Kind::Host), Decision::Once);
+        assert_eq!(parse_decision("a", Kind::Read), Decision::Always);
+        assert_eq!(parse_decision("", Kind::Tool), Decision::Deny);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, p) = (dir.path(), Path::new("/p/a"));
+        remember(store, p, "pypi.org").unwrap();
+        remember(store, p, "tool:notes.post_note").unwrap();
+        assert_eq!(remembered(store, p).unwrap(), vec!["pypi.org"], "tools aren't hosts");
+        assert_eq!(remembered_tools(store, p).unwrap(), vec!["notes.post_note"]);
     }
 
     #[test]

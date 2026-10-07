@@ -1,13 +1,27 @@
-//! `agent mcp`: an MCP server (JSON-RPC over stdio) that an agent runs
-//! inside its sandbox. Its tools let the agent see what it was granted and
-//! ask you, with a reason, for a folder or a host; the supervisor does the
-//! work through the control socket (see `control.rs`).
+//! MCP, both ways.
+//!
+//! - `agent mcp`: agentos's own MCP server (JSON-RPC over stdio), run by an
+//!   agent inside its sandbox. Its tools let the agent see what it was
+//!   granted and ask you, with a reason, for a folder or a host; the
+//!   supervisor does the work through the control socket (`control.rs`).
+//! - `agent mcp NAME`: the gateway to one of *your* MCP servers. agentos runs
+//!   the server outside the sandbox, with your credentials, which the agent
+//!   never sees; the agent's calls go through the supervisor, which journals
+//!   every tool call and asks you before the ones that change things.
 
+use crate::approvals::{Decision, Kind, Request};
 use crate::control::{self, Call, Reply};
-use anyhow::Result;
+use crate::journal::Journal;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::{BufRead, Write};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Protocol versions we speak; tools work the same in all of them.
 const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -120,6 +134,43 @@ pub fn handle(msg: &Value, ask: &dyn Fn(&Call) -> Result<Reply>) -> Option<Value
     })
 }
 
+/// One of your MCP servers, from `[mcp.NAME]` in your config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Server {
+    #[serde(skip)]
+    pub name: String,
+    pub command: Vec<String>,
+    /// Variables passed from your environment to the server (and only to it).
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Per tool. Without an entry: allowed when the server marks the tool
+    /// read-only, asked otherwise.
+    #[serde(default)]
+    pub tools: BTreeMap<String, Policy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Policy {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl Server {
+    pub fn validate(&self) -> Result<()> {
+        let name = &self.name;
+        if name.is_empty() || name == "agentos" || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            bail!("[mcp.{name}]: names are letters, digits, - and _ (and not \"agentos\")");
+        }
+        if self.command.first().is_none_or(|c| c.is_empty()) {
+            bail!("[mcp.{name}]: command is empty");
+        }
+        Ok(())
+    }
+}
+
 /// Serves MCP on stdin/stdout until the agent closes it.
 pub fn serve_stdio(socket: &Path) -> Result<()> {
     let ask = |c: &Call| control::call(socket, c);
@@ -139,6 +190,315 @@ pub fn serve_stdio(socket: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `agent mcp NAME`, inside the sandbox: connects the agent's MCP client to
+/// your server NAME, which agentos runs outside.
+pub fn relay_stdio(socket: &Path, name: &str) -> Result<()> {
+    let mut conn = UnixStream::connect(socket).with_context(|| format!("can't reach agentos at {}", socket.display()))?;
+    writeln!(conn, "{}", serde_json::to_string(&Call::Mcp { server: name.to_string() })?)?;
+    let mut from_agentos = BufReader::new(conn.try_clone()?);
+    let mut line = String::new();
+    from_agentos.read_line(&mut line)?;
+    let reply: Reply = serde_json::from_str(line.trim()).context("agentos sent a malformed reply")?;
+    if !reply.ok {
+        bail!("{}", reply.text);
+    }
+    std::thread::spawn(move || {
+        let _ = forward(&mut std::io::stdin().lock(), &mut conn);
+        let _ = conn.shutdown(std::net::Shutdown::Write);
+    });
+    forward(&mut from_agentos, &mut std::io::stdout().lock())?;
+    Ok(())
+}
+
+/// Copies as data arrives. (`io::copy` splices a pipe into a socket, and the
+/// kernel can hold that data back until the pipe closes: an MCP client
+/// keeps it open and waits for answers.)
+fn forward(r: &mut impl std::io::Read, w: &mut impl Write) -> std::io::Result<()> {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                w.write_all(&buf[..n])?;
+                w.flush()?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Methods that go through the gateway. Anything else (a server's own
+/// extensions) could do what tools/call does without being asked about.
+const RELAYED: &[&str] = &[
+    "initialize", "ping", "tools/list", "tools/call", "resources/list", "resources/templates/list", "resources/read",
+    "resources/subscribe", "resources/unsubscribe", "prompts/list", "prompts/get", "completion/complete", "logging/setLevel",
+];
+
+/// The supervisor's side: your MCP servers, run outside the sandbox, and
+/// every tool call the agent makes through them, journaled and governed.
+pub struct Gateway {
+    pub servers: Vec<Server>,
+    /// Where servers run (the task's folder, the real one).
+    pub cwd: PathBuf,
+    /// Server output goes to `mcp-NAME.log` here.
+    pub log_dir: PathBuf,
+    /// Asks you; `None` when nobody can be asked.
+    pub ask: Box<dyn Fn(&Request) -> Option<Decision> + Send + Sync>,
+    /// `server.tool` approved "always" for this project.
+    pub remembered: Vec<String>,
+    pub journal: Journal,
+    /// Tells you something, live.
+    pub say: Box<dyn Fn(String) + Send + Sync>,
+    children: Mutex<Vec<u32>>,
+}
+
+/// One relayed session's bookkeeping.
+#[derive(Default)]
+struct Session {
+    /// Tool → marked read-only by the server.
+    read_only: HashMap<String, bool>,
+    /// Pending tools/list requests (ids).
+    listing: HashSet<String>,
+    /// Pending tools/call requests: id → (tool, arguments, how it was allowed, when).
+    calls: HashMap<String, (String, Value, &'static str, Instant)>,
+}
+
+fn send(w: &Mutex<impl Write>, msg: &Value) {
+    if let Ok(mut w) = w.lock() {
+        let _ = writeln!(w, "{msg}");
+        let _ = w.flush();
+    }
+}
+
+/// A tool call's arguments, short enough to show you and to journal.
+fn summary(args: &Value, max: usize) -> String {
+    crate::approvals::sanitize(&args.to_string(), max)
+}
+
+impl Gateway {
+    pub fn new(
+        servers: Vec<Server>,
+        cwd: PathBuf,
+        log_dir: PathBuf,
+        ask: Box<dyn Fn(&Request) -> Option<Decision> + Send + Sync>,
+        remembered: Vec<String>,
+        journal: Journal,
+        say: Box<dyn Fn(String) + Send + Sync>,
+    ) -> Gateway {
+        Gateway { servers, cwd, log_dir, ask, remembered, journal, say, children: Mutex::new(Vec::new()) }
+    }
+
+    /// Ends the servers still running (the task is over).
+    pub fn stop_all(&self) {
+        if let Ok(pids) = self.children.lock() {
+            for pid in pids.iter() {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(*pid as i32), nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+    }
+
+    fn spawn(&self, server: &Server) -> Result<Child> {
+        let mut cmd = Command::new(&server.command[0]);
+        cmd.args(&server.command[1..]).current_dir(&self.cwd).env_clear();
+        for k in ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
+            if let Some(v) = std::env::var_os(k) {
+                cmd.env(k, v);
+            }
+        }
+        for k in &server.env {
+            match std::env::var_os(k) {
+                Some(v) => {
+                    cmd.env(k, v);
+                }
+                None => (self.say)(format!("MCP server {}: {k} isn't set in your environment", server.name)),
+            }
+        }
+        let log = std::fs::File::create(self.log_dir.join(format!("mcp-{}.log", server.name)))?;
+        use std::os::unix::process::CommandExt;
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log).process_group(0);
+        let child = cmd.spawn().with_context(|| format!("start {}", server.command[0]))?;
+        if let Ok(mut pids) = self.children.lock() {
+            pids.push(child.id());
+        }
+        Ok(child)
+    }
+
+    /// Relays one agent connection to a fresh process of server `name`,
+    /// until either side hangs up.
+    pub fn relay(self: Arc<Self>, name: &str, conn: UnixStream) {
+        let reply = |r: Reply| {
+            let _ = writeln!(&conn, "{}", serde_json::to_string(&r).unwrap_or_default());
+        };
+        let Some(server) = self.servers.iter().find(|s| s.name == name).cloned() else {
+            return reply(Reply::error(format!("no MCP server named {name} in the user's agentos config")));
+        };
+        let mut child = match self.spawn(&server) {
+            Ok(c) => c,
+            Err(e) => return reply(Reply::error(format!("{e:#}"))),
+        };
+        reply(Reply::answer("connected"));
+        let _ = self.journal.append("mcp.start", json!({ "server": name, "command": server.command[0] }));
+        let (Some(stdin), Some(stdout), Ok(conn_out)) = (child.stdin.take(), child.stdout.take(), conn.try_clone()) else {
+            let _ = child.kill();
+            return;
+        };
+        let to_server = Arc::new(Mutex::new(stdin));
+        let to_agent = Arc::new(Mutex::new(conn_out));
+        let session = Arc::new(Mutex::new(Session::default()));
+
+        // Server → agent: note which tools are read-only, hide denied ones,
+        // and journal each call's outcome.
+        let back = {
+            let (gw, server, session, to_agent) = (self.clone(), server.clone(), session.clone(), to_agent.clone());
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    let msg = gw.from_server(&server, &session, line);
+                    if let Ok(mut w) = to_agent.lock() {
+                        let _ = writeln!(w, "{msg}");
+                    }
+                }
+                if let Ok(w) = to_agent.lock() {
+                    let _ = w.shutdown(std::net::Shutdown::Both);
+                }
+            })
+        };
+        // Agent → server: policy on each tools/call.
+        for line in BufReader::new(&conn).lines() {
+            let Ok(line) = line else { break };
+            self.clone().from_agent(&server, &session, &to_server, &to_agent, line);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = back.join();
+    }
+
+    fn from_server(&self, server: &Server, session: &Mutex<Session>, line: String) -> String {
+        let Ok(mut msg) = serde_json::from_str::<Value>(&line) else { return line };
+        let (Some(id), None) = (msg.get("id").map(|i| i.to_string()), msg.get("method")) else { return line };
+        let Ok(mut s) = session.lock() else { return line };
+        if s.listing.remove(&id) {
+            if let Some(tools) = msg["result"]["tools"].as_array_mut() {
+                tools.retain(|t| {
+                    let name = t["name"].as_str().unwrap_or_default();
+                    s.read_only.insert(name.to_string(), t["annotations"]["readOnlyHint"].as_bool() == Some(true));
+                    server.tools.get(name) != Some(&Policy::Deny)
+                });
+                return msg.to_string();
+            }
+        }
+        if let Some((tool, args, how, started)) = s.calls.remove(&id) {
+            let failed = msg.get("error").is_some() || msg["result"]["isError"].as_bool() == Some(true);
+            let _ = self.journal.append(
+                "mcp.call",
+                json!({
+                    "server": server.name, "tool": tool, "arguments": summary(&args, 1000), "decision": how,
+                    "error": failed, "bytes": line.len(), "ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+        }
+        line
+    }
+
+    fn from_agent(self: Arc<Self>, server: &Server, session: &Arc<Mutex<Session>>, to_server: &Arc<Mutex<ChildStdin>>, to_agent: &Arc<Mutex<UnixStream>>, line: String) {
+        let refuse = |id: &Value, code: i64, message: String| {
+            send(to_agent, &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }));
+        };
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(m) => m,
+            Err(_) => return refuse(&Value::Null, -32700, "agentos: unparseable message".into()),
+        };
+        if msg.is_array() {
+            return refuse(&Value::Null, -32600, "agentos: batches aren't relayed; send one message at a time".into());
+        }
+        let Some(method) = msg.get("method").and_then(Value::as_str) else {
+            // The agent's answer to a request from the server.
+            return send(to_server, &msg);
+        };
+        let id = msg.get("id").cloned();
+        if !method.starts_with("notifications/") && !RELAYED.contains(&method) {
+            if let Some(id) = &id {
+                refuse(id, -32601, format!("agentos: {method} isn't relayed to your MCP servers"));
+            }
+            return;
+        }
+        let Some(id) = id else {
+            // Only real notifications go through without an id: a "tools/call"
+            // sent as one would skip the questions, and a lax server might run it.
+            if method.starts_with("notifications/") {
+                send(to_server, &msg);
+            }
+            return;
+        };
+        match method {
+            "tools/list" => {
+                if let Ok(mut s) = session.lock() {
+                    s.listing.insert(id.to_string());
+                }
+                send(to_server, &msg)
+            }
+            "tools/call" => {
+                let tool = msg["params"]["name"].as_str().unwrap_or_default().to_string();
+                let args = msg["params"]["arguments"].clone();
+                let read_only = session.lock().ok().and_then(|s| s.read_only.get(&tool).copied()).unwrap_or(false);
+                let target = format!("{}.{tool}", server.name);
+                let policy = match server.tools.get(&tool) {
+                    Some(p) => *p,
+                    None if read_only || self.remembered.contains(&target) => Policy::Allow,
+                    None => Policy::Ask,
+                };
+                let forward = |how: &'static str| {
+                    if let Ok(mut s) = session.lock() {
+                        s.calls.insert(id.to_string(), (tool.clone(), args.clone(), how, Instant::now()));
+                    }
+                    send(to_server, &msg);
+                };
+                let deny = |how: &'static str, text: String| {
+                    let _ = self.journal.append(
+                        "mcp.call",
+                        json!({ "server": server.name, "tool": tool, "arguments": summary(&args, 1000), "decision": how, "error": true, "bytes": 0, "ms": 0 }),
+                    );
+                    send(to_agent, &json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": text }], "isError": true } }));
+                };
+                match policy {
+                    Policy::Allow if read_only => forward("read-only"),
+                    Policy::Allow => forward("allowed"),
+                    Policy::Deny => deny("denied by config", format!("agentos: the user's config doesn't allow {target}.")),
+                    Policy::Ask => {
+                        // Asking can take a while; other messages keep flowing.
+                        let (gw, server, session, to_server, to_agent) = (self.clone(), server.clone(), session.clone(), to_server.clone(), to_agent.clone());
+                        std::thread::spawn(move || {
+                            let req = Request { kind: Kind::Tool, target: target.clone(), reason: Some(summary(&args, 300)) };
+                            match (gw.ask)(&req) {
+                                Some(d) if d.allows() => {
+                                    if let Ok(mut s) = session.lock() {
+                                        s.calls.insert(id.to_string(), (tool, args, d.label(), Instant::now()));
+                                    }
+                                    send(&to_server, &msg);
+                                }
+                                other => {
+                                    let (how, text) = match other {
+                                        None => ("nobody to ask", format!("agentos: {target} needs the user's approval, and nobody can be asked in this task.")),
+                                        Some(Decision::Timeout) => ("timeout", format!("agentos: the user didn't answer about {target} in time.")),
+                                        Some(_) => ("deny", format!("agentos: the user denied this call to {target}. Don't try to do it another way.")),
+                                    };
+                                    let _ = gw.journal.append(
+                                        "mcp.call",
+                                        json!({ "server": server.name, "tool": tool, "arguments": summary(&args, 1000), "decision": how, "error": true, "bytes": 0, "ms": 0 }),
+                                    );
+                                    send(&to_agent, &json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": text }], "isError": true } }));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            _ => send(to_server, &msg),
+        }
+    }
 }
 
 #[cfg(test)]

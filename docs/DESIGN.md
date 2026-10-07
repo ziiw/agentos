@@ -26,7 +26,7 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Taint tracking | Once a session reads untrusted input, its risky actions need approval | policy engine (Cedar) | ○ Phase 1 |
 | Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, every model call with its measured cost |
 | Tokens are a budgeted resource | $/token/time budgets per task | model gateway | ● per-task $ or token budgets, metered on the wire (M15); time via --timeout |
-| Interfaces built for agents | System services exposed as typed tools | MCP gateway, D-Bus bridge, AT-SPI | ◐ agentos's own MCP server in every sandbox: sandbox_info, request_path_access, request_network_access (M16) |
+| Interfaces built for agents | System services exposed as typed tools | MCP gateway, D-Bus bridge, AT-SPI | ◐ agentos's own MCP server in every sandbox: sandbox_info, request_path_access, request_network_access (M16); your MCP servers through a gateway (M17) |
 | Agents can live for days | Sleep, wake on events, survive reboots | systemd units, CRIU | ○ Phase 3 |
 
 ● done ◐ partial ○ planned
@@ -133,6 +133,7 @@ It's verified at three levels:
 | M14: agents as config files: any agent CLI via `agents/NAME.toml` (commands, allowlist, brokered secrets, output); `agent agents`; default agent | ✅ CI green (stand-in agents); Codex/Gemini/Aider examples untested |
 | M15: model gateway: every model call metered from the provider's own usage (Anthropic Messages, OpenAI Responses/Chat Completions, custom endpoints), priced, journaled; per-task $ or token budgets, refused in the API's own format once used up | ✅ CI green (stand-in API); real Claude: in scripts/acceptance.sh |
 | M16: agents ask: an MCP server in every sandbox (`agent mcp`, over a control socket) to see the sandbox and request folders or hosts with a reason; you answer at the terminal or in the console; granted folders are mounted into the running sandbox (open_tree + setns + move_mount from the namespace parent, which keeps a host view), writable ones as new overlay layers | ✅ CI green; real Claude Code connects to the server; asking for itself: in scripts/acceptance.sh |
+| M17: MCP gateway: your servers (`[mcp.NAME]`, your config only) run by agentos outside the sandbox with your credentials; the agent reaches them through `agent mcp NAME`; read-only tools run, others ask you (this call / this task / always), per-tool policy, denied tools hidden, non-standard methods not relayed, every call journaled | ✅ CI green (stand-in server) |
 | M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and passes the whole e2e suite (179/179, Landlock and limits enforced) |
 
 ### Phase 1 backlog, in order
@@ -145,7 +146,7 @@ It's verified at three levels:
 6. **cgroups.** ✅ CPU, memory and pid limits through a systemd transient scope (M13).
    **Model gateway.** ✅ (M15) Model calls go through the broker's TLS termination (for credentialed hosts, and for model APIs when there's a budget), so the gateway reads the usage the provider reports in each response, JSON or streamed, without trusting the agent. Calls are priced (built-in Claude list prices, `[prices]` for the rest; an unknown model counts at the highest rate), journaled, and counted against the task's budget. Once it's used up, model calls get a 400 in the API's own error format, which agents don't retry; one that keeps calling is stopped after 5 refusals. Next: budgets across tasks (per day, per project), the Gemini API, and refusing the batch APIs under a budget (they're billed later and not metered).
 7. **agentd + API.** ✅ `agent serve` (M10): token-protected web console and JSON API; approvals reach you away from the terminal, with optional push notifications. ✅ Agents request folders and hosts mid-task, with a reason, and you answer at the terminal or in the console (M16). Next: run tasks *from* agentd, accounts for teams, policy in Cedar (auto-answers), and removing a grant mid-task.
-8. **MCP gateway.** System services exposed as typed tools, governed by the same policy. ✅ The first server: agentos itself (M16). Next: proxying the agent's other MCP servers through agentos, so their calls are journaled and approved like the rest.
+8. **MCP gateway.** System services exposed as typed tools, governed by the same policy. ✅ The first server: agentos itself (M16). ✅ Your servers, run outside the sandbox with your credentials, every call journaled and governed (M17). Next: remote (HTTP) servers natively, with their OAuth tokens in the vault; policy on arguments (e.g. only this repo); system services (D-Bus) as servers.
 
 ## Open decisions
 

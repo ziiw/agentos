@@ -111,16 +111,20 @@
       const kind = q.kind || "host";
       const what = kind === "read" ? "The agent asks to read"
         : kind === "write" ? "The agent asks to change"
+        : kind === "tool" ? "The agent wants to call"
         : q.reason ? "The agent asks to reach" : "The agent wants to reach";
       const held = kind === "write" ? `<div class="meta">Its changes there are held for your review, like the rest.</div>` : "";
-      const why = q.reason ? `<div class="reason">\u201c${esc(q.reason)}\u201d</div>` : "";
-      const always = kind === "host" ? `<button data-q="${q.id}" data-d="always">Always in ${esc(project)}</button>` : "";
+      const why = !q.reason ? "" : kind === "tool" ? `<pre>${esc(q.reason)}</pre>` : `<div class="reason">\u201c${esc(q.reason)}\u201d</div>`;
+      const always = kind === "host" || kind === "tool" ? `<button data-q="${q.id}" data-d="always">Always in ${esc(project)}</button>` : "";
+      const allow = kind === "tool"
+        ? `<button class="primary" data-q="${q.id}" data-d="call">Allow this call</button><button data-q="${q.id}" data-d="once">For this task</button>`
+        : `<button class="primary" data-q="${q.id}" data-d="once">Allow for this task</button>`;
       return `<div class="card ask">
         <div class="meta">${esc(q.title)} · ${ago(q.asked_ms)}</div>
         <div class="what">${what} <strong>${esc(q.target)}</strong></div>
         ${why}${held}
         <div class="row">
-          <button class="primary" data-q="${q.id}" data-d="once">Allow for this task</button>
+          ${allow}
           ${always}
           <button class="danger" data-q="${q.id}" data-d="deny">Deny</button>
         </div></div>`;

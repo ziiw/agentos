@@ -564,6 +564,74 @@ check "an unknown agent is refused, with what's available" grep -q "unknown agen
 echo 'agent = "echo"' > "$CFG"
 check "the default agent comes from your config" grep -q 'echo-agent got' <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do just do it 2>&1)"
 
+section "your MCP servers, through agentos (gateway)"
+if ! command -v python3 >/dev/null; then
+  skip "the stand-in MCP server needs python3"
+else
+  reset_proj
+  cd "$PROJ"
+  cp "$HERE/mcp-client" ./mcp-client
+  export NOTES_TOKEN=notes-token-0123456789 NOTES_FILE="$WORK/notes.txt"
+  : > "$NOTES_FILE"
+  cat > "$CFG" <<TOML
+[mcp.notes]
+command = ["python3", "$HERE/fake-mcp-server"]
+env = ["NOTES_TOKEN", "NOTES_FILE"]
+tools = { drop_notes = "deny" }
+TOML
+  PORT=$((20000 + RANDOM % 10000))
+  "$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve3.log" 2>&1 &
+  SERVE_PID=$!
+  for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
+  TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
+  CONSOLE="http://127.0.0.1:$PORT"
+  : > "$WORK/questions"
+  # You, in the console: "Allow this call", unless the arguments say nope.
+  ( for _ in $(seq 600); do
+      q="$(api "$CONSOLE/api/approvals")"
+      id="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$q")"
+      if [ -n "$id" ]; then
+        printf '%s\n' "$q" >> "$WORK/questions"
+        d=call; grep -q '"reason":"{\\"text\\":\\"nope' <<<"$q" && d=deny
+        api -X POST -d "{\"decision\":\"$d\"}" "$CONSOLE/api/approvals/$id" >/dev/null
+      fi
+      sleep 0.1
+    done ) &
+  ANSWERER=$!
+  out="$(AGENTOS_CONFIG="$CFG" "$AGENT" run --ask -- sh -c '
+    echo "token in the sandbox: ${NOTES_TOKEN:-unset}"
+    python3 ./mcp-client notes tools/list \
+      "tools/call:read_note:{}" \
+      "tools/call:post_note:{\"text\":\"hello\"}" \
+      "tools/call:post_note:{\"text\":\"nope\"}" \
+      "tools/call:drop_notes:{}" \
+      "sneak:post_note:{\"text\":\"sneaked\"}" \
+      notes/wipe' 2>&1 </dev/null)"
+  events="$(latest_task_dir)/events.jsonl"
+  check "your server's credential never reaches the sandbox" grep -q 'token in the sandbox: unset' <<<"$out"
+  check "...but the server, run outside, has it" grep -q "read_note: .*token: set" <<<"$out"
+  check "tools your config denies aren't even listed" grep -q '^tools: read_note,post_note$' <<<"$out"
+  check "read-only tools run without asking" lacks '"target":"notes.read_note"' "$(cat "$WORK/questions")"
+  check "you're asked before a tool that changes things, with its arguments" grep -q '"kind":"tool".*"reason":"{\\"text\\":\\"hello\\"}".*"target":"notes.post_note"' "$WORK/questions"
+  check "...and once you allow it, it happens" grep -qx hello "$NOTES_FILE"
+  check "what you deny doesn't happen" lacks nope "$(cat "$NOTES_FILE")"
+  check "...and the agent is told" grep -q 'post_note: agentos: the user denied this call.*\[error\]' <<<"$out"
+  check "tools your config denies are refused without asking" grep -q "drop_notes: agentos: the user's config doesn't allow notes.drop_notes" <<<"$out"
+  check "...and a server's own methods don't get around the rules" grep -q "notes/wipe: .*isn't relayed" <<<"$out"
+  check "...so the notes are still there" grep -qx hello "$NOTES_FILE"
+  check "...and a tool call sent as a notification doesn't run" lacks sneaked "$(cat "$NOTES_FILE")"
+  check "every call is journaled, with how it was allowed" test "$(grep -c '"kind":"mcp.call"' "$events")" = 4
+  check "...including the read-only ones" grep -q '"kind":"mcp.call".*"decision":"read-only".*"tool":"read_note"' "$events"
+  check "agent log shows them" grep -q 'notes.post_note {"text":"hello"} · you allowed this call · ok' <<<"$("$AGENT" log)"
+  check "the credential isn't journaled" bash -c "! grep -rq notes-token-0123456789 '$AGENTOS_HOME/tasks'"
+  AGENTOS_CONFIG="$CFG" "$AGENT" do use the notes >/dev/null 2>&1
+  check "Claude gets your servers too, through agentos" grep -q '"notes":{"args":\["mcp","notes"\]' "$AGENT_STATE/last-argv"
+  kill $ANSWERER 2>/dev/null; wait $ANSWERER 2>/dev/null
+  kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+  unset NOTES_TOKEN NOTES_FILE
+  : > "$CFG"
+fi
+
 section "budgets (the model gateway)"
 # A stand-in model API: httpbin's /base64/… answers with whatever body the
 # URL carries, so the "provider" reports exactly the usage we choose.
