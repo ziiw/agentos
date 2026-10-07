@@ -506,7 +506,13 @@ src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway t
 src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refresh
 src/policy.rs    your rules (Cedar): answers given in advance
 src/taint.rs     whether a task has read untrusted input
-src/main.rs      CLI          src/render.rs   output
+src/held.rs      held tool calls (the outbox for MCP tools)
+src/main.rs      entry point and dispatch; the rest of the CLI, one file per concern:
+  src/cli.rs           arguments            src/plan.rs     `do`/`run`: arguments and config into a plan
+  src/task.rs          running a task       src/owner.rs    your side of a running task (give back, raise)
+  src/agent_control.rs the agent's requests src/review.rs   diff, commit, push, rollback, log
+  src/admin.rs         approvals, rules, spend, connect, doctor
+src/render.rs    output       src/web.rs   agentd's console
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run
 .github/workflows/ci.yml   unit + e2e tests on real Ubuntu 24.04 (x86_64, arm64), Landlock required
