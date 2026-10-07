@@ -19,6 +19,19 @@ bad() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 check() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else bad "$name"; fi; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 skip() { printf '  \033[33m-\033[0m skipped: %s\n' "$1"; skipped=$((skipped + 1)); }
+# Starts agentd and waits for *its* agentd.json (a previous one's may still
+# be there): sets SERVE_PID, TOKEN and CONSOLE. Extra arguments: environment
+# for agentd, e.g. AGENTOS_CONFIG=….
+start_agentd() {
+  rm -f "$AGENTOS_HOME/agentd.json"
+  PORT=$((20000 + RANDOM % 10000))
+  env "$@" "$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve.$PORT.log" 2>&1 &
+  SERVE_PID=$!
+  for _ in $(seq 100); do grep -q "\"pid\": *$SERVE_PID," "$AGENTOS_HOME/agentd.json" 2>/dev/null && break; sleep 0.1; done
+  TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
+  CONSOLE="http://127.0.0.1:$PORT"
+  SERVE_LOG="$WORK/serve.$PORT.log"
+}
 
 # Folders an agent asks for mid-task live under $HOME: with Landlock,
 # that's where write access can still be added once a task runs.
@@ -247,14 +260,9 @@ out="$("$AGENT" run --ask -- $GET 2>&1 </dev/null)"
 check "without a terminal nobody is asked, the host is refused" grep -q 'blocked example.com:443' <<<"$out"
 
 section "agentd console"
-PORT=$((20000 + RANDOM % 10000))
-"$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve.log" 2>&1 &
-SERVE_PID=$!
-for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
-TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
-CONSOLE="http://127.0.0.1:$PORT"
+start_agentd
 api() { curl -sS -m 10 -H "Authorization: Bearer $TOKEN" "$@"; }
-check "agent serve prints a link with a token" grep -q "#token=$TOKEN" "$WORK/serve.log"
+check "agent serve prints a link with a token" grep -q "#token=$TOKEN" "$SERVE_LOG"
 check "the console page is served" grep -q 'agentd console' <<<"$(curl -sS -m 10 "$CONSOLE/")"
 check "the API refuses calls without the token" test "$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 401
 check "it lists tasks" grep -q '"id"' <<<"$(api "$CONSOLE/api/tasks")"
@@ -285,12 +293,7 @@ mkdir -p "$ASKED/docs" "$ASKED/lib" "$ASKED/nope" "$WORK/outside"
 echo "the docs" > "$ASKED/docs/README"
 echo "lib v1" > "$ASKED/lib/lib.txt"
 echo "outside" > "$WORK/outside/file"
-PORT=$((20000 + RANDOM % 10000))
-"$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve2.log" 2>&1 &
-SERVE_PID=$!
-for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
-TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
-CONSOLE="http://127.0.0.1:$PORT"
+start_agentd
 # You, in the console: yes to everything except "nope".
 ( for _ in $(seq 600); do
     q="$(api "$CONSOLE/api/approvals")"
@@ -360,12 +363,7 @@ cd "$PROJ"
 mkdir -p "$ASKED/rv" "$ASKED/signal"
 echo "lent" > "$ASKED/rv/file"
 rm -f "$ASKED/signal/revoked"
-PORT=$((20000 + RANDOM % 10000))
-"$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve5.log" 2>&1 &
-SERVE_PID=$!
-for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
-TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
-CONSOLE="http://127.0.0.1:$PORT"
+start_agentd
 ( for _ in $(seq 600); do
     id="$(api "$CONSOLE/api/approvals" | sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p')"
     [ -n "$id" ] && api -X POST -d '{"decision":"once"}' "$CONSOLE/api/approvals/$id" >/dev/null
@@ -637,12 +635,7 @@ command = ["python3", "$HERE/fake-mcp-server"]
 env = ["NOTES_TOKEN", "NOTES_FILE"]
 tools = { drop_notes = "deny" }
 TOML
-  PORT=$((20000 + RANDOM % 10000))
-  "$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve3.log" 2>&1 &
-  SERVE_PID=$!
-  for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
-  TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
-  CONSOLE="http://127.0.0.1:$PORT"
+  start_agentd
   : > "$WORK/questions"
   # You, in the console: "Allow this call", unless the arguments say nope.
   ( for _ in $(seq 600); do
@@ -802,12 +795,7 @@ cat > "$WORK/cfg/agents/sleeper.toml" <<'TOML'
 run = ["sh", "-c", "echo sleeping; sleep 60", "{task}"]
 TOML
 printf '[console]\nprojects = ["%s"]\n' "$WORK/listed" > "$CFG"
-PORT=$((20000 + RANDOM % 10000))
-AGENTOS_CONFIG="$CFG" "$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve4.log" 2>&1 &
-SERVE_PID=$!
-for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
-TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
-CONSOLE="http://127.0.0.1:$PORT"
+start_agentd AGENTOS_CONFIG="$CFG"
 post() { api -X POST -d "$2" "$CONSOLE$1"; }
 wait_task() { for _ in $(seq 150); do api "$CONSOLE/api/tasks/$1" | grep -q "\"live\":$2" && return; sleep 0.2; done; }
 lp="$(api "$CONSOLE/api/launchpad")"
