@@ -3,11 +3,17 @@
 //!
 //! It listens on 127.0.0.1 by default, and every API call needs the token it
 //! prints (`#token=…` in the URL keeps it out of logs). Actions run the
-//! `agent` CLI itself, so commit, push and rollback behave exactly as in the
-//! terminal, with your own git and credentials.
+//! `agent` CLI itself, so starting a task, commit, push and rollback behave
+//! exactly as in the terminal, with your own git and credentials. Tasks can
+//! only be started in your projects: folders you list in your config, and
+//! folders you've run agents in.
 
 use crate::render::{self, Paint};
 use agentos::approvals::{self, Agentd, Decision};
+use agentos::config;
+use agentos::gateway::Budget;
+use agentos::profiles;
+use agentos::store::Access;
 use agentos::changes::{self, Summary};
 use agentos::gateway;
 use agentos::outbox;
@@ -20,7 +26,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -109,8 +115,10 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
     let segments: Vec<&str> = parts.path.trim_matches('/').split('/').collect();
     let result = match (&parts.method, segments.as_slice()) {
         (Method::Get, ["api", "tasks"]) => tasks(&store),
+        (Method::Post, ["api", "tasks"]) => start(&store, &parts.body),
+        (Method::Get, ["api", "launchpad"]) => launchpad(&store),
         (Method::Get, ["api", "tasks", id]) => task(&store, id),
-        (Method::Post, ["api", "tasks", id, action]) if ["commit", "push", "rollback"].contains(action) => run_cli(&store, action, id),
+        (Method::Post, ["api", "tasks", id, action]) if ["commit", "push", "rollback", "stop"].contains(action) => run_cli(&store, action, id),
         (Method::Get, ["api", "approvals"]) => Ok(json!(approvals::questions(store.root()))),
         (Method::Post, ["api", "approvals", id]) => {
             let decision = std::mem::take(&mut parts.body);
@@ -173,7 +181,117 @@ fn task(store: &Store, id: &str) -> Result<Value> {
     let mut v = task_json(&t);
     v["diff"] = json!(render::diff(Paint::plain(), &t, &changes, &pushes, false, false));
     v["log"] = json!(render::log(Paint::plain(), &t, &events));
+    v["output"] = json!(output_tail(&t, 16 * 1024));
     Ok(v)
+}
+
+/// The end of what a background task printed.
+fn output_tail(t: &Task, max: u64) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = fs::File::open(t.dir.join("output.log")).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    // Cut at a line boundary when it's a tail.
+    Some(if len > max { text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or(text) } else { text })
+}
+
+/// Folders tasks can be started in from the console, most recent first:
+/// those you list (`[console] projects`), and those you've run agents in.
+fn projects(store: &Store, home: &Path) -> Result<Vec<PathBuf>> {
+    let settings = config::load(store.root(), home, home)?;
+    let mut used: Vec<(u64, PathBuf)> = store
+        .list()?
+        .into_iter()
+        .filter(|t| t.meta.grants.iter().any(|g| g.access == Access::Rw && g.path == t.meta.cwd))
+        .map(|t| (t.meta.started_at_ms, t.meta.cwd))
+        .collect();
+    used.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in settings.projects.into_iter().chain(used.into_iter().map(|(_, p)| p)) {
+        let ok = p.is_dir() && crate::cwd_refusal(&p, home, store.root()).is_none();
+        if ok && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// What the "new task" form offers: your projects and your agents.
+fn launchpad(store: &Store) -> Result<Value> {
+    let home = crate::home_dir()?;
+    let default = config::load(store.root(), &home, &home)?.agent.unwrap_or_else(|| "claude".into());
+    let agents: Vec<Value> = profiles::available(&crate::agents_dir(&home))
+        .into_iter()
+        .map(|a| json!({ "name": a.name, "installed": a.program.is_some(), "default": a.name == default }))
+        .collect();
+    let projects: Vec<Value> = projects(store, &home)?
+        .iter()
+        .map(|p| json!({ "path": p, "shown": util::display_path(p) }))
+        .collect();
+    Ok(json!({ "projects": projects, "agents": agents }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Start {
+    project: PathBuf,
+    task: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    budget: Option<String>,
+    #[serde(default)]
+    timeout: Option<String>,
+}
+
+/// Starts `agent do --bg` in one of your projects, exactly as from a
+/// terminal there. Returns the task's id.
+fn start(store: &Store, body: &str) -> Result<Value> {
+    let req: Start = serde_json::from_str(body).context("expected {project, task, agent?, budget?, timeout?}")?;
+    let home = crate::home_dir()?;
+    let blank = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let (agent, budget, timeout) = (blank(&req.agent), blank(&req.budget), blank(&req.timeout));
+    if !projects(store, &home)?.contains(&req.project) {
+        bail!("{} isn't one of your projects: run an agent there from a terminal first, or list it under [console] projects in your config", util::display_path(&req.project));
+    }
+    let task = req.task.trim();
+    if task.is_empty() || task.len() > 20_000 {
+        bail!("describe the task (up to 20,000 characters)");
+    }
+    if let Some(a) = &agent {
+        if !profiles::available(&crate::agents_dir(&home)).iter().any(|x| x.name == *a) {
+            bail!("unknown agent '{a}'");
+        }
+    }
+    if let Some(b) = &budget {
+        b.parse::<Budget>().map_err(|e| anyhow!("budget {e}"))?;
+    }
+    if let Some(t) = &timeout {
+        humantime::parse_duration(t).with_context(|| format!("timeout {t}: expected e.g. 30m or 2h"))?;
+    }
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.current_dir(&req.project).args(["do", "--bg"]);
+    for (flag, value) in [("--agent", &agent), ("--budget", &budget), ("--timeout", &timeout)] {
+        if let Some(v) = value {
+            cmd.args([flag, v]);
+        }
+    }
+    let out = cmd
+        .arg("--")
+        .arg(task)
+        .env("AGENTOS_HOME", store.root())
+        .env("NO_COLOR", "1")
+        .env(crate::STARTED_BY, "agentd console")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    match stdout.lines().last().map(str::trim) {
+        Some(id) if out.status.success() && !id.is_empty() => Ok(json!({ "id": id })),
+        _ => bail!("{}", String::from_utf8_lossy(&out.stderr).trim()),
+    }
 }
 
 /// Runs `agent ACTION ID` and returns its output: the console does exactly
@@ -215,7 +333,13 @@ fn notifier(root: PathBuf, url: String) {
     loop {
         for q in approvals::questions(&root) {
             if asked.insert(q.id.clone()) {
-                send("agentos: an agent is asking", &format!("{} wants to reach {}", q.title, q.target));
+                let what = match q.kind {
+                    approvals::Kind::Host => "to reach",
+                    approvals::Kind::Read => "to read",
+                    approvals::Kind::Write => "to change",
+                    approvals::Kind::Tool => "to call",
+                };
+                send("agentos: an agent is asking", &format!("{} asks {what} {}", q.title, q.target));
             }
         }
         if let Ok(store) = Store::open_at(&root) {

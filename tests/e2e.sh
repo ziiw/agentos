@@ -707,6 +707,49 @@ rm -f "$RULES" rules.sh mcp-client
 unset NOTES_FILE
 : > "$CFG"
 
+section "start tasks from agentd's console"
+reset_proj
+cd "$PROJ"
+mkdir -p "$WORK/listed"
+cat > "$WORK/cfg/agents/sleeper.toml" <<'TOML'
+run = ["sh", "-c", "echo sleeping; sleep 60", "{task}"]
+TOML
+printf '[console]\nprojects = ["%s"]\n' "$WORK/listed" > "$CFG"
+PORT=$((20000 + RANDOM % 10000))
+AGENTOS_CONFIG="$CFG" "$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve4.log" 2>&1 &
+SERVE_PID=$!
+for _ in $(seq 50); do [ -s "$AGENTOS_HOME/agentd.json" ] && break; sleep 0.1; done
+TOKEN="$(sed -n 's/.*"token": *"\([0-9a-f]*\)".*/\1/p' "$AGENTOS_HOME/agentd.json")"
+CONSOLE="http://127.0.0.1:$PORT"
+post() { api -X POST -d "$2" "$CONSOLE$1"; }
+wait_task() { for _ in $(seq 150); do api "$CONSOLE/api/tasks/$1" | grep -q "\"live\":$2" && return; sleep 0.2; done; }
+lp="$(api "$CONSOLE/api/launchpad")"
+check "the console offers folders you've run agents in" grep -q "\"path\":\"$PROJ\"" <<<"$lp"
+check "...and those you list in your config" grep -q "\"path\":\"$WORK/listed\"" <<<"$lp"
+check "...and your agents" grep -q '"name":"sleeper"' <<<"$lp"
+check "it won't start a task in any other folder" grep -q "isn't one of your projects" <<<"$(post /api/tasks "{\"project\":\"$WORK\",\"task\":\"x\"}")"
+check "...or with an agent you don't have" grep -q "unknown agent" <<<"$(post /api/tasks "{\"project\":\"$PROJ\",\"task\":\"x\",\"agent\":\"nope\"}")"
+check "...or a budget it can't read" grep -q '"error":"budget' <<<"$(post /api/tasks "{\"project\":\"$PROJ\",\"task\":\"x\",\"budget\":\"lots\"}")"
+r="$(post /api/tasks "{\"project\":\"$PROJ\",\"task\":\"add a test for greet\",\"budget\":\"2usd\"}")"
+ID="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$r")"
+check "starting a task returns its id" test -n "$ID"
+wait_task "$ID" false
+d="$(api "$CONSOLE/api/tasks/$ID")"
+check "it runs like agent do: the agent does the work" grep -q 'test_greet.py' <<<"$d"
+check "...in its sandbox, held for review" test ! -e "$PROJ/test_greet.py"
+check "...with what you set (budget)" grep -q '"budget":"\$2.00"' <<<"$d"
+check "its output shows in the console" grep -q 'Added test_greet.py' <<<"$d"
+check "the journal says it was started from the console" grep -q '"started_by":"agentd console"' "$AGENTOS_HOME/tasks/$ID/events.jsonl"
+r="$(post /api/tasks "{\"project\":\"$PROJ\",\"task\":\"take a nap\",\"agent\":\"sleeper\"}")"
+ID2="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$r")"
+wait_task "$ID2" true
+check "a running task shows what it prints, live" grep -q 'sleeping' <<<"$(api "$CONSOLE/api/tasks/$ID2")"
+check "...and can be stopped from the console" grep -q '"ok":true' <<<"$(post "/api/tasks/$ID2/stop" '{}')"
+check "...which it is" grep -q '"status":"stopped"' <<<"$(api "$CONSOLE/api/tasks/$ID2")"
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+rm -f "$WORK/cfg/agents/sleeper.toml"
+: > "$CFG"
+
 section "budgets (the model gateway)"
 # A stand-in model API: httpbin's /base64/… answers with whatever body the
 # URL carries, so the "provider" reports exactly the usage we choose.

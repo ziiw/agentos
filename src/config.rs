@@ -32,6 +32,9 @@
 //! env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]  # the agent reaches it through agentos
 //! tools = { delete_file = "deny" }        # allow | ask | deny (default: read-only tools allowed, others asked)
 //!
+//! [console]                               # your file only: where agentd's console can
+//! projects = ["~/code/app"]               # start tasks (besides folders you've used)
+//!
 //! [prices]                                # your file only; USD per million tokens, for
 //! "gpt-*" = { input = 1.25, output = 10 }  # models agentos doesn't know (example figures)
 //! ```
@@ -65,6 +68,15 @@ struct ConfigFile {
     prices: BTreeMap<String, Price>,
     #[serde(default)]
     mcp: BTreeMap<String, crate::mcp::Server>,
+    #[serde(default)]
+    console: Console,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Console {
+    #[serde(default)]
+    projects: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,6 +127,8 @@ pub struct Settings {
     pub prices: Vec<(String, Price)>,
     /// Your MCP servers, run by agentos outside the sandbox.
     pub mcp: Vec<crate::mcp::Server>,
+    /// Folders agentd's console can start tasks in (besides those you've used).
+    pub projects: Vec<PathBuf>,
     /// Default agent for `agent do` (a project's overrides yours).
     pub agent: Option<String>,
 }
@@ -227,6 +241,14 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
     // A project pricing its models at zero would switch your budgets off.
     if project.is_some() && !file.prices.is_empty() {
         bail!("{shown}: [prices] only belongs in your own config, never in a project's");
+    }
+    if project.is_some() && !file.console.projects.is_empty() {
+        bail!("{shown}: [console] only belongs in your own config, never in a project's");
+    }
+    for entry in &file.console.projects {
+        if let Ok(p) = fs::canonicalize(resolve(entry)?) {
+            s.projects.push(p);
+        }
     }
     // A cloned repo must never get agentos to run a program on your machine.
     if project.is_some() && !file.mcp.is_empty() {

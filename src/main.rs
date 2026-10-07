@@ -34,6 +34,9 @@ use std::time::Duration;
 mod render;
 mod web;
 
+/// Set when a task is started for you (by agentd's console), for the journal.
+const STARTED_BY: &str = "AGENTOS_STARTED_BY";
+
 /// Environment variables an agent inherits by default. Anything else (API
 /// keys, tokens) must be passed explicitly with --env.
 const PASS_ENV: &[&str] = &[
@@ -885,6 +888,7 @@ fn execute(store: &Store, plan: Plan) -> Result<i32> {
             "secrets": plan.secrets.iter().map(|s| json!({ "env": s.env, "host": s.host, "header": s.header })).collect::<Vec<_>>(),
             "env": task.meta.env,
             "budget": budget,
+            "started_by": std::env::var(STARTED_BY).ok(),
         }),
     )?;
 

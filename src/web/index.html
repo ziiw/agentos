@@ -53,14 +53,26 @@
   .doing { font-family: var(--mono); font-size: 12px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
   .notice { background: var(--card); border: 1px solid var(--bad); border-radius: 12px; padding: 14px 16px; }
   .output { white-space: pre-wrap; }
+  pre.live { max-height: 320px; overflow-y: auto; }
+  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 0; font-weight: 600; }
+  .new label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  .new select, .new textarea, .new input { font: inherit; font-size: 15px; width: 100%; color: var(--text); background: var(--bg);
+                                          border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .new textarea { min-height: 96px; resize: vertical; }
+  .new .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0 10px; }
+  .new .error { color: var(--bad); font-size: 14px; margin-top: 10px; }
+  header button { margin-left: auto; }
+  header .dot { margin-left: 8px; }
 </style>
 </head>
 <body>
 <main>
   <header>
-    <h1>agentos</h1><span class="sub">agentd console</span><span class="dot" id="dot" title="connection"></span>
+    <h1>agentos</h1><span class="sub">agentd console</span>
+    <button id="new-open" class="primary">New task</button><span class="dot" id="dot" title="connection"></span>
   </header>
   <div id="notice"></div>
+  <section id="new"></section>
   <section id="asks"></section>
   <h2>Tasks</h2>
   <section id="tasks"><p class="empty">Loading…</p></section>
@@ -165,11 +177,52 @@
   async function loadDetail(id) {
     const el = $("detail"); if (!el) return;
     const t = await api("/api/tasks/" + id);
-    const actions = t.open && !t.live ? `<div class="row">
+    const actions = t.live
+      ? `<div class="row"><button class="danger" data-act="stop" data-id="${id}">Stop</button></div>`
+      : t.open ? `<div class="row">
         <button class="primary" data-act="commit" data-id="${id}">Commit${t.pushes ? " and push" : ""}</button>
         ${t.pushes ? `<button data-act="push" data-id="${id}">Push only</button>` : ""}
         <button class="danger" data-act="rollback" data-id="${id}">Roll back</button></div>` : "";
-    el.innerHTML = `${actions}<div id="result"></div><pre>${colorDiff(t.diff)}</pre><pre>${esc(t.log)}</pre>`;
+    const output = t.output ? `<h3>Output</h3><pre class="output live" id="live">${esc(t.output)}</pre>` : "";
+    el.innerHTML = `${actions}<div id="result"></div>${output}<h3>Changes</h3><pre>${colorDiff(t.diff)}</pre><h3>Journal</h3><pre>${esc(t.log)}</pre>`;
+    const live = $("live"); if (live) live.scrollTop = live.scrollHeight;
+  }
+
+  // The "new task" form: your projects and agents, from agentd.
+  let launchpad = null;
+  async function openNew() {
+    if (!launchpad) launchpad = await api("/api/launchpad").catch(() => null);
+    const lp = launchpad || { projects: [], agents: [] };
+    if (!lp.projects.length) {
+      $("new").innerHTML = `<div class="card new"><p class="empty">No projects yet. Run <code>agent do</code> in a folder once, or list folders under <code>[console] projects</code> in your config.</p>
+        <div class="row"><button data-new="close">Close</button></div></div>`;
+      return;
+    }
+    const projects = lp.projects.map((p) => `<option value="${esc(p.path)}">${esc(p.shown)}</option>`).join("");
+    const agents = lp.agents.map((a) => `<option value="${esc(a.name)}"${a.default ? " selected" : ""}${a.installed ? "" : " disabled"}>${esc(a.name)}${a.installed ? "" : " (not installed)"}</option>`).join("");
+    $("new").innerHTML = `<div class="card new">
+      <label for="np">Project</label><select id="np">${projects}</select>
+      <label for="nt">Task</label><textarea id="nt" placeholder="What should the agent do?"></textarea>
+      <div class="grid">
+        <div><label for="na">Agent</label><select id="na">${agents}</select></div>
+        <div><label for="nb">Budget</label><input id="nb" placeholder="e.g. 2usd or 500k"></div>
+        <div><label for="nto">Stop after</label><input id="nto" placeholder="e.g. 30m"></div>
+      </div>
+      <div class="error" id="nerr"></div>
+      <div class="row"><button class="primary" data-new="start">Start</button><button data-new="close">Cancel</button></div>
+    </div>`;
+    $("nt").focus();
+  }
+
+  async function startTask(button) {
+    const body = { project: $("np").value, task: $("nt").value, agent: $("na").value, budget: $("nb").value, timeout: $("nto").value };
+    if (!body.task.trim()) { $("nerr").textContent = "Describe the task first."; return; }
+    button.disabled = true;
+    const r = await api("/api/tasks", body).catch((e) => ({ error: e.message }));
+    if (r.error) { $("nerr").textContent = r.error; button.disabled = false; return; }
+    $("new").innerHTML = "";
+    openTask = r.id;
+    refresh();
   }
 
   async function refresh() {
@@ -186,8 +239,12 @@
     }
   }
 
+  $("new-open").addEventListener("click", () => ($("new").innerHTML ? ($("new").innerHTML = "") : openNew()));
+
   document.addEventListener("click", async (ev) => {
     const b = ev.target.closest("button");
+    if (b && b.dataset.new === "close") { $("new").innerHTML = ""; return; }
+    if (b && b.dataset.new === "start") return startTask(b);
     if (b && b.dataset.q) {
       b.disabled = true;
       await api("/api/approvals/" + b.dataset.q, { decision: b.dataset.d }).catch(() => {});
@@ -195,6 +252,7 @@
     }
     if (b && b.dataset.act) {
       if (b.dataset.act === "rollback" && !confirm("Discard this task's changes and held pushes?")) return;
+      if (b.dataset.act === "stop" && !confirm("Stop this task? What it did so far is held for review.")) return;
       document.querySelectorAll("#detail button").forEach((x) => (x.disabled = true));
       const r = await api(`/api/tasks/${b.dataset.id}/${b.dataset.act}`, {});
       const res = $("result");

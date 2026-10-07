@@ -275,7 +275,14 @@ At 80% of the budget you get a heads-up. Once it's used up, further model calls 
 agent serve
 ```
 
-This starts agentd and prints a link like `http://127.0.0.1:7777/#token=…`. The page lists your tasks, shows each one's diff, held pushes and journal, and has **Commit / Push / Roll back** buttons that run the same commands as the terminal. Running tasks show what they're doing right now. Questions from agents appear at the top with **Allow for this task / Always / Deny**, alongside the terminal prompt; the first answer wins. Tasks with no terminal to ask at, like Claude's full-screen interface or background runs, ask there too.
+This starts agentd and prints a link like `http://127.0.0.1:7777/#token=…`. The page lists your tasks, shows each one's diff, held pushes and journal, and has **Commit / Push / Roll back** buttons that run the same commands as the terminal. Running tasks show what they're doing right now.
+
+**Start tasks from there too**, from your laptop or your phone: **New task**, pick a project, describe the task, optionally choose the agent, a budget and when to stop it. It runs exactly like `agent do --bg` in that folder: same sandbox, rules and journal (which notes it was started from the console). Its output streams into its card, and **Stop** ends it, with what it did so far held for review. Tasks can only be started in your projects: folders you've run agents in, plus those you list in your config:
+
+```toml
+[console]
+projects = ["~/code/app", "~/code/site"]
+``` Questions from agents appear at the top with **Allow for this task / Always / Deny**, alongside the terminal prompt; the first answer wins. Tasks with no terminal to ask at, like Claude's full-screen interface or background runs, ask there too.
 
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
 - `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only), and when a task finishes, with what it left for review.
