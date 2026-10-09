@@ -1,0 +1,19 @@
+# Aider (0.86.2) with a model on this machine: Ollama, llama.cpp, vLLM, anything
+# that speaks OpenAI's chat completions. Checked end to end under agentos with
+# scripts/verify-aider.sh, which runs the real Aider against a stand-in server.
+#
+# Copy to ~/.config/agentos/agents/aider.toml (adjust the port and model), then:
+#   agent do --agent aider "…"
+#
+# The model server is reached through `local`, the one door out of the sandbox:
+# no internet is needed, and nothing else on your loopback is reachable. Aider
+# also tries to fetch litellm's price list from raw.githubusercontent.com; that
+# is blocked and it carries on. Add the host to `allow` to silence it.
+run = ["aider", "--yes-always", "--no-check-update", "--no-analytics", "--no-show-model-warnings", "--model", "openai/llama3.2", "--message", "{task}"]
+interactive = ["aider", "--no-check-update", "--no-analytics", "--model", "openai/llama3.2"]
+local = [11434]
+
+[env]
+OPENAI_API_BASE = "http://127.0.0.1:11434/v1"
+OPENAI_API_KEY = "none"                       # the server doesn't check it
+LITELLM_LOCAL_MODEL_COST_MAP = "True"

@@ -1,4 +1,6 @@
-# Aider, here with an Anthropic model. UNTESTED SKETCH: check `aider --help`.
+# Aider (0.86.2), here with an Anthropic model. Aider itself runs under agentos
+# (see aider-local.toml, checked end to end); this variant reaches Anthropic
+# through the same broker as Claude Code does, and has not been run with a real key.
 # Copy to ~/.config/agentos/agents/aider.toml, then: agent do --agent aider "…"
 run = ["aider", "--yes-always", "--no-check-update", "--no-analytics", "--message", "{task}"]
 interactive = ["aider", "--no-check-update", "--no-analytics"]
