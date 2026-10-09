@@ -1428,6 +1428,90 @@ TOML
   : > "$CFG"
 fi
 
+section "services on your machine (D-Bus as MCP servers)"
+BUS_PID=
+if command -v python3 >/dev/null && command -v busctl >/dev/null && command -v dbus-daemon >/dev/null; then
+  # A bus of its own, so nothing here touches yours.
+  mkdir -p "$WORK/dbus"
+  dbus-daemon --session --address="unix:path=$WORK/dbus/bus" --nofork --nopidfile >/dev/null 2>&1 &
+  BUS_PID=$!
+  for _ in $(seq 50); do [ -S "$WORK/dbus/bus" ] && break; sleep 0.1; done
+fi
+if [ ! -S "$WORK/dbus/bus" ]; then
+  skip "D-Bus tools need python3, busctl (systemd) and a dbus-daemon that starts"
+else
+  reset_proj
+  cd "$PROJ"
+  cp "$HERE/mcp-client" ./mcp-client
+  DCFG="$WORK/dbuscfg/config.toml"
+  mkdir -p "$(dirname "$DCFG")"
+  write_dcfg() { cat > "$DCFG" <<TOML
+[mcp.bus]
+dbus = "session"
+services = ["org.freedesktop.DBus", "org.example.*"]
+$1
+TOML
+  }
+  bb() { DBUS_SESSION_BUS_ADDRESS="unix:path=$WORK/dbus/bus" AGENTOS_CONFIG="$DCFG" "$AGENT" "$@"; }
+  write_dcfg 'tools = { dbus_call = "allow" }'
+  D='"service":"org.freedesktop.DBus","path":"/org/freedesktop/DBus"'
+  I='"interface":"org.freedesktop.DBus"'
+  CALLS=(
+    tools/list
+    'tools/call:dbus_services:{}'
+    "tools/call:dbus_introspect:{$D}"
+    "tools/call:dbus_get:{$D,$I,\"property\":\"Features\"}"
+    "tools/call:dbus_call:{$D,$I,\"method\":\"NameHasOwner\",\"args\":[\"org.freedesktop.DBus\"]}"
+    "tools/call:dbus_call:{$D,$I,\"method\":\"NameHasOwner\",\"args\":[\"--user\"]}"
+    "tools/call:dbus_call:{$D,$I,\"method\":\"UpdateActivationEnvironment\",\"args\":[{\"E2E_VAR\":\"a b\"}]}"
+    "tools/call:dbus_call:{$D,$I,\"method\":\"GetNameOwner\",\"args\":[5]}"
+    'tools/call:dbus_call:{"service":"org.freedesktop.secrets","path":"/","interface":"org.freedesktop.Secret.Service","method":"OpenSession"}'
+  )
+  out="$(bb run -- python3 ./mcp-client bus "${CALLS[@]}" 2>&1 </dev/null)"
+  events="$(latest_task_dir)/events.jsonl"
+  check "the bus's tools are listed" grep -q '^tools: dbus_services,dbus_introspect,dbus_get,dbus_call$' <<<"$out"
+  check "services lists the ones you named that are there, and only those" grep -q 'dbus_services: {"bus":"session","allowed":\["org.freedesktop.DBus","org.example.\*"\],"services":\[{"name":"org.freedesktop.DBus","running":true}\]}' <<<"$out"
+  check "an object's methods come with their types" grep -q 'method NameHasOwner(s) -> b' <<<"$out"
+  check "a property is read" grep -q 'dbus_get: {"type":"as","data":\["ActivatableServicesChanged","HeaderFiltering"\]}' <<<"$out"
+  check "a method is called with its arguments as JSON" grep -q 'dbus_call: {"type":"b","data":\[true\]}' <<<"$out"
+  check "...a value that looks like an option is only a value" grep -q 'dbus_call: {"type":"b","data":\[false\]}' <<<"$out"
+  check "...a dict goes through" grep -q 'dbus_call: (it returned nothing)' <<<"$out"
+  check "...the wrong type is explained before anything is sent" grep -q 'dbus_call: args\[0\]: expected a string (type s), got 5 \[error\]' <<<"$out"
+  check "a service you didn't list is out of reach" grep -q "isn't a service this server may use. It can reach: org.freedesktop.DBus, org.example.\* \[error\]" <<<"$out"
+  check "reads are journaled as read-only" grep -q '"kind":"mcp.call".*"decision":"read-only".*"server":"bus","tool":"dbus_get"' "$events"
+  check "calls are journaled as allowed, with their arguments" grep -q '"kind":"mcp.call".*NameHasOwner.*"decision":"allowed".*"server":"bus","tool":"dbus_call"' "$events"
+  out="$(bb run -- sh -c "echo \"bus address in the sandbox: \${DBUS_SESSION_BUS_ADDRESS:-unset}\"; DBUS_SESSION_BUS_ADDRESS=unix:path=$WORK/dbus/bus busctl --user --no-pager list >/dev/null 2>&1 && echo 'the bus itself: reached' || echo 'the bus itself: unreachable'" 2>&1 </dev/null)"
+  check "the sandbox isn't told where your bus is" grep -q 'bus address in the sandbox: unset' <<<"$out"
+  check "...and can't reach it" grep -q 'the bus itself: unreachable' <<<"$out"
+
+  # One method of a service can be forbidden, whatever the config allows.
+  cat > "$(dirname "$DCFG")/policy.cedar" <<'CEDAR'
+@id("no activation environment")
+forbid (principal, action == Action::"call", resource == Tool::"bus.dbus_call")
+when { context.args has method && context.args.method == "UpdateActivationEnvironment" };
+CEDAR
+  out="$(bb run -- python3 ./mcp-client bus tools/list "tools/call:dbus_call:{$D,$I,\"method\":\"UpdateActivationEnvironment\",\"args\":[{\"E2E_VAR\":\"x\"}]}" "tools/call:dbus_call:{$D,$I,\"method\":\"NameHasOwner\",\"args\":[\"org.freedesktop.DBus\"]}" 2>&1 </dev/null)"
+  check "a rule can forbid one method of a service" grep -q 'rules forbid this call' <<<"$out"
+  check "...and the rest still works" grep -q 'dbus_call: {"type":"b","data":\[true\]}' <<<"$out"
+  check "...which the journal says" grep -q '"decision":"forbidden".*"rule":"no activation environment"' "$(latest_task_dir)/events.jsonl"
+  rm -f "$(dirname "$DCFG")/policy.cedar"
+
+  # A call can wait for your review, like any tool's.
+  write_dcfg 'hold = true'
+  out="$(bb run -- python3 ./mcp-client bus tools/list "tools/call:dbus_call:{$D,$I,\"method\":\"UpdateActivationEnvironment\",\"args\":[{\"E2E_HELD\":\"1\"}]}" "tools/call:dbus_get:{$D,$I,\"property\":\"Features\"}" 2>&1 </dev/null)"
+  check "a call can be held for review" grep -q 'dbus_call: Queued, not done yet: bus.dbus_call is held' <<<"$out"
+  check "...while reads still run" grep -q 'dbus_get: {"type":"as"' <<<"$out"
+  check "agent diff lists it with its arguments" grep -q 'bus.dbus_call .*UpdateActivationEnvironment' <<<"$(bb diff 2>&1)"
+  check "agent commit makes the call, through the same bridge" grep -q 'ran bus.dbus_call: (it returned nothing)' <<<"$(bb commit 2>&1)"
+
+  # A bus is a lot of power: a list of services is not optional.
+  printf '[mcp.bus]\ndbus = "session"\n' > "$DCFG"
+  check "a bus without a list of services is refused" grep -q 'name the services it may reach' <<<"$(bb run -- true 2>&1)"
+  kill "$BUS_PID" 2>/dev/null; wait "$BUS_PID" 2>/dev/null
+  rm -f mcp-client
+  : > "$DCFG"
+fi
+
 section "remote MCP servers (Streamable HTTP, OAuth sign-in)"
 if ! command -v python3 >/dev/null; then
   skip "the stand-in remote MCP server needs python3"

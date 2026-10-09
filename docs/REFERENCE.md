@@ -304,6 +304,34 @@ agent connect             # your remote servers, and whether you're signed in
 
 agentos finds where to sign in from the server itself, registers there as a client, and has you approve in your browser, which comes back to agentos on a loopback address. Over SSH, open the printed link anywhere and paste back the address your browser ends up on. The tokens are kept in the task store's vault, which no sandbox can see. They're refreshed when they expire, or when the server refuses them. `agent connect NAME --forget` forgets them.
 
+**Services on your machine, over D-Bus.** A desktop and a Linux machine are full of services an agent could use: notifications, media players, network settings, the power menu. agentos makes a bus's services into MCP tools, with the same questions, rules and journal, and nothing else on the bus:
+
+```toml
+[mcp.desktop]
+dbus = "session"                              # or "system"
+services = ["org.freedesktop.Notifications", "org.mpris.MediaPlayer2.*"]   # required: the only names it can reach
+tools = { dbus_call = "ask" }                 # the default for a tool that isn't read-only
+```
+
+A bus is a lot of power (the session bus has your password manager, your shell and your media players; the system bus has `systemd` and the power button), so a server like this reaches **only the services you list**: `org.mpris.MediaPlayer2.*` names a family, and a unique name (`:1.42`) is never one of them. The agent gets four tools and needn't know D-Bus:
+
+| Tool | What it does |
+|---|---|
+| `dbus_services` | which of your services are there, and whether each is running |
+| `dbus_introspect` | an object's methods (with the types they take and return), properties and signals, and the objects below it |
+| `dbus_get` | one property |
+| `dbus_call` | a method, with its arguments as a JSON list: strings, numbers, booleans, a list for an array, an object for a dict (`a{sv}`), a list for a struct. A variant is a plain value, or `{"type": "u", "data": 5}` to say which type. The method's types come from introspection, so `["hi", 3]` is enough |
+
+The first three are read-only, so they run without asking; `dbus_call` is asked about like any tool that changes things, with its arguments on screen (`tools = { dbus_call = "allow" }`, `hold = true` or `"hold"` to queue calls for `agent commit`, `"deny"` as for any server). Rules see the arguments, so one method of one service can be forbidden or allowed:
+
+```cedar
+@id("notifications, but not the power menu")
+permit (principal, action == Action::"call", resource == Tool::"desktop.dbus_call")
+when { context.args.service == "org.freedesktop.Notifications" && context.args.method == "Notify" };
+```
+
+It needs `busctl` (it comes with systemd). agentos runs the bridge outside the sandbox, as you, with your bus's address; the sandbox is never told where the bus is. On a bus that listens on an abstract socket (`unix:abstract=…`, what `dbus-launch` makes), a task started with `--net host` could reach it directly: use the path-based user bus systemd makes (`/run/user/UID/bus`), or keep such tasks on the default network.
+
 ## API writes wait in the outbox too
 
 ```bash
@@ -588,6 +616,10 @@ budget = "5usd"                       # model calls: dollars, or tokens ("2M")
 command = ["github-mcp-server", "stdio"]
 env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 
+[mcp.desktop]                         # your file only: a D-Bus bus's services, as tools
+dbus = "session"
+services = ["org.freedesktop.Notifications"]
+
 [prices]                              # your file only; USD per million tokens
 "gpt-*" = { input = 1.25, output = 10 }   # example figures: use your provider's
 
@@ -788,6 +820,7 @@ src/broker.rs    credential broker (per-task CA, HTTP/1.1 relay)
 src/gateway.rs   model gateway: usage metering, prices, budgets
 src/control.rs   the agent's requests from inside (control socket), and what may be granted
 src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway to yours
+src/dbus.rs      D-Bus services as MCP tools (`agent dbus-bridge`, over busctl): typed arguments, a list of services
 src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refresh
 src/policy.rs    your rules (Cedar): answers given in advance
 src/packages.rs  agent packages: review, install, check before every run
@@ -803,5 +836,6 @@ src/render.rs    output       src/web.rs   agentd's console
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run
 scripts/package.sh      .deb and .rpm (nfpm), from packaging/: the unit, the AppArmor profile, install scripts
+scripts/dev.sh          build and test in a Linux container (scripts/dev.Dockerfile: Rust, Xvfb, xdotool, D-Bus)
 .github/workflows/ci.yml   unit + e2e tests on real Ubuntu 24.04 (x86_64, arm64), Landlock required
 ```

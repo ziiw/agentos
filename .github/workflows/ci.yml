@@ -41,8 +41,8 @@ jobs:
       - name: agent doctor
         run: agent doctor
 
-      - name: A virtual display for the --display tests
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-utils xdotool
+      - name: A virtual display for the --display tests, and a bus for the D-Bus ones
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-utils xdotool dbus-daemon
 
       - name: End-to-end tests
         run: REQUIRE_LANDLOCK=1 bash tests/e2e.sh

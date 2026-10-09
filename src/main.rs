@@ -84,6 +84,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
         return Ok(0);
     }
+    if let Command::DbusBridge { bus, services } = cli.command {
+        agentos::dbus::serve_stdio(&bus, services)?;
+        return Ok(0);
+    }
     let store = Store::open()?;
     match cli.command {
         Command::Do(args) => cmd_do(&store, args),
@@ -123,7 +127,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
         Command::Revoke { target, task } => cmd_revoke(&store, target, task),
         Command::Connect { name, forget } => cmd_connect(&store, name, forget),
-        Command::Mcp { .. } => unreachable!(),
+        Command::Mcp { .. } | Command::DbusBridge { .. } => unreachable!(),
     }
 }
 

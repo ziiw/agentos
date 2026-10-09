@@ -246,6 +246,15 @@ pub(crate) enum Command {
     /// the gateway to one of yours
     #[command(hide = true)]
     Mcp { server: Option<String> },
+    /// The MCP server that `[mcp.NAME] dbus = …` starts: tools for a D-Bus
+    /// bus, reaching only the services named
+    #[command(hide = true, name = "dbus-bridge")]
+    DbusBridge {
+        #[arg(long)]
+        bus: String,
+        #[arg(long = "service")]
+        services: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]

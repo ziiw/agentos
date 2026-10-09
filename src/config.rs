@@ -44,6 +44,10 @@
 //! url = "https://mcp.linear.app/mcp"      # never the sandbox; `agent connect linear`
 //!                                         # signs in (or: token = "ENV_VAR")
 //!
+//! [mcp.desktop]                           # a bus's services as tools: agentos runs a bridge to
+//! dbus = "session"                        # your session (or system) bus that reaches only these:
+//! services = ["org.freedesktop.Notifications", "org.mpris.MediaPlayer2.*"]
+//!
 //! [taint]                                 # your file only: hosts whose content doesn't make
 //! trusted = ["git.corp.example", "*.docs.example"] # a task "tainted" (registries and model APIs already don't)
 //!
@@ -632,8 +636,24 @@ mod tests {
         let file: ConfigFile = toml::from_str("[mcp.tracker]\nurl = \"https://mcp.example.com/mcp\"\ntoken = \"TRACKER_TOKEN\"\n").unwrap();
         apply(&mut s, file, Path::new("config.toml"), None, &e.home).unwrap();
         assert_eq!(s.mcp[1].describe(), "https://mcp.example.com/mcp");
+        let file: ConfigFile = toml::from_str("[mcp.desktop]\ndbus = \"session\"\nservices = [\"org.freedesktop.Notifications\", \"org.mpris.MediaPlayer2.*\"]\n").unwrap();
+        apply(&mut s, file, Path::new("config.toml"), None, &e.home).unwrap();
+        assert_eq!(s.mcp[2].describe(), "D-Bus session bus: org.freedesktop.Notifications, org.mpris.MediaPlayer2.*");
+        let argv = s.mcp[2].argv().unwrap();
+        assert_eq!(argv[1..], ["dbus-bridge", "--bus", "session", "--service", "org.freedesktop.Notifications", "--service", "org.mpris.MediaPlayer2.*"], "agentos runs its own bridge");
+        assert!(!s.mcp[2].taints(), "what's on your own machine isn't untrusted input");
 
         for bad in [
+            "[mcp.x]\ndbus = \"session\"\n",
+            "[mcp.x]\ndbus = \"session\"\nservices = []\n",
+            "[mcp.x]\ndbus = \"seat\"\nservices = [\"org.a.B\"]\n",
+            "[mcp.x]\ndbus = \"session\"\nservices = [\"*\"]\n",
+            "[mcp.x]\ndbus = \"session\"\nservices = [\"org.*\"]\n",
+            "[mcp.x]\ndbus = \"session\"\nservices = [\":1.5\"]\n",
+            "[mcp.x]\ndbus = \"session\"\nservices = [\"org.a.B\"]\ncommand = [\"x\"]\n",
+            "[mcp.x]\ndbus = \"session\"\nservices = [\"org.a.B\"]\nurl = \"https://a.dev/mcp\"\n",
+            "[mcp.x]\ndbus = \"session\"\nservices = [\"org.a.B\"]\nenv = [\"A\"]\n",
+            "[mcp.x]\ncommand = [\"x\"]\nservices = [\"org.a.B\"]\n",
             "[limits]\nbudget = \"lots\"\n",
             "[limits]\nmemroy = \"4G\"\n",
             "[prices]\nx = { input = -1, output = 1 }\n",

@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Protocol versions we speak; tools work the same in all of them.
-const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+pub(crate) const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INSTRUCTIONS: &str = "You run inside an agentos sandbox: you see only the folders you were granted, \
 your file changes and git pushes are held for the user's review, and the network is an allowlist. \
@@ -153,6 +153,15 @@ pub struct Server {
     /// A remote server (Streamable HTTP).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// A D-Bus bus (`session` or `system`) to make tools of: agentos runs its
+    /// own bridge (`agent dbus-bridge`), which reaches only `services`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbus: Option<String>,
+    /// For a bus: the service names the agent may use, and nothing else on
+    /// the bus (`org.freedesktop.Notifications`, or a family:
+    /// `org.mpris.MediaPlayer2.*`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
     /// For a remote server: the environment variable holding its bearer
     /// token. Without one, `agent connect NAME` signs in (OAuth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,9 +215,30 @@ impl Server {
         if name.is_empty() || name == "agentos" || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
             bail!("[mcp.{name}]: names are letters, digits, - and _ (and not \"agentos\")");
         }
+        if let Some(bus) = &self.dbus {
+            if !self.command.is_empty() || self.url.is_some() {
+                bail!("[mcp.{name}]: a bus, a command or a url, not more than one");
+            }
+            if crate::dbus::Bus::parse(bus).is_none() {
+                bail!("[mcp.{name}]: dbus is \"session\" or \"system\", not {bus:?}");
+            }
+            if self.services.is_empty() {
+                bail!("[mcp.{name}]: a bus is a lot of power: name the services it may reach, like services = [\"org.freedesktop.Notifications\"]");
+            }
+            if let Some(bad) = self.services.iter().find(|s| !crate::dbus::valid_pattern(s)) {
+                bail!("[mcp.{name}]: {bad:?} isn't a service name (like org.freedesktop.Notifications, or a family: org.mpris.MediaPlayer2.*)");
+            }
+            if !self.env.is_empty() || self.token.is_some() {
+                bail!("[mcp.{name}]: a bus takes no env or token");
+            }
+            return Ok(());
+        }
+        if !self.services.is_empty() {
+            bail!("[mcp.{name}]: services is for a bus (dbus = \"session\")");
+        }
         match (&self.url, self.command.is_empty()) {
             (Some(_), false) => bail!("[mcp.{name}]: a command or a url, not both"),
-            (None, true) => bail!("[mcp.{name}]: needs a command (a server agentos runs) or a url (a remote one)"),
+            (None, true) => bail!("[mcp.{name}]: needs a command (a server agentos runs), a url (a remote one) or a dbus bus"),
             (None, false) if self.command[0].is_empty() => bail!("[mcp.{name}]: command is empty"),
             (None, false) if self.token.is_some() => bail!("[mcp.{name}]: token is for remote servers; pass a local one its credentials with env"),
             (Some(url), _) => {
@@ -230,9 +260,24 @@ impl Server {
         Ok(())
     }
 
-    /// What it is, for you: its command, or its URL.
+    /// What agentos runs for this server: its command, or for a bus its own
+    /// bridge to it.
+    pub fn argv(&self) -> Result<Vec<String>> {
+        let Some(bus) = &self.dbus else { return Ok(self.command.clone()) };
+        let exe = std::env::current_exe().context("find agentos's own program")?;
+        let mut argv = vec![exe.to_string_lossy().into_owned(), "dbus-bridge".to_string(), "--bus".to_string(), bus.clone()];
+        for service in &self.services {
+            argv.extend(["--service".to_string(), service.clone()]);
+        }
+        Ok(argv)
+    }
+
+    /// What it is, for you: its command, or its URL, or its bus.
     pub fn describe(&self) -> String {
-        self.url.clone().unwrap_or_else(|| self.command.join(" "))
+        match &self.dbus {
+            Some(bus) => format!("D-Bus {bus} bus: {}", self.services.join(", ")),
+            None => self.url.clone().unwrap_or_else(|| self.command.join(" ")),
+        }
     }
 }
 
@@ -574,11 +619,20 @@ impl Gateway {
     }
 
     fn spawn(&self, server: &Server) -> Result<Child> {
-        let mut cmd = Command::new(&server.command[0]);
-        cmd.args(&server.command[1..]).current_dir(&self.cwd).env_clear();
+        let argv = server.argv()?;
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).current_dir(&self.cwd).env_clear();
         for k in ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
             if let Some(v) = std::env::var_os(k) {
                 cmd.env(k, v);
+            }
+        }
+        // Where your bus is (an address, not a secret), for the bridge to it.
+        if server.dbus.is_some() {
+            for k in ["DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS"] {
+                if let Some(v) = std::env::var_os(k) {
+                    cmd.env(k, v);
+                }
             }
         }
         for k in &server.env {
@@ -593,7 +647,7 @@ impl Gateway {
         let log = std::fs::File::create(self.log_dir.join(format!("mcp-{}.log", server.name)))?;
         use std::os::unix::process::CommandExt;
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log).process_group(0);
-        let child = cmd.spawn().with_context(|| format!("start {}", server.command[0]))?;
+        let child = cmd.spawn().with_context(|| format!("start {}", argv[0]))?;
         if let Ok(mut pids) = self.children.lock() {
             pids.push(child.id());
         }
@@ -655,7 +709,11 @@ impl Gateway {
                     Err(e) => return reply(Reply::error(format!("{e:#}"))),
                 };
                 reply(Reply::answer("connected"));
-                let _ = self.journal.append("mcp.start", json!({ "server": name, "command": server.command[0] }));
+                let started = match &server.dbus {
+                    Some(bus) => json!({ "server": name, "dbus": bus, "services": server.services }),
+                    None => json!({ "server": name, "command": server.command[0] }),
+                };
+                let _ = self.journal.append("mcp.start", started);
                 let (Some(stdin), Some(stdout)) = (c.stdin.take(), c.stdout.take()) else {
                     let _ = c.kill();
                     return;

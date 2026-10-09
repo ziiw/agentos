@@ -14,7 +14,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE="${AGENTOS_DEV_IMAGE:-rust:1.94-bookworm}"
+# Without AGENTOS_DEV_IMAGE: rust:1.94-bookworm plus what the e2e sections
+# use (scripts/dev.Dockerfile); built once, then docker's cache makes this instant.
+IMAGE="${AGENTOS_DEV_IMAGE:-}"
+if [ -z "$IMAGE" ]; then
+  IMAGE=agentos-dev
+  docker build -q -t "$IMAGE" -f "$ROOT/scripts/dev.Dockerfile" "$ROOT/scripts" >/dev/null
+fi
 CMD="${1:-shell}"
 [ $# -gt 0 ] && shift
 

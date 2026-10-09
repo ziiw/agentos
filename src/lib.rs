@@ -11,6 +11,7 @@ pub mod broker;
 pub mod changes;
 pub mod config;
 pub mod control;
+pub mod dbus;
 pub mod display;
 pub mod doctor;
 pub mod gateway;

@@ -92,6 +92,21 @@ pub fn first_line(s: &str, max: usize) -> String {
     truncate(s.lines().find(|l| !l.trim().is_empty()).unwrap_or(""), max)
 }
 
+/// A held call's arguments for a glance: all of their structure, with long
+/// strings clipped, so a long body can't push out what it's being sent to
+/// (the method of a D-Bus call comes after its service and path).
+fn glance(args: &Value) -> String {
+    fn clip(v: &Value) -> Value {
+        match v {
+            Value::String(s) if s.chars().count() > 80 => Value::String(format!("{}…", s.chars().take(79).collect::<String>())),
+            Value::Array(items) => Value::Array(items.iter().map(clip).collect()),
+            Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), clip(v))).collect()),
+            other => other.clone(),
+        }
+    }
+    clip(args).to_string()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max { flat } else { format!("{}…", flat.chars().take(max - 1).collect::<String>()) }
@@ -403,7 +418,7 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], call
         };
         let _ = writeln!(out, "\n  {}", p.bold(heading));
         for h in calls {
-            let _ = writeln!(out, "  {}  {}  {}", p.cyan("\u{23f8}"), p.bold(h.target()), truncate(&h.args.to_string(), 100));
+            let _ = writeln!(out, "  {}  {}  {}", p.cyan("\u{23f8}"), p.bold(h.target()), truncate(&glance(&h.args), 300));
         }
     }
     if shown.iter().any(|c| c.path.file_name().is_some_and(|n| n == agentos::config::PROJECT_FILE)) {
@@ -841,5 +856,21 @@ fn describe(p: Paint, e: &Event) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         _ => truncate(&d.to_string(), 100),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_held_calls_arguments_keep_their_shape_and_lose_their_bulk() {
+        let args = json!({ "service": "org.freedesktop.DBus", "method": "Notify", "args": ["short", "x".repeat(200), { "body": "y".repeat(100) }], "n": 3 });
+        let shown = glance(&args);
+        assert!(shown.contains("\"method\":\"Notify\"") && shown.contains("\"n\":3"), "{shown}");
+        assert!(shown.contains(&format!("{}…\"", "x".repeat(79))), "{shown}");
+        assert!(shown.chars().count() < 300, "{shown}");
+        assert_eq!(glance(&json!({ "text": "hello" })), r#"{"text":"hello"}"#);
     }
 }
