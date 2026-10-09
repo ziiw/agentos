@@ -53,6 +53,10 @@
 //!
 //! [console]                               # your file only: where agentd's console can
 //! projects = ["~/code/app"]               # start tasks (besides folders you've used)
+//! [console.oidc]                          # people sign in with your identity provider:
+//! issuer = "https://accounts.example.com" # issuer, client_id, client_secret (a variable's name),
+//! client_id = "agentd"                    # public_url (where people reach agentd), and who gets
+//! public_url = "https://agentd.example.com" # what: [console.oidc.roles] "group:dev" = "approver"
 //!
 //! [prices]                                # your file only; USD per million tokens, for
 //! "gpt-*" = { input = 1.25, output = 10 }  # models agentos doesn't know (example figures)
@@ -139,6 +143,9 @@ struct TaintSection {
 struct Console {
     #[serde(default)]
     projects: Vec<String>,
+    /// Sign-in with your identity provider.
+    #[serde(default)]
+    oidc: Option<crate::oidc::Config>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -227,6 +234,8 @@ pub struct Settings {
     pub witness: Option<String>,
     /// The index `agent install NAME` and `agent search` read.
     pub registry: Option<String>,
+    /// How people sign in to agentd's console with your identity provider, if they can.
+    pub oidc: Option<crate::oidc::Config>,
     /// The publisher's keys, one of which the index must be signed by (none: not checked).
     pub registry_keys: Vec<String>,
     /// Tasks agentd starts on a timer.
@@ -451,13 +460,17 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         }
     }
     s.taint_trusted.extend(file.taint.trusted.iter().map(|h| h.to_ascii_lowercase()));
-    if project.is_some() && !file.console.projects.is_empty() {
+    if project.is_some() && (!file.console.projects.is_empty() || file.console.oidc.is_some()) {
         bail!("{shown}: [console] only belongs in your own config, never in a project's");
     }
     for entry in &file.console.projects {
         if let Ok(p) = fs::canonicalize(resolve(entry)?) {
             s.projects.push(p);
         }
+    }
+    if let Some(oidc) = &file.console.oidc {
+        oidc.validate().with_context(|| shown.to_string())?;
+        s.oidc = Some(oidc.clone());
     }
     // A cloned repo must never get agentos to run a program on your machine.
     if project.is_some() && !file.mcp.is_empty() {

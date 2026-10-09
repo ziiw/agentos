@@ -464,12 +464,21 @@ pub(crate) fn cmd_users(store: &Store, command: Option<UsersCommand>) -> Result<
     match command {
         None => {
             let all = agentos::users::list(store.root());
-            if all.is_empty() {
+            let signed_in = agentos::users::sessions(store.root());
+            if all.is_empty() && signed_in.is_empty() {
                 println!("nobody besides you: agent users add NAME --role viewer|approver|admin");
             }
             for u in all {
                 let scope = if u.projects.is_empty() { String::new() } else { format!(" · only {}", u.projects.iter().map(|p| display_path(p)).collect::<Vec<_>>().join(", ")) };
                 println!("{:<16} {:<9} {}  {}", u.name, u.role.name(), out.dim(format!("{}{scope}", u.role.describe())), out.dim(util::ago(u.created_ms)));
+            }
+            if !signed_in.is_empty() {
+                println!("\n{}", out.bold("signed in with your identity provider (agent users remove NAME ends a sign-in)"));
+                for s in signed_in {
+                    let scope = if s.projects.is_empty() { String::new() } else { format!(" · only {}", s.projects.iter().map(|p| display_path(p)).collect::<Vec<_>>().join(", ")) };
+                    let left = humantime::format_duration(std::time::Duration::from_secs(s.expires_ms.saturating_sub(util::now_ms()) / 1000 / 60 * 60));
+                    println!("{:<32} {:<9} {}", s.name, s.role.name(), out.dim(format!("signed in {}, for {left} more{scope}", util::ago(s.created_ms))));
+                }
             }
         }
         Some(UsersCommand::Add { name, role, project }) => {

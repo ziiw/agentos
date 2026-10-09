@@ -24,7 +24,7 @@ skip() { printf '  \033[33m-\033[0m skipped: %s\n' "$1"; skipped=$((skipped + 1)
 # for agentd, e.g. AGENTOS_CONFIG=….
 start_agentd() {
   rm -f "$AGENTOS_HOME/agentd.json"
-  PORT=$((20000 + RANDOM % 10000))
+  PORT="${AGENTD_PORT:-$((20000 + RANDOM % 10000))}"
   env "$@" "$AGENT" serve --listen "127.0.0.1:$PORT" >"$WORK/serve.$PORT.log" 2>&1 &
   SERVE_PID=$!
   for _ in $(seq 100); do grep -q "\"pid\": *$SERVE_PID," "$AGENTOS_HOME/agentd.json" 2>/dev/null && break; sleep 0.1; done
@@ -840,6 +840,132 @@ check "a limited token reads its own project's task in full" grep -q "\"id\":\"$
 kill $SERVE_PID 2>/dev/null
 wait $SERVE_PID 2>/dev/null
 rm -f "$AGENTOS_HOME/users.json"
+
+section "single sign-on for agentd (OpenID Connect)"
+if ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then
+  skip "the stand-in identity provider needs python3 and openssl"
+else
+  reset_proj
+  cd "$PROJ"
+  mkdir -p "$WORK/oidc"
+  AGENTD_PORT=$((20000 + RANDOM % 10000))
+  python3 "$HERE/fake-oidc" "$WORK/oidc/port" "$WORK/oidc" "http://127.0.0.1:$AGENTD_PORT/oidc/callback" 2>"$WORK/oidc/idp.log" &
+  IDP_PID=$!
+  for _ in $(seq 100); do [ -s "$WORK/oidc/port" ] && break; sleep 0.1; done
+  IDP="http://127.0.0.1:$(cat "$WORK/oidc/port" 2>/dev/null)"
+  OCFG="$WORK/oidc/config.toml"
+  cat > "$OCFG" <<TOML
+[console.oidc]
+issuer = "$IDP"
+client_id = "agentd-e2e"
+client_secret = "OIDC_E2E_SECRET"
+public_url = "http://127.0.0.1:$AGENTD_PORT"
+session = "1h"
+
+[console.oidc.roles]
+"alice@example.com" = "admin"
+"dave@example.com" = "admin"
+"group:platform" = "approver"
+"group:contractors" = { role = "viewer", projects = ["$PROJ"] }
+"domain:example.com" = "viewer"
+TOML
+  export OIDC_E2E_SECRET=e2e-oidc-secret
+  rm -f "$AGENTOS_HOME/sessions.json"
+  AGENTD_PORT=$AGENTD_PORT start_agentd AGENTOS_CONFIG="$OCFG"
+  oa() { local t="$1"; shift; curl -sS -m 10 -H "Authorization: Bearer $t" "$@"; }
+  # The browser's side: /login, then the provider (which approves at once as whoever ?as= says), then the callback.
+  sso_begin() {
+    local hdr loc
+    hdr="$(curl -sS -m 10 -D - -o /dev/null "$CONSOLE/login")"
+    LOGIN_HEADERS="$hdr"
+    loc="$(sed -n 's/^[Ll]ocation: \(.*\)\r$/\1/p' <<<"$hdr")"
+    COOKIE="$(sed -n 's/^[Ss]et-[Cc]ookie: \([^;]*\);.*/\1/p' <<<"$hdr")"
+    BACK="$(curl -sS -m 10 -D - -o /dev/null "$loc&as=$1" | sed -n 's/^[Ll]ocation: \(.*\)\r$/\1/p')"
+  }
+  sso_finish() { curl -sS -m 10 -i -H "Cookie: ${1-$COOKIE}" "$BACK"; }
+  sso_token() { sso_begin "$1"; sso_finish | sed -n 's/^[Ll]ocation: .*#token=\([0-9a-f]*\).*/\1/p'; }
+
+  check "the login page is told single sign-on is set up" grep -q '"sso":true' <<<"$(curl -sS -m 10 "$CONSOLE/auth/config")"
+  sso_begin alice
+  check "/login sends the browser to the provider, with PKCE, a state and a nonce" grep -Eq "^[Ll]ocation: $IDP/authorize\?response_type=code&client_id=agentd-e2e&redirect_uri=http%3A%2F%2F127.0.0.1%3A$AGENTD_PORT%2Foidc%2Fcallback&scope=openid%20email%20profile&state=[0-9a-f]{48}&nonce=[0-9a-f]{48}&code_challenge=[A-Za-z0-9_-]{43}&code_challenge_method=S256" <<<"$LOGIN_HEADERS"
+  check "...and a cookie that ties it to this browser" grep -Eq '^[Ss]et-[Cc]ookie: agentd_oidc=[0-9a-f]{48}; HttpOnly; SameSite=Lax; Path=/oidc' <<<"$LOGIN_HEADERS"
+  check "the provider sent the browser back to agentd's callback" grep -q "^http://127.0.0.1:$AGENTD_PORT/oidc/callback?code=" <<<"$BACK"
+  out="$(sso_finish)"
+  ALICE="$(sed -n 's/^[Ll]ocation: .*#token=\([0-9a-f]*\).*/\1/p' <<<"$out")"
+  check "the callback signs her in: a link with a token, in the fragment" test -n "$ALICE"
+  check "...and clears the cookie" grep -Eq '^[Ss]et-[Cc]ookie: agentd_oidc=; .*Max-Age=0' <<<"$out"
+  me="$(oa "$ALICE" "$CONSOLE/api/whoami")"
+  check "she is who the provider said, with the role her address gets" grep -q '"name":"sso:alice@example.com","role":"admin","owner":false' <<<"$me"
+  check "...and the token works as any other" test "$(oa "$ALICE" -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 200
+  check "a second use of the same sign-in is refused" grep -q 'unknown, was used already' <<<"$(sso_finish)"
+  sso_begin bob; check "someone else's cookie doesn't finish a sign-in" grep -q 'another browser' <<<"$(sso_finish 'agentd_oidc=0000')"
+  sso_begin bob; check "...nor does no cookie at all" grep -q 'another browser' <<<"$(curl -sS -m 10 -i "$BACK")"
+  BOB="$(sso_token bob)"
+  check "a group gives a role" grep -q '"name":"sso:bob@nowhere.example","role":"approver"' <<<"$(oa "$BOB" "$CONSOLE/api/whoami")"
+  check "...and approver means what it does for a local user" test "$(oa "$BOB" -o /dev/null -w '%{http_code}' -X POST -d '{}' "$CONSOLE/api/tasks")" = 403
+  check "a domain gives a role (whatever the case of the address)" grep -q '"name":"sso:Gina@Example.COM","role":"viewer"' <<<"$(oa "$(sso_token gina)" "$CONSOLE/api/whoami")"
+  ERIN="$(sso_token erin)"
+  check "a role can be limited to a project" grep -q "\"role\":\"viewer\".*\"projects\":\[\"$PROJ\"\]" <<<"$(oa "$ERIN" "$CONSOLE/api/whoami")"
+  FRANK="$(sso_token frank)"
+  check "a token signed with ES256 works too" grep -q '"name":"sso:frank@nowhere.example","role":"approver"' <<<"$(oa "$FRANK" "$CONSOLE/api/whoami")"
+  sso_begin carol; out="$(sso_finish)"
+  check "someone the provider vouches for, with no role in your config, gets none" grep -q 'agentd has no role for you' <<<"$out"
+  check "...and no token" bash -c '! grep -q "#token=" <<<"$1"' _ "$out"
+  sso_begin dave; out="$(sso_finish)"
+  check "an address the provider doesn't call verified doesn't get the role it names" grep -q 'agentd has no role for you' <<<"$out"
+  for bad in "badaud|audience" "badiss|another issuer" "expired|expired" "badnonce|wrong nonce" "noexp|no expiry" \
+             "nonealg|accepts RS256 and ES256" "hs256|accepts RS256 and ES256" "unknownkid|doesn.*t publish" \
+             "tampered|signature isn.*t the provider" "wrongkey|signature isn.*t the provider"; do
+    sso_begin "${bad%%|*}"; out="$(sso_finish)"
+    check "a token that is ${bad%%|*} is refused" grep -q "${bad#*|}" <<<"$out"
+    check "...without giving a token" bash -c '! grep -q "#token=" <<<"$1"' _ "$out"
+  done
+  check "the refusal page is plain text, not what the provider sent" bash -c '! grep -q "<script" <<<"$1"' _ "$(curl -sS -m 10 "$CONSOLE/oidc/callback?error=access_denied&error_description=%3Cscript%3Ealert(1)%3C/script%3E")"
+
+  # What they do is under their name.
+  "$AGENT" run --ask -- curl -sS -m 30 -o /dev/null -w 'HTTP%{http_code}' https://example.com >"$WORK/oidc/ask.out" 2>&1 </dev/null &
+  ASK_PID=$!
+  Q=""
+  for _ in $(seq 100); do Q="$(oa "$BOB" "$CONSOLE/api/approvals")"; grep -q '"id"' <<<"$Q" && break; sleep 0.1; done
+  QID="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$Q")"
+  check "someone signed in answers a question" grep -q '"ok":true' <<<"$(oa "$BOB" -X POST -d '{"decision":"once"}' "$CONSOLE/api/approvals/$QID")"
+  wait $ASK_PID
+  check "...and the task's journal has their name" grep -q '"by":"sso:bob@nowhere.example"' "$(latest_task_dir)/events.jsonl"
+
+  # Sessions can be seen, ended, and run out.
+  out="$("$AGENT" users)"
+  check "agent users lists who is signed in" grep -q 'sso:bob@nowhere.example .*approver' <<<"$out"
+  check "...with a limit, if they have one" grep -q "sso:erin@contractors.example .*only $PROJ" <<<"$out"
+  check "agent users remove ends a person's sign-in" grep -q "token no longer works" <<<"$("$AGENT" users remove sso:bob@nowhere.example)"
+  check "...at once" test "$(oa "$BOB" -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 401
+  check "signing out ends only that sign-in" grep -q '"ok":true' <<<"$(oa "$ALICE" -X POST "$CONSOLE/api/logout")"
+  check "...and the token stops working" test "$(oa "$ALICE" -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 401
+  check "...but another person's does not" test "$(oa "$FRANK" -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 200
+  check "your own token isn't a sign-in to end" grep -q 'nothing to sign out of' <<<"$(oa "$TOKEN" -X POST "$CONSOLE/api/logout")"
+  python3 - "$AGENTOS_HOME/sessions.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+sessions = json.load(open(path))
+for s in sessions:
+    if s["name"] == "sso:frank@nowhere.example":
+        s["expires_ms"] = 1
+json.dump(sessions, open(path, "w"))
+PY
+  check "a sign-in runs out" test "$(oa "$FRANK" -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 401
+  check "a link from agent serve and a token from agent users add still work" test "$(oa "$TOKEN" -o /dev/null -w '%{http_code}' "$CONSOLE/api/tasks")" = 200
+
+  # A project can't turn it on (or point it somewhere).
+  printf '[console.oidc]\nissuer = "%s"\nclient_id = "x"\npublic_url = "https://a.example"\n[console.oidc.roles]\n"a@b.example" = "admin"\n' "$IDP" > .agentos.toml
+  "$AGENT" trust >/dev/null 2>&1
+  check "a project can't configure sign-in" test $? -eq 2
+  rm -f .agentos.toml
+  printf '[console.oidc]\nissuer = "http://idp.example.com"\nclient_id = "x"\npublic_url = "https://a.example"\n[console.oidc.roles]\n"a@b.example" = "admin"\n' > "$WORK/oidc/bad.toml"
+  check "an issuer that isn't https is a config error" grep -q 'issuer must be an https' <<<"$(AGENTOS_CONFIG="$WORK/oidc/bad.toml" "$AGENT" run -- true 2>&1)"
+  kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+  kill $IDP_PID 2>/dev/null; wait $IDP_PID 2>/dev/null
+  unset OIDC_E2E_SECRET AGENTD_PORT
+  rm -f "$AGENTOS_HOME/sessions.json" "$AGENTOS_HOME/users.json"
+fi
 
 section "agents ask for more, mid-task (agentos MCP server)"
 reset_proj

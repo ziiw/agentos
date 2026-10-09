@@ -88,6 +88,7 @@ struct Parts {
     auth: Option<String>,
     /// `X-Agentos-Token` or `X-Gitlab-Token`: the ways a webhook sender can present a hook's token.
     token_header: Option<String>,
+    cookie: Option<String>,
     body: String,
 }
 
@@ -96,24 +97,41 @@ fn request_parts(req: &Request) -> Parts {
     let (path, query) = url.split_once('?').map(|(p, q)| (p.to_string(), q.to_string())).unwrap_or((url, String::new()));
     let auth = req.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.to_string());
     let token_header = req.headers().iter().find(|h| h.field.equiv("X-Agentos-Token") || h.field.equiv("X-Gitlab-Token")).map(|h| h.value.to_string());
-    Parts { method: req.method().clone(), path, query, auth, token_header, body: String::new() }
+    let cookie = req.headers().iter().find(|h| h.field.equiv("Cookie")).map(|h| h.value.to_string());
+    Parts { method: req.method().clone(), path, query, auth, token_header, cookie, body: String::new() }
 }
 
 enum Reply {
     Html(&'static str),
     Json(u16, Value),
     Png(Vec<u8>),
+    /// Sends the browser elsewhere, with a cookie to set (or clear) if there is one.
+    Redirect(String, Option<String>),
+    /// A page for a person: what a sign-in says when it doesn't work out.
+    Page(u16, String),
 }
 
 fn respond(req: Request, reply: Reply) -> std::io::Result<()> {
+    let nocache = Header::from_bytes("Cache-Control", "no-store").expect("static header");
+    let mut extra = Vec::new();
     let (status, body, kind) = match reply {
         Reply::Html(html) => (200, html.as_bytes().to_vec(), "text/html; charset=utf-8"),
         Reply::Json(status, value) => (status, value.to_string().into_bytes(), "application/json"),
         Reply::Png(png) => (200, png, "image/png"),
+        Reply::Page(status, html) => (status, html.into_bytes(), "text/html; charset=utf-8"),
+        Reply::Redirect(location, cookie) => {
+            // (header values with a line break in them are refused by Header::from_bytes)
+            extra.extend(Header::from_bytes("Location", location));
+            extra.extend(cookie.and_then(|c| Header::from_bytes("Set-Cookie", c).ok()));
+            (302, Vec::new(), "text/plain")
+        }
     };
     let header = Header::from_bytes("Content-Type", kind).expect("static header");
-    let nocache = Header::from_bytes("Cache-Control", "no-store").expect("static header");
-    req.respond(Response::from_data(body).with_status_code(StatusCode(status)).with_header(header).with_header(nocache))
+    let mut response = Response::from_data(body).with_status_code(StatusCode(status)).with_header(header).with_header(nocache);
+    for h in extra {
+        response.add_header(h);
+    }
+    req.respond(response)
 }
 
 /// Who is asking: you (agentd's own token), or someone you gave a token and a role.
@@ -145,7 +163,7 @@ impl Who {
 /// the safe ways of interrupting a task for approvers, the rest for admins.
 fn needs(method: &Method, segments: &[&str]) -> Role {
     match (method, segments) {
-        (Method::Get, _) => Role::Viewer,
+        (Method::Get, _) | (Method::Post, ["api", "logout"]) => Role::Viewer,
         (Method::Post, ["api", "approvals", _]) | (Method::Post, ["api", "tasks", _, "stop" | "revoke" | "input"]) => Role::Approver,
         _ => Role::Admin,
     }
@@ -156,6 +174,15 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         return Reply::Html(INDEX);
     }
     let segments: Vec<&str> = parts.path.trim_matches('/').split('/').collect();
+    // Signing in with your identity provider: how a person without a link gets one.
+    if parts.method == Method::Get {
+        match parts.path.as_str() {
+            "/auth/config" => return Reply::Json(200, json!({ "sso": sso_config(root).is_some() })),
+            "/login" => return sso_login(root),
+            "/oidc/callback" => return sso_callback(&parts, root),
+            _ => {}
+        }
+    }
     // A hook has a token of its own and opens nothing else.
     if let (Method::Post, ["api", "hooks", name]) = (&parts.method, segments.as_slice()) {
         return hook(&parts, name, root);
@@ -199,6 +226,10 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         };
     }
     let result = match (&parts.method, segments.as_slice()) {
+        (Method::Post, ["api", "logout"]) => match given.as_deref() {
+            Some(t) if users::end_session(root, t) => Ok(json!({ "ok": true })),
+            _ => Err(anyhow!("this isn't a single sign-on session: there is nothing to sign out of")),
+        },
         (Method::Get, ["api", "whoami"]) => Ok(json!({ "name": who.name, "role": who.role.name(), "owner": who.owner, "projects": who.projects })),
         (Method::Get, ["api", "tasks"]) => tasks(&store, &who),
         (Method::Post, ["api", "tasks"]) => start(&store, &parts.body, &who.label(), None),
@@ -235,6 +266,88 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
             Reply::Json(200, v)
         }
         Err(e) => Reply::Json(400, json!({ "error": format!("{e:#}") })),
+    }
+}
+
+// ---- signing in with your identity provider ----
+
+/// The settings for it, if it's set up (and where your secret commands are, for the client secret).
+fn sso_config(root: &Path) -> Option<(agentos::oidc::Config, PathBuf, agentos::keychain::Commands)> {
+    let home = crate::home_dir().ok()?;
+    let settings = config::load(root, &home, &home).ok()?;
+    Some((settings.oidc?, home, settings.secret_commands))
+}
+
+fn esc(s: &str) -> String {
+    s.chars().map(|c| match c { '&' => "&amp;".into(), '<' => "&lt;".into(), '>' => "&gt;".into(), '"' => "&quot;".into(), '\'' => "&#39;".into(), c => c.to_string() }).collect()
+}
+
+/// What a person sees when signing in doesn't work out.
+fn sso_page(status: u16, message: &str) -> Reply {
+    Reply::Page(
+        status,
+        format!(
+            "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width, initial-scale=1\"><title>agentd</title>\
+<style>body{{font:16px/1.5 system-ui,sans-serif;max-width:34em;margin:12vh auto;padding:0 16px;color:#1d1d1b}}\
+@media(prefers-color-scheme:dark){{body{{background:#141413;color:#ecebe6}}a{{color:#748ffc}}}}</style>\
+<h1 style=\"font-size:20px\">agentd</h1><p>{}</p><p><a href=\"/login\">Try again</a></p>",
+            esc(message)
+        ),
+    )
+}
+
+/// `GET /login`: off to your identity provider.
+fn sso_login(root: &Path) -> Reply {
+    let Some((cfg, _, _)) = sso_config(root) else { return sso_page(404, "Single sign-on isn't set up here.") };
+    match agentos::oidc::begin(&cfg) {
+        Ok((location, browser)) => {
+            // The callback wants this cookie back: the sign-in finishes in the browser that began it.
+            let cookie = format!("agentd_oidc={browser}; HttpOnly; SameSite=Lax; Path=/oidc; Max-Age=600{}", if cfg.secure() { "; Secure" } else { "" });
+            Reply::Redirect(location, Some(cookie))
+        }
+        Err(e) => {
+            eprintln!("agentd: single sign-on: {e:#}");
+            sso_page(502, &format!("agentd can't reach the identity provider ({}).", e.root_cause()))
+        }
+    }
+}
+
+/// `GET /oidc/callback`: the provider sends the person back with a code.
+fn sso_callback(parts: &Parts, root: &Path) -> Reply {
+    let Some((cfg, home, commands)) = sso_config(root) else { return sso_page(404, "Single sign-on isn't set up here.") };
+    let secret = match cfg.client_secret.as_deref().map(|var| agentos::keychain::lookup(var, &commands)) {
+        None => None,
+        Some(Ok(Some(secret))) if !secret.is_empty() => Some(secret),
+        Some(_) => {
+            eprintln!("agentd: single sign-on: {} isn't set where agentd runs", cfg.client_secret.as_deref().unwrap_or(""));
+            return sso_page(500, "agentd's client secret for your identity provider isn't set where it runs.");
+        }
+    };
+    let browser = parts.cookie.as_deref().and_then(|c| c.split(';').filter_map(|kv| kv.trim().strip_prefix("agentd_oidc=")).next()).map(str::to_string);
+    let cleared = format!("agentd_oidc=; HttpOnly; SameSite=Lax; Path=/oidc; Max-Age=0{}", if cfg.secure() { "; Secure" } else { "" });
+    let identity = match agentos::oidc::finish(&cfg, secret.as_deref(), &parts.query, browser.as_deref(), util::now_ms() / 1000) {
+        Ok(id) => id,
+        Err(why) => {
+            eprintln!("agentd: single sign-on refused: {why}");
+            return sso_page(400, &why);
+        }
+    };
+    let (role, projects) = match agentos::oidc::grant(&cfg, &identity) {
+        Ok(Some(granted)) => granted,
+        Ok(None) => {
+            eprintln!("agentd: single sign-on: {} has no role", identity.name());
+            return sso_page(403, &format!("You're signed in as {}, but agentd has no role for you. Ask whoever runs it to add you under [console.oidc.roles].", identity.email.as_deref().unwrap_or(&identity.sub)));
+        }
+        Err(why) => return sso_page(500, &why),
+    };
+    // A role limited to projects stays limited, even if a folder isn't there (it then matches nothing).
+    let projects: Vec<PathBuf> = projects.iter().map(|p| expand(&home, p)).map(|p| fs::canonicalize(&p).unwrap_or(p)).collect();
+    match cfg.session_ttl().and_then(|ttl| users::start_session(root, &identity.name(), role, &projects, ttl)) {
+        Ok(token) => {
+            eprintln!("agentd: {} signed in as {}", identity.name(), role.name());
+            Reply::Redirect(format!("/#token={token}"), Some(cleared))
+        }
+        Err(e) => sso_page(500, &format!("{e:#}")),
     }
 }
 

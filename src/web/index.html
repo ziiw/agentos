@@ -89,7 +89,7 @@
 <main>
   <header>
     <h1>agentos</h1><span class="sub">agentd console</span>
-    <span id="who" class="who" hidden></span>
+    <span id="who" class="who" hidden></span><button id="signout" class="pill" hidden>Sign out</button>
     <button id="spend-open" class="pill" hidden></button>
     <button id="new-open" class="primary">New task</button><span class="dot" id="dot" title="connection"></span>
   </header>
@@ -354,6 +354,13 @@
     refresh();
   }
 
+  // Where your identity provider is set up, a way in without a link.
+  let sso = null;
+  async function ssoLink() {
+    if (sso === null) { try { sso = !!(await (await fetch("/auth/config")).json()).sso; } catch { sso = false; } }
+    return sso ? ` Or <a href="/login">sign in with your identity provider</a>.` : "";
+  }
+
   // Who this link is for, once: a person's name and role (and projects), and only what their role can start.
   let me = null;
   async function showWho() {
@@ -365,10 +372,15 @@
     $("who").title = projects.length ? "Limited to: " + projects.join(", ") : "All projects";
     $("who").hidden = false;
     $("new-open").hidden = me.role !== "admin";
+    $("signout").hidden = !me.name.startsWith("sso:");
   }
+  $("signout").addEventListener("click", async () => {
+    try { await api("/api/logout", {}); } catch {}
+    store.set(""); token = null; location.reload();
+  });
 
   async function refresh() {
-    if (!token) { $("notice").innerHTML = `<div class="notice">Open the link that <code>agent serve</code> printed: it carries the access token.</div>`; return; }
+    if (!token) { $("notice").innerHTML = `<div class="notice">Open the link that <code>agent serve</code> printed: it carries the access token.${await ssoLink()}</div>`; return; }
     try {
       const [asks, tasks, sp, sched] = await Promise.all([api("/api/approvals"), api("/api/tasks"), api("/api/spend").catch(() => null), api("/api/schedules").catch(() => null)]);
       $("notice").innerHTML = ""; $("dot").classList.add("live");
@@ -380,7 +392,7 @@
       if (!document.querySelector("#detail button:focus")) renderTasks(tasks);
     } catch (e) {
       $("dot").classList.remove("live");
-      if (e.message === "unauthorized") { $("notice").innerHTML = `<div class="notice">This link's token isn't valid anymore. Open the one <code>agent serve</code> printed.</div>`; }
+      if (e.message === "unauthorized") { $("notice").innerHTML = `<div class="notice">This link's token isn't valid anymore. Open the one <code>agent serve</code> printed.${await ssoLink()}</div>`; }
     }
   }
 

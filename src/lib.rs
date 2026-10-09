@@ -21,6 +21,7 @@ pub mod keychain;
 pub mod limits;
 pub mod mcp;
 pub mod oauth;
+pub mod oidc;
 pub mod outbox;
 pub mod packages;
 pub mod policy;

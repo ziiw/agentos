@@ -547,6 +547,28 @@ Questions from agents appear at the top with **Allow for this task / Always / De
   ```
 
   A limited token sees, and can act on, only the tasks that ran in those folders (or below them): its task list, the questions waiting for an answer, the screens, the schedules, and the new-task form's projects are cut to them, and it can't start a task elsewhere. A task or a question outside looks to it like one that doesn't exist (the same error, and it must name a task by its whole id, since the start of an id could match one it can't see). Budgets across tasks aren't split by project, so they stay closed to a limited token. The console shows who a link is for, and only offers **New task** to admins.
+
+- **People can sign in with your identity provider** (OpenID Connect: Google, Okta, Entra ID, Keycloak, Authentik, anything that speaks it), instead of being handed a link:
+
+  ```toml
+  [console.oidc]                                     # your config only
+  issuer = "https://accounts.example.com"
+  client_id = "agentd"
+  client_secret = "AGENTD_OIDC_SECRET"              # the variable that holds it (or a [secret_commands] entry)
+  public_url = "https://agentd.example.com"         # where people reach agentd; register {public_url}/oidc/callback with the provider
+  session = "12h"                                    # how long a sign-in lasts (5 minutes to 30 days)
+
+  [console.oidc.roles]                               # who gets what; nobody not named gets in
+  "alice@example.com" = "admin"
+  "group:platform" = "approver"                      # from the token's "groups" claim (groups_claim = "..." to change it)
+  "domain:example.com" = "viewer"
+  "sub:1234567890" = "viewer"                        # the provider's stable id for a person
+  "group:contractors" = { role = "viewer", projects = ["~/code/app"] }
+  ```
+
+  The console's page then offers **sign in with your identity provider**, and `/login` is the way in. agentos uses the authorization code flow with PKCE, a `state` and a `nonce`, and a cookie that ties the sign-in to the browser that began it (a callback opened in another browser is refused, and a sign-in can be finished once). The ID token is checked before anything else: its signature against the provider's published keys (RS256 or ES256, nothing else, whatever the token's header asks for, so `none` and an HMAC keyed with a public key don't work), the issuer to the letter, the audience, the expiry and the nonce. A person then gets a session token of the kind a local user gets, with the role their entry gives (the strongest match wins; of equal roles one that isn't limited to projects wins, and limited ones add up). An email address counts only if the provider says it's verified (`require_verified_email = false` if yours never does); a group or an id doesn't depend on it. What they do is in the journal under `sso:their@address`. They **Sign out** from the console; `agent users` lists who is signed in, and `agent users remove sso:alice@example.com` ends theirs at once.
+
+  agentd itself is a plain-HTTP console, so `public_url` should be where your reverse proxy or private network answers with https (the provider refuses a non-https redirect address anyway, except for `localhost`). Only your own config can turn this on.
 - **A task with a screen** (`--display`) shows it in its card, refreshed every second, scaled to fit. **Act on it** hands you the mouse and keyboard: click on the picture and type, and your input goes to the task's screen as a person's would (through `xdotool`, which must be installed on the machine running agentd). It's for stepping in when an agent is stuck on a dialog; every click, key and typed run is journaled with your name, never the text you typed. A viewer can watch; acting needs an approver or you. Once the task has ended the card shows its last picture.
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
 - `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only, or which budget ran out), and when a task finishes, with what it left for review.
@@ -829,7 +851,8 @@ src/sandbox.rs   namespaces, root assembly, Landlock, exec
 src/changes.rs   reading/committing/rolling back overlay transactions
 src/journal.rs   hash-chained event log
 src/attest.rs    receipts: the journal head, signed; the witness
-src/users.rs     people besides you for agentd's console: tokens and roles
+src/users.rs     people besides you for agentd's console: tokens and roles, and sign-in sessions
+src/oidc.rs      signing in with your identity provider (OpenID Connect): the flow, the ID token's checks, roles
 src/schedule.rs  tasks agentd starts on a timer, and what it remembers of them
 src/display.rs   a task's virtual screen: Xvfb, its cookie, screenshots (XWD to PNG)
 src/store.rs     on-disk task store

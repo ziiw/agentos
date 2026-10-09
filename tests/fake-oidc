@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+# A stand-in OpenID Connect provider for the tests, and a strict one: discovery, published keys, an
+# authorize endpoint that approves at once (as whoever ?as=NAME says), and a token endpoint that wants
+# PKCE, the client's login, the same redirect address, and a code only once.
+#
+#   fake-oidc PORT_FILE KEY_DIR REDIRECT_URI
+#
+# ?as=NAME picks what comes back: a person (alice, bob, ...), or a token that is wrong in one way
+# (badaud, badiss, expired, badnonce, nonealg, hs256, unknownkid, tampered, wrongkey, noexp).
+# Signing and keys use the openssl command line.
+import base64
+import hashlib
+import hmac
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port_file, key_dir, redirect_uri = sys.argv[1:4]
+CLIENT, SECRET = "agentd-e2e", "e2e-oidc-secret"
+
+
+def b64(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def openssl(*args, data=None):
+    return subprocess.run(["openssl", *args], input=data, capture_output=True, check=True).stdout
+
+
+def make_keys():
+    for name in ("rsa", "other"):
+        openssl("genrsa", "-out", f"{key_dir}/{name}.pem", "2048")
+    openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", f"{key_dir}/ec.pem")
+
+
+def rsa_modulus(name):
+    text = openssl("rsa", "-in", f"{key_dir}/{name}.pem", "-noout", "-modulus").decode().strip()
+    return bytes.fromhex(text.split("=", 1)[1])
+
+
+def ec_point():
+    text = openssl("ec", "-in", f"{key_dir}/ec.pem", "-noout", "-text").decode()
+    pub = text.split("pub:", 1)[1].split("ASN1 OID", 1)[0]
+    point = bytes.fromhex("".join(pub.split()).replace(":", ""))
+    return point[1:33], point[33:65]
+
+
+def der_to_raw(der):
+    i = 2 if der[1] < 0x80 else 2 + (der[1] & 0x7F)
+    out = b""
+    for _ in range(2):
+        length = der[i + 1]
+        value = der[i + 2 : i + 2 + length].lstrip(b"\x00")
+        out += value.rjust(32, b"\x00")
+        i += 2 + length
+    return out
+
+
+make_keys()
+MODULUS = rsa_modulus("rsa")
+EC_X, EC_Y = ec_point()
+JWKS = {
+    "keys": [
+        {"kty": "RSA", "kid": "rsa-1", "use": "sig", "alg": "RS256", "n": b64(MODULUS), "e": "AQAB"},
+        {"kty": "EC", "kid": "ec-1", "use": "sig", "crv": "P-256", "x": b64(EC_X), "y": b64(EC_Y)},
+    ]
+}
+
+PEOPLE = {
+    "alice": {"sub": "u-alice", "email": "alice@example.com", "email_verified": True},
+    "bob": {"sub": "u-bob", "email": "bob@nowhere.example", "email_verified": True, "groups": ["platform"]},
+    "carol": {"sub": "u-carol", "email": "carol@nowhere.example", "email_verified": True},
+    "dave": {"sub": "u-dave", "email": "dave@example.com", "email_verified": False},
+    "erin": {"sub": "u-erin", "email": "erin@contractors.example", "email_verified": True, "groups": ["contractors"]},
+    "frank": {"sub": "u-frank", "email": "frank@nowhere.example", "email_verified": True, "groups": ["platform"], "es256": True},
+    "gina": {"sub": "u-gina", "email": "Gina@Example.COM", "email_verified": True},
+}
+CODES = {}
+
+
+def sign(alg, kid, claims, key="rsa", tamper=False):
+    header = {"alg": alg, "typ": "JWT"}
+    if kid:
+        header["kid"] = kid
+    head, payload = b64(json.dumps(header).encode()), b64(json.dumps(claims).encode())
+    signing_input = f"{head}.{payload}".encode()
+    if alg == "RS256":
+        signature = openssl("dgst", "-sha256", "-sign", f"{key_dir}/{key}.pem", data=signing_input)
+    elif alg == "ES256":
+        signature = der_to_raw(openssl("dgst", "-sha256", "-sign", f"{key_dir}/ec.pem", data=signing_input))
+    elif alg == "HS256":
+        # The classic trick: an HMAC keyed with the public key.
+        signature = hmac.new(MODULUS, signing_input, hashlib.sha256).digest()
+    else:
+        signature = b""
+    if tamper:
+        payload = b64(json.dumps({**claims, "sub": "u-admin", "email": "admin@example.com"}).encode())
+    return f"{head}.{payload}.{b64(signature)}"
+
+
+def id_token(scenario, issuer, nonce):
+    person = PEOPLE.get(scenario, PEOPLE["alice"])
+    now = int(time.time())
+    claims = {"iss": issuer, "aud": CLIENT, "sub": person["sub"], "iat": now, "exp": now + 300, "nonce": nonce,
+              "email": person["email"], "email_verified": person["email_verified"]}
+    if "groups" in person:
+        claims["groups"] = person["groups"]
+    alg, kid, key, tamper = ("ES256", "ec-1", "rsa", False) if person.get("es256") else ("RS256", "rsa-1", "rsa", False)
+    if scenario == "badaud":
+        claims["aud"] = "someone-else"
+    elif scenario == "badiss":
+        claims["iss"] = "https://evil.example.com"
+    elif scenario == "expired":
+        claims["exp"] = now - 3600
+        claims["iat"] = now - 7200
+    elif scenario == "badnonce":
+        claims["nonce"] = "not-the-nonce"
+    elif scenario == "noexp":
+        del claims["exp"]
+    elif scenario == "nonealg":
+        alg = "none"
+    elif scenario == "hs256":
+        alg = "HS256"
+    elif scenario == "unknownkid":
+        kid = "no-such-key"
+    elif scenario == "tampered":
+        tamper = True
+    elif scenario == "wrongkey":
+        key = "other"
+    return sign(alg, kid, claims, key, tamper)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, status, body, kind="application/json", headers=()):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    @property
+    def issuer(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+        if url.path == "/.well-known/openid-configuration":
+            return self.reply(200, {
+                "issuer": self.issuer,
+                "authorization_endpoint": self.issuer + "/authorize",
+                "token_endpoint": self.issuer + "/token",
+                "jwks_uri": self.issuer + "/jwks",
+                "id_token_signing_alg_values_supported": ["RS256", "ES256"],
+                "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+            })
+        if url.path == "/jwks":
+            return self.reply(200, JWKS)
+        if url.path == "/authorize":
+            problems = []
+            if q.get("response_type") != "code":
+                problems.append("response_type")
+            if q.get("client_id") != CLIENT:
+                problems.append("client_id")
+            if q.get("redirect_uri") != redirect_uri:
+                problems.append("redirect_uri")
+            if "openid" not in q.get("scope", "").split():
+                problems.append("scope")
+            if not q.get("state") or not q.get("nonce"):
+                problems.append("state/nonce")
+            if q.get("code_challenge_method") != "S256" or not q.get("code_challenge"):
+                problems.append("pkce")
+            if problems:
+                return self.reply(400, {"error": "invalid_request", "error_description": ", ".join(problems)})
+            code = os.urandom(12).hex()
+            CODES[code] = {"as": q.get("as", "alice"), "nonce": q["nonce"], "challenge": q["code_challenge"], "used": False}
+            back = redirect_uri + "?" + urllib.parse.urlencode({"code": code, "state": q["state"]})
+            return self.reply(302, b"", "text/plain", [("Location", back)])
+        self.reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/token":
+            return self.reply(404, {"error": "not found"})
+        form = {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()).items()}
+        login = None
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            user, _, password = base64.b64decode(auth[6:]).decode().partition(":")
+            login = (urllib.parse.unquote(user), urllib.parse.unquote(password))
+        if login != (CLIENT, SECRET):
+            return self.reply(401, {"error": "invalid_client"})
+        entry = CODES.get(form.get("code", ""))
+        if form.get("grant_type") != "authorization_code" or entry is None or entry["used"]:
+            return self.reply(400, {"error": "invalid_grant"})
+        entry["used"] = True
+        if form.get("redirect_uri") != redirect_uri:
+            return self.reply(400, {"error": "invalid_grant", "error_description": "redirect_uri"})
+        if b64(hashlib.sha256(form.get("code_verifier", "").encode()).digest()) != entry["challenge"]:
+            return self.reply(400, {"error": "invalid_grant", "error_description": "pkce"})
+        self.reply(200, {"access_token": "not-used", "token_type": "Bearer", "expires_in": 300,
+                         "id_token": id_token(entry["as"], self.issuer, entry["nonce"])})
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w") as f:
+    f.write(str(server.server_address[1]))
+server.serve_forever()
