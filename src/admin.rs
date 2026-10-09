@@ -426,3 +426,31 @@ pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<P
     println!("{}", serde_json::to_string_pretty(&signed)?);
     Ok(0)
 }
+
+pub(crate) fn cmd_users(store: &Store, command: Option<UsersCommand>) -> Result<i32> {
+    let out = Paint::stdout();
+    match command {
+        None => {
+            let all = agentos::users::list(store.root());
+            if all.is_empty() {
+                println!("nobody besides you: agent users add NAME --role viewer|approver|admin");
+            }
+            for u in all {
+                println!("{:<16} {:<9} {}  {}", u.name, u.role.name(), out.dim(u.role.describe()), out.dim(util::ago(u.created_ms)));
+            }
+        }
+        Some(UsersCommand::Add { name, role }) => {
+            let role = agentos::users::Role::parse(&role)?;
+            let token = agentos::users::add(store.root(), &name, role)?;
+            println!("{} {name} is {} {}: {}", out.green("✓"), if role == agentos::users::Role::Viewer { "a" } else { "an" }, role.name(), role.describe());
+            let at = approvals::agentd(store.root()).map(|d| d.listen).unwrap_or_else(|| "HOST:7777".into());
+            println!("  their link   http://{at}/#token={token}");
+            println!("  {}", out.dim("shown once; it works wherever agentd is reachable (agent serve --listen 0.0.0.0:7777, over a private network)"));
+        }
+        Some(UsersCommand::Remove { name }) => {
+            agentos::users::remove(store.root(), &name)?;
+            println!("{} {name}'s token no longer works", out.green("✓"));
+        }
+    }
+    Ok(0)
+}

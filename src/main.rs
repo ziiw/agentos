@@ -104,6 +104,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Uninstall { name } => cmd_uninstall(&name),
         Command::Packages => cmd_packages(),
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
+        Command::Users { command } => cmd_users(&store, command),
         Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
         Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
         Command::Policy { command } => cmd_policy(command),

@@ -27,5 +27,6 @@ pub mod proxy;
 pub mod sandbox;
 pub mod store;
 pub mod taint;
+pub mod users;
 pub mod util;
 pub mod vault;

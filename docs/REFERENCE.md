@@ -101,6 +101,7 @@ scripts/dev.sh shell
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent install DIR [--yes] [--digest HEX]` / `uninstall NAME` / `packages` | Agent packages: install one after reading what it asks for, remove it, list them and whether they're intact |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
+| `agent users [add NAME --role ROLE \| remove NAME]` | Who else may use agentd's console (viewer, approver, admin), with their own tokens |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 | `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
 | `agent connect [NAME] [--forget]` | Sign in to one of your remote MCP servers, or list them |
@@ -453,6 +454,15 @@ Questions from agents appear at the top with **Allow for this task / Always / De
 
 **Spend is in the header**: today's, against your daily budget if you have one. Click it for this week and this month, where each budget across tasks stands, and today's tasks by cost. A budget that's used up shows at the top, with buttons to raise it until it resets.
 
+- **A team can share it.** agentd's own token is yours and does everything. `agent users add alex --role approver` makes another, shown once (only a hash is kept), as a link to give them:
+
+  | role | may |
+  |---|---|
+  | `viewer` | read tasks, diffs, journals and what agents are asking |
+  | `approver` | also answer questions, stop tasks, take back what an agent was given |
+  | `admin` | also start tasks, commit, push, roll back and raise budgets |
+
+  What a named person does to a task (an answer, a commit, a stop) is written into that task's journal under their name (`console.action`), and a task they start says who started it. `agent users` lists them, `agent users remove NAME` takes a token back at once. Put agentd on a private network (`--listen 0.0.0.0:7777` over Tailscale, say), not the open internet: it's a plain-HTTP console and the token is a bearer token. A viewer sees every task's diff and journal, so give that role the way you'd give read access to the repositories.
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
 - `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only, or which budget ran out), and when a task finishes, with what it left for review.
 
@@ -620,6 +630,7 @@ src/sandbox.rs   namespaces, root assembly, Landlock, exec
 src/changes.rs   reading/committing/rolling back overlay transactions
 src/journal.rs   hash-chained event log
 src/attest.rs    receipts: the journal head, signed; the witness
+src/users.rs     people besides you for agentd's console: tokens and roles
 src/store.rs     on-disk task store
 src/doctor.rs    environment checks
 src/profiles.rs  agent profiles (Claude Code) and their output

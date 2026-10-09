@@ -18,6 +18,7 @@ use agentos::changes::{self, Summary};
 use agentos::gateway;
 use agentos::outbox;
 use agentos::store::{Store, Task};
+use agentos::users::{self, Role};
 use agentos::util;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -99,23 +100,65 @@ fn respond(req: Request, reply: Reply) -> std::io::Result<()> {
     req.respond(Response::from_string(body).with_status_code(StatusCode(status)).with_header(header).with_header(nocache))
 }
 
+/// Who is asking: you (agentd's own token), or someone you gave a token and a role.
+struct Who {
+    name: String,
+    role: Role,
+    owner: bool,
+}
+
+impl Who {
+    /// What the journal and a task's `started_by` call them.
+    fn label(&self) -> String {
+        if self.owner { "agentd console".to_string() } else { format!("agentd console ({})", self.name) }
+    }
+}
+
+/// The least role an endpoint needs: reading is for everyone, answering and
+/// the safe ways of interrupting a task for approvers, the rest for admins.
+fn needs(method: &Method, segments: &[&str]) -> Role {
+    match (method, segments) {
+        (Method::Get, _) => Role::Viewer,
+        (Method::Post, ["api", "approvals", _]) | (Method::Post, ["api", "tasks", _, "stop" | "revoke"]) => Role::Approver,
+        _ => Role::Admin,
+    }
+}
+
 fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
     if parts.method == Method::Get && (parts.path == "/" || parts.path == "/index.html") {
         return Reply::Html(INDEX);
     }
     let bearer = parts.auth.as_deref().and_then(|a| a.strip_prefix("Bearer ")).map(str::to_string);
     let query_token = parts.query.split('&').find_map(|kv| kv.strip_prefix("token=")).map(str::to_string);
-    if bearer.or(query_token).as_deref() != Some(token) {
-        return Reply::Json(401, json!({ "error": "missing or wrong token: open the link agent serve printed" }));
+    let given = bearer.or(query_token);
+    let who = match given.as_deref() {
+        Some(t) if t == token => Who { name: "you".into(), role: Role::Admin, owner: true },
+        Some(t) => match users::authenticate(root, t) {
+            Some(u) => Who { name: u.name, role: u.role, owner: false },
+            None => return Reply::Json(401, json!({ "error": "missing or wrong token: open the link agent serve printed" })),
+        },
+        None => return Reply::Json(401, json!({ "error": "missing or wrong token: open the link agent serve printed" })),
+    };
+    let segments: Vec<&str> = parts.path.trim_matches('/').split('/').collect();
+    let needed = needs(&parts.method, &segments);
+    if who.role < needed {
+        return Reply::Json(403, json!({ "error": format!("{} is {} {}: that needs {} {}", who.name, article(who.role), who.role.name(), article(needed), needed.name()) }));
     }
     let store = match Store::open_at(root) {
         Ok(s) => s,
         Err(e) => return Reply::Json(500, json!({ "error": format!("{e:#}") })),
     };
-    let segments: Vec<&str> = parts.path.trim_matches('/').split('/').collect();
+    // What a person (not you) does to a task is written into its journal, under their name.
+    let touched: Option<(String, String)> = match (&parts.method, segments.as_slice()) {
+        (Method::Post, ["api", "tasks", id, action]) => Some((id.to_string(), action.to_string())),
+        (Method::Post, ["api", "approvals", id]) => approvals::questions(store.root()).into_iter().find(|q| q.id == *id).map(|q| (q.task, format!("answered {}", q.target))),
+        _ => None,
+    };
+    let body_for_note = parts.body.clone();
     let result = match (&parts.method, segments.as_slice()) {
+        (Method::Get, ["api", "whoami"]) => Ok(json!({ "name": who.name, "role": who.role.name(), "owner": who.owner })),
         (Method::Get, ["api", "tasks"]) => tasks(&store),
-        (Method::Post, ["api", "tasks"]) => start(&store, &parts.body),
+        (Method::Post, ["api", "tasks"]) => start(&store, &parts.body, &who.label()),
         (Method::Get, ["api", "launchpad"]) => launchpad(&store),
         (Method::Get, ["api", "tasks", id]) => task(&store, id),
         (Method::Post, ["api", "tasks", id, "revoke"]) => revoke(&store, id, &parts.body),
@@ -135,7 +178,15 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         _ => return Reply::Json(404, json!({ "error": "not found" })),
     };
     match result {
-        Ok(v) => Reply::Json(200, v),
+        Ok(v) => {
+            if let (false, Some((task, action))) = (who.owner, touched) {
+                if let Ok(t) = store.resolve(Some(&task)) {
+                    let decision = serde_json::from_str::<Value>(&body_for_note).ok().and_then(|b| b["decision"].as_str().map(str::to_string));
+                    let _ = t.journal().append("console.action", json!({ "by": who.name, "role": who.role.name(), "action": action, "decision": decision }));
+                }
+            }
+            Reply::Json(200, v)
+        }
         Err(e) => Reply::Json(400, json!({ "error": format!("{e:#}") })),
     }
 }
@@ -278,7 +329,11 @@ struct Start {
 
 /// Starts `agent do --bg` in one of your projects, exactly as from a
 /// terminal there. Returns the task's id.
-fn start(store: &Store, body: &str) -> Result<Value> {
+fn article(role: Role) -> &'static str {
+    if role == Role::Viewer { "a" } else { "an" }
+}
+
+fn start(store: &Store, body: &str, by: &str) -> Result<Value> {
     let req: Start = serde_json::from_str(body).context("expected {project, task, agent?, budget?, timeout?}")?;
     let home = crate::home_dir()?;
     let blank = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
@@ -313,7 +368,7 @@ fn start(store: &Store, body: &str) -> Result<Value> {
         .arg(task)
         .env("AGENTOS_HOME", store.root())
         .env("NO_COLOR", "1")
-        .env(crate::STARTED_BY, "agentd console")
+        .env(crate::STARTED_BY, by)
         .stdin(std::process::Stdio::null())
         .output()?;
     let stdout = String::from_utf8_lossy(&out.stdout);

@@ -578,6 +578,10 @@ fn describe(p: Paint, e: &Event) -> String {
                 format!("{} {target} · {}", p.red("✗ blocked"), s(&d["reason"]))
             }
         }
+        "console.action" => {
+            let decision = d["decision"].as_str().map(|x| format!(" ({x})")).unwrap_or_default();
+            format!("{} ({}) in agentd's console: {}{decision}", s(&d["by"]), s(&d["role"]), s(&d["action"]))
+        }
         "receipt.signed" => {
             let witness = match (d["witness"]["status"].as_u64(), d["witness"]["ok"].as_bool()) {
                 (Some(status), None) => format!(" · posted to {} ({status})", s(&d["witness"]["url"])),

@@ -538,6 +538,53 @@ check "...applies the change" grep -qx from-agent console.txt
 kill $SERVE_PID 2>/dev/null
 wait $SERVE_PID 2>/dev/null
 
+section "team access to agentd (users and roles)"
+reset_proj
+cd "$PROJ"
+check "agent users starts empty" grep -q 'nobody besides you' <<<"$("$AGENT" users)"
+tok() { sed -n 's/.*#token=\([0-9a-f]*\).*/\1/p'; }
+VIEW="$("$AGENT" users add vera --role viewer | tok)"
+APPR="$("$AGENT" users add alex --role approver | tok)"
+ADMN="$("$AGENT" users add dana --role admin | tok)"
+out="$("$AGENT" users)"
+check "agent users lists them with what their roles may do" grep -Eq 'alex +approver +also answers questions' <<<"$out"
+check "a name that's yours is refused" bash -c '! "$@" 2>/dev/null' _ "$AGENT" users add you
+check "...and so is a second token for one person" bash -c '! "$@" 2>/dev/null' _ "$AGENT" users add vera
+check "only hashes are kept" bash -c "! grep -q '$VIEW' '$AGENTOS_HOME/users.json'"
+start_agentd
+as() { local t="$1"; shift; curl -sS -m 10 -H "Authorization: Bearer $t" "$@"; }
+code() { local t="$1"; shift; curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" "$@"; }
+check "yours is the owner's" grep -q '"name":"you","role":"admin","owner":true' <<<"$(as "$TOKEN" "$CONSOLE/api/whoami")"
+check "a person's token says who they are" grep -q '"name":"vera","role":"viewer","owner":false' <<<"$(as "$VIEW" "$CONSOLE/api/whoami")"
+check "a viewer reads tasks" test "$(code "$VIEW" "$CONSOLE/api/tasks")" = 200
+check "...but can't answer questions" test "$(code "$VIEW" -X POST -d '{"decision":"deny"}' "$CONSOLE/api/approvals/0000")" = 403
+check "...or stop a task" test "$(code "$VIEW" -X POST "$CONSOLE/api/tasks/0000/stop")" = 403
+check "...or start one" test "$(code "$VIEW" -X POST -d '{}' "$CONSOLE/api/tasks")" = 403
+check "an approver can't start tasks or commit either" test "$(code "$APPR" -X POST -d '{}' "$CONSOLE/api/tasks")$(code "$APPR" -X POST "$CONSOLE/api/tasks/0000/commit")" = 403403
+check "a token nobody has is refused" test "$(code deadbeefdeadbeefdeadbeefdeadbeef "$CONSOLE/api/tasks")" = 401
+check "the 403 says what it needs" grep -q 'vera is a viewer: that needs an approver' <<<"$(as "$VIEW" -X POST -d '{"decision":"deny"}' "$CONSOLE/api/approvals/0000")"
+"$AGENT" run --ask -- curl -sS -m 30 -o /dev/null -w 'HTTP%{http_code}' https://example.com >"$WORK/team.out" 2>&1 </dev/null &
+RUN_PID=$!
+Q=""
+for _ in $(seq 100); do Q="$(as "$VIEW" "$CONSOLE/api/approvals")"; grep -q '"id"' <<<"$Q" && break; sleep 0.1; done
+check "a viewer sees the question" grep -q '"target":"example.com"' <<<"$Q"
+QID="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$Q")"
+check "an approver answers it" grep -q '"ok":true' <<<"$(as "$APPR" -X POST -d '{"decision":"once"}' "$CONSOLE/api/approvals/$QID")"
+wait $RUN_PID
+check "...and the connection goes through" grep -q HTTP200 "$WORK/team.out"
+check "the task's journal says who answered" grep -q '"kind":"console.action".*"action":"answered example.com".*"by":"alex"\|"kind":"console.action".*"by":"alex".*"action":"answered example.com"' "$(latest_task_dir)/events.jsonl"
+"$AGENT" run -- sh -c 'echo from-team > team.txt' 2>/dev/null
+ID="$("$AGENT" ls | sed -n 2p | cut -d' ' -f1)"
+check "an admin commits from the console" grep -q '"ok":true' <<<"$(as "$ADMN" -X POST "$CONSOLE/api/tasks/$ID/commit")"
+check "...and the journal says who" grep -q '"by":"dana".*"role":"admin"\|"action":"commit".*"by":"dana"' "$AGENTOS_HOME/tasks/$ID/events.jsonl"
+check "...and the journal still verifies" grep -q 'chain intact' <<<"$("$AGENT" log "$ID")"
+"$AGENT" users remove vera >/dev/null
+check "a removed token stops working" test "$(code "$VIEW" "$CONSOLE/api/tasks")" = 401
+check "...the others don't" test "$(code "$APPR" "$CONSOLE/api/tasks")" = 200
+kill $SERVE_PID 2>/dev/null
+wait $SERVE_PID 2>/dev/null
+rm -f "$AGENTOS_HOME/users.json"
+
 section "agents ask for more, mid-task (agentos MCP server)"
 reset_proj
 cd "$PROJ"

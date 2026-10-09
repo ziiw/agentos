@@ -107,6 +107,12 @@ pub(crate) enum Command {
         #[arg(long, default_value = "claude")]
         agent: String,
     },
+    /// People besides you who can use agentd's console, with a token and a
+    /// role each (viewer, approver or admin); with no subcommand, list them
+    Users {
+        #[command(subcommand)]
+        command: Option<UsersCommand>,
+    },
     /// Run agentd: a web console for tasks and approvals (phone-friendly)
     Serve {
         /// Address to listen on; 0.0.0.0:PORT to reach it from other devices
@@ -218,6 +224,20 @@ pub(crate) enum Command {
     /// the gateway to one of yours
     #[command(hide = true)]
     Mcp { server: Option<String> },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum UsersCommand {
+    /// Give someone a token (shown once)
+    Add {
+        /// Lowercase letters, digits, - and _
+        name: String,
+        /// viewer: reads. approver: also answers questions, stops tasks. admin: everything
+        #[arg(long, default_value = "viewer", value_parser = ["viewer", "approver", "admin"])]
+        role: String,
+    },
+    /// Take their token back
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
