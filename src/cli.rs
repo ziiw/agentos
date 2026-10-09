@@ -147,9 +147,10 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with_all = ["verify", "task"])]
         public: bool,
     },
-    /// Install an agent package from a folder, after showing what it asks for
+    /// Install an agent package after showing what it asks for: from a
+    /// folder, or by name from your registry
     Install {
-        /// A folder with an agentos-package.toml
+        /// A folder with an agentos-package.toml, or a package in your registry ([registry] in your config)
         dir: PathBuf,
         /// Install without asking (once you've read what it asks for)
         #[arg(long)]
@@ -158,6 +159,8 @@ pub(crate) enum Command {
         #[arg(long, value_name = "HEX")]
         digest: Option<String>,
     },
+    /// The packages in your registry, matching TEXT if you give some
+    Search { text: Option<String> },
     /// Remove an installed agent package
     Uninstall {
         /// The package, as `agent packages` lists it

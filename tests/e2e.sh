@@ -1010,6 +1010,90 @@ check "...but not an agent file of yours" test -f "$WORK/pkgcfg/agents/mine.toml
 check "uninstalling what isn't installed says so" grep -q 'no package named e2e-pkg' <<<"$(pk uninstall e2e-pkg 2>&1)"
 unset AGENTOS_PACKAGES
 
+section "a registry of agent packages"
+reset_proj
+cd "$PROJ"
+if command -v python3 >/dev/null && command -v tar >/dev/null; then
+  REG="$WORK/registry"
+  mkdir -p "$REG" "$WORK/reg-src/e2e-reg/bin" "$WORK/regcfg"
+  cat > "$WORK/reg-src/e2e-reg/bin/run" <<'SH'
+#!/bin/sh
+echo "registry agent got: $*"
+SH
+  chmod +x "$WORK/reg-src/e2e-reg/bin/run"
+  cat > "$WORK/reg-src/e2e-reg/agentos-package.toml" <<'TOML'
+[package]
+name = "e2e-reg"
+version = "0.1.0"
+description = "A package that comes from a registry"
+
+[agent]
+run = ["{pkg}/bin/run", "{task}"]
+allow = ["example.com"]
+TOML
+  tar czf "$REG/e2e-reg-0.1.0.tar.gz" -C "$WORK/reg-src" e2e-reg
+  GOODSHA="$(sha256sum "$REG/e2e-reg-0.1.0.tar.gz" | cut -d' ' -f1)"
+  python3 - "$REG" "$WORK/reg-src/e2e-reg" <<'PY'
+import io, os, sys, tarfile
+reg, src = sys.argv[1:3]
+def add_tree(t):
+    for name in ("agentos-package.toml", "bin/run"):
+        t.add(os.path.join(src, name), arcname=name)
+with tarfile.open(os.path.join(reg, "traversal.tar.gz"), "w:gz") as t:
+    add_tree(t)
+    info = tarfile.TarInfo("../escape.txt"); info.size = 1
+    t.addfile(info, io.BytesIO(b"x"))
+with tarfile.open(os.path.join(reg, "linked.tar.gz"), "w:gz") as t:
+    add_tree(t)
+    link = tarfile.TarInfo("passwd"); link.type = tarfile.SYMTYPE; link.linkname = "/etc/passwd"
+    t.addfile(link)
+PY
+  sha() { sha256sum "$REG/$1" | cut -d' ' -f1; }
+  cat > "$REG/index.json" <<JSON
+{ "packages": {
+  "e2e-reg":   { "version": "0.1.0", "description": "A package that comes from a registry", "url": "e2e-reg-0.1.0.tar.gz", "sha256": "$GOODSHA" },
+  "forged":    { "version": "0.1.0", "description": "Not the tarball it names", "url": "e2e-reg-0.1.0.tar.gz", "sha256": "$(printf 0%.0s $(seq 64))" },
+  "traversal": { "version": "0.1.0", "description": "Reaches outside its folder", "url": "traversal.tar.gz", "sha256": "$(sha traversal.tar.gz)" },
+  "linked":    { "version": "0.1.0", "description": "Carries a symlink", "url": "linked.tar.gz", "sha256": "$(sha linked.tar.gz)" },
+  "lying":     { "version": "0.1.0", "description": "Vouches for another package", "url": "e2e-reg-0.1.0.tar.gz", "sha256": "$GOODSHA", "digest": "00000000000000000000" }
+} }
+JSON
+  RPORT=$((20000 + RANDOM % 10000))
+  python3 -m http.server "$RPORT" --bind 127.0.0.1 --directory "$REG" >/dev/null 2>&1 &
+  REG_PID=$!
+  for _ in $(seq 50); do curl -sf -m 2 "http://127.0.0.1:$RPORT/index.json" >/dev/null 2>&1 && break; sleep 0.1; done
+  RCFG="$WORK/regcfg/config.toml"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\n' "$RPORT" > "$RCFG"
+  export AGENTOS_PACKAGES="$WORK/regpackages"
+  rg() { AGENTOS_CONFIG="$RCFG" "$AGENT" "$@"; }
+  out="$(rg search 2>&1)"
+  check "agent search lists what your registry has" grep -Eq 'e2e-reg +0.1.0 +A package that comes from a registry' <<<"$out"
+  check "...or what matches" test "$(rg search symlink 2>&1 | wc -l)" -eq 1
+  out="$(rg install e2e-reg </dev/null 2>&1)"
+  check "agent install NAME says where it came from, and what it asks for" grep -q "from http://127.0.0.1:$RPORT/e2e-reg-0.1.0.tar.gz" <<<"$out"
+  check "...and installs nothing without your yes" test ! -e "$WORK/regpackages/e2e-reg"
+  check "--yes installs it" grep -q 'installed to' <<<"$(rg install e2e-reg --yes 2>&1)"
+  check "...and it runs" grep -q 'registry agent got: hello' <<<"$(rg do --agent e2e-reg hello 2>&1)"
+  check "...and leaves nothing of the download behind" test -z "$(ls -A "$WORK/regpackages" | grep '^.fetch')"
+  check "a tarball that isn't the one the index names is refused" grep -q "isn't the tarball the index names" <<<"$(rg install forged --yes 2>&1)"
+  check "...a tarball reaching outside its folder" grep -q "couldn't unpack" <<<"$(rg install traversal --yes 2>&1)"
+  check "...and nothing of it was written outside" test ! -e "$WORK/regpackages/files/../escape.txt" -a ! -e "$WORK/regpackages/escape.txt"
+  check "...a tarball with a symlink" grep -q "symlinks aren't allowed" <<<"$(rg install linked --yes 2>&1)"
+  check "...a package whose digest isn't what the index vouches for" grep -q "the registry's index says this package's digest is 00000000000000000000" <<<"$(rg install lying --yes 2>&1)"
+  check "a name in neither place is explained" grep -q "isn't a folder here or in your registry" <<<"$(rg install nonesuch --yes 2>&1)"
+  check "without a registry, so is the hint" grep -q 'you have no registry' <<<"$(AGENTOS_CONFIG="$WORK/regcfg/none.toml" "$AGENT" install e2e-reg --yes 2>&1)"
+  printf '[registry]\nurl = "http://agents.example.com/index.json"\n' > "$WORK/regcfg/plain.toml"
+  check "a registry has to be https (or this machine)" grep -q 'a registry is an https' <<<"$(AGENTOS_CONFIG="$WORK/regcfg/plain.toml" "$AGENT" search 2>&1)"
+  printf '[registry]\nurl = "https://agents.example.com/index.json"\n' > .agentos.toml
+  "$AGENT" trust >/dev/null 2>&1
+  check "a project can't choose where your agents come from" test $? -eq 2
+  rm -f .agentos.toml
+  unset AGENTOS_PACKAGES
+  kill "$REG_PID" 2>/dev/null; wait "$REG_PID" 2>/dev/null
+else
+  skip "the registry tests need python3 and tar"
+fi
+
 section "your MCP servers, through agentos (gateway)"
 if ! command -v python3 >/dev/null; then
   skip "the stand-in MCP server needs python3"

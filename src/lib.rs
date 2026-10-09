@@ -24,6 +24,7 @@ pub mod packages;
 pub mod policy;
 pub mod profiles;
 pub mod proxy;
+pub mod registry;
 pub mod sandbox;
 pub mod store;
 pub mod taint;

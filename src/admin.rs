@@ -282,10 +282,24 @@ pub(crate) fn cmd_doctor(store: &Store) -> Result<i32> {
 }
 
 /// `agent install DIR`: what the package asks for, then your answer.
-pub(crate) fn cmd_install(dir: PathBuf, yes: bool, digest: Option<String>) -> Result<i32> {
+pub(crate) fn cmd_install(store: &Store, dir: PathBuf, yes: bool, digest: Option<String>) -> Result<i32> {
     let home = home_dir()?;
     let (out, err) = (Paint::stdout(), Paint::stderr());
+    // A name that isn't a folder here is a package in your registry: fetched
+    // into a folder of ours (removed afterwards), then reviewed like any other.
+    let name = dir.to_str().filter(|n| !dir.exists() && !n.contains('/')).map(str::to_string);
+    let fetched = name.map(|name| fetch_from_registry(store, &name)).transpose()?;
+    let (dir, source, vouched) = match &fetched {
+        Some((folder, url, entry)) => (folder.root.clone(), Some(url.clone()), entry.digest.clone()),
+        None => (dir, None, None),
+    };
     let review = agentos::packages::review(&dir)?;
+    if let Some(vouched) = vouched.filter(|v| !review.digest.starts_with(&v.to_ascii_lowercase())) {
+        bail!("the registry's index says this package's digest is {vouched}, but what it served is {}: nothing was installed", review.digest);
+    }
+    if let Some(url) = &source {
+        println!("{}", out.dim(format!("from {url}")));
+    }
     if let Some(wanted) = &digest {
         let wanted = wanted.to_ascii_lowercase();
         if wanted.len() < 8 || !review.digest.starts_with(&wanted) {
@@ -451,6 +465,52 @@ pub(crate) fn cmd_users(store: &Store, command: Option<UsersCommand>) -> Result<
             agentos::users::remove(store.root(), &name)?;
             println!("{} {name}'s token no longer works", out.green("✓"));
         }
+    }
+    Ok(0)
+}
+
+/// A package fetched from your registry, unpacked in a folder that goes away with this value.
+pub(crate) struct Fetched {
+    tmp: PathBuf,
+    /// The folder with its agentos-package.toml.
+    pub(crate) root: PathBuf,
+}
+
+impl Drop for Fetched {
+    fn drop(&mut self) {
+        let _ = util::force_remove_dir_all(&self.tmp);
+    }
+}
+
+fn fetch_from_registry(store: &Store, name: &str) -> Result<(Fetched, String, agentos::registry::Entry)> {
+    let (cwd, home) = (std::env::current_dir()?, home_dir()?);
+    let url = config::load(store.root(), &cwd, &home)?
+        .registry
+        .with_context(|| format!("{name} isn't a folder here, and you have no registry: add [registry] url = \"https://…/index.json\" to your config"))?;
+    let index = agentos::registry::index(&url)?;
+    let entry = index.packages.get(name).cloned().with_context(|| format!("{name} isn't a folder here or in your registry ({url}); `agent search` lists what is"))?;
+    let tmp = agentos::packages::packages_root(&home).join(format!(".fetch-{}", util::random_hex(6)?));
+    fs::create_dir_all(&tmp)?;
+    let mut guard = Fetched { tmp: tmp.clone(), root: tmp.clone() };
+    guard.root = agentos::registry::fetch(&url, &entry, &tmp)?;
+    let source = agentos::registry::resolve(&url, &entry);
+    Ok((guard, source, entry))
+}
+
+pub(crate) fn cmd_search(store: &Store, text: Option<&str>) -> Result<i32> {
+    let (cwd, home, out) = (std::env::current_dir()?, home_dir()?, Paint::stdout());
+    let url = config::load(store.root(), &cwd, &home)?.registry.context("you have no registry: add [registry] url = \"https://…/index.json\" to your config")?;
+    let index = agentos::registry::index(&url)?;
+    let wanted = text.map(str::to_ascii_lowercase);
+    let mut shown = 0;
+    for (name, e) in &index.packages {
+        if wanted.as_ref().is_none_or(|w| name.contains(w.as_str()) || e.description.to_ascii_lowercase().contains(w.as_str())) {
+            println!("{:<20} {:<10} {}", name, e.version, out.dim(&e.description));
+            shown += 1;
+        }
+    }
+    if shown == 0 {
+        println!("nothing in {url}{}", text.map(|t| format!(" matches {t:?}")).unwrap_or_default());
     }
     Ok(0)
 }

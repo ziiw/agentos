@@ -91,6 +91,15 @@ struct ConfigFile {
     taint: TaintSection,
     #[serde(default)]
     journal: JournalSection,
+    #[serde(default)]
+    registry: RegistrySection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrySection {
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -198,6 +207,8 @@ pub struct Settings {
     pub agent: Option<String>,
     /// Where finished tasks' signed receipts are posted.
     pub witness: Option<String>,
+    /// The index `agent install NAME` and `agent search` read.
+    pub registry: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -329,6 +340,14 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
     // A cloned repo must never choose who hears about your tasks.
     if project.is_some() && file.journal.witness.is_some() {
         bail!("{shown}: [journal] only belongs in your own config, never in a project's");
+    }
+    // …or where your agents come from.
+    if project.is_some() && file.registry.url.is_some() {
+        bail!("{shown}: [registry] only belongs in your own config, never in a project's");
+    }
+    if let Some(url) = &file.registry.url {
+        crate::registry::valid_url(url).map_err(|e| anyhow::anyhow!("{shown}: [registry] url: {e}"))?;
+        s.registry = Some(url.clone());
     }
     if let Some(url) = &file.journal.witness {
         crate::attest::valid_witness(url).map_err(|e| anyhow::anyhow!("{shown}: [journal] witness: {e}"))?;

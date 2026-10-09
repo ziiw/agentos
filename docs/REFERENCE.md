@@ -99,7 +99,7 @@ scripts/dev.sh shell
 | `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
 | `agent attest [TASK]` / `--verify FILE [--journal FILE] [--trust KEY]` / `--public` | Sign a task's journal head (a receipt), check a receipt, show this machine's receipt key |
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
-| `agent install DIR [--yes] [--digest HEX]` / `uninstall NAME` / `packages` | Agent packages: install one after reading what it asks for, remove it, list them and whether they're intact |
+| `agent install DIR\|NAME [--yes] [--digest HEX]` / `uninstall NAME` / `packages` / `search [TEXT]` | Agent packages: install one (from a folder, or by name from your registry) after reading what it asks for, remove it, list them and whether they're intact, search your registry |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
 | `agent users [add NAME --role ROLE \| remove NAME]` | Who else may use agentd's console (viewer, approver, admin), with their own tokens |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
@@ -501,6 +501,9 @@ env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 
 [journal]                             # your file only: finished tasks' signed receipts go here
 witness = "https://witness.example/receipts"
+
+[registry]                            # your file only: where `agent install NAME` looks
+url = "https://agents.example.com/index.json"
 ```
 
 - **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`, `[mcp]` and `[prices]`; they're brokered whenever the variable has a value (in your environment, or from its `[secret_commands]` entry) and the task uses the allowlist network.
@@ -596,7 +599,29 @@ agent ▸ install local-aider 0.1.0? [y/N] y
 $ agent do --agent local-aider "…"
 ```
 
-`[agent]` *is* the agent file `agent install` writes, so the list you read is exactly what is enforced; there is no separate declaration to drift from it. The files are copied to a folder the agent can only read, their hashes are recorded, and **before every run** agentos checks that neither the files nor the agent file have changed since you approved them. A package that asks for more later (an upgrade) shows the difference first (`+`/`-` against what you installed). Without a terminal, install needs `--yes`; `--digest HEX` makes sure it's the package you read. `agent packages` lists what's installed and whether it's intact; `agent uninstall NAME` removes a package and the agent file it wrote. A package can't contain symlinks, can't take the name of a built-in agent, and can't replace an agent file you wrote yourself. A package is a folder for now: there's no registry yet.
+`[agent]` *is* the agent file `agent install` writes, so the list you read is exactly what is enforced; there is no separate declaration to drift from it. The files are copied to a folder the agent can only read, their hashes are recorded, and **before every run** agentos checks that neither the files nor the agent file have changed since you approved them. A package that asks for more later (an upgrade) shows the difference first (`+`/`-` against what you installed). Without a terminal, install needs `--yes`; `--digest HEX` makes sure it's the package you read. `agent packages` lists what's installed and whether it's intact; `agent uninstall NAME` removes a package and the agent file it wrote. A package can't contain symlinks, can't take the name of a built-in agent, and can't replace an agent file you wrote yourself.
+
+**A registry** is a static `index.json` anyone can host (GitHub Pages, S3, your intranet). Point your config at one, and install by name:
+
+```toml
+[registry]                                        # your config only
+url = "https://agents.example.com/index.json"
+```
+
+```json
+{ "packages": { "local-aider": {
+    "version": "0.1.0",
+    "description": "Aider, with a model on this machine",
+    "url": "local-aider-0.1.0.tar.gz",
+    "sha256": "…the tarball's…" } } }
+```
+
+```bash
+agent search aider            # what the registry has
+agent install local-aider     # fetch, unpack, then the same review as above
+```
+
+The tarball (32 MB at most) is checked against the `sha256` the index gives, unpacked into a folder of its own, and reviewed like any package: you read what it asks for and answer. An index entry may also give the package's `digest`, and then the package must match it. Symlinks, hard links and members that reach outside the folder are refused. The index is as trustworthy as the host you fetch it from: what the hash and the review protect is that the tarball is the one that index named, and that nothing is installed that you haven't read. A registry has to be https (or this machine, for testing), and only your own config can name one.
 
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 
@@ -642,6 +667,7 @@ src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway t
 src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refresh
 src/policy.rs    your rules (Cedar): answers given in advance
 src/packages.rs  agent packages: review, install, check before every run
+src/registry.rs  a registry of them: index.json, tarballs checked by hash
 src/taint.rs     whether a task has read untrusted input
 src/held.rs      held tool calls and API requests (the outbox for tools and APIs)
 src/main.rs      entry point and dispatch; the rest of the CLI, one file per concern:
