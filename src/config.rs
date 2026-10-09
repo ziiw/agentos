@@ -89,6 +89,15 @@ struct ConfigFile {
     console: Console,
     #[serde(default)]
     taint: TaintSection,
+    #[serde(default)]
+    journal: JournalSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalSection {
+    #[serde(default)]
+    witness: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -187,6 +196,8 @@ pub struct Settings {
     pub projects: Vec<PathBuf>,
     /// Default agent for `agent do` (a project's overrides yours).
     pub agent: Option<String>,
+    /// Where finished tasks' signed receipts are posted.
+    pub witness: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -314,6 +325,14 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
 
     if file.agent.is_some() {
         s.agent = file.agent.clone();
+    }
+    // A cloned repo must never choose who hears about your tasks.
+    if project.is_some() && file.journal.witness.is_some() {
+        bail!("{shown}: [journal] only belongs in your own config, never in a project's");
+    }
+    if let Some(url) = &file.journal.witness {
+        crate::attest::valid_witness(url).map_err(|e| anyhow::anyhow!("{shown}: [journal] witness: {e}"))?;
+        s.witness = Some(url.clone());
     }
     let LimitsSection { memory, cpus, pids, budget, daily, weekly, monthly } = file.limits;
     for (period, value) in crate::gateway::Period::ALL.into_iter().zip([daily, weekly, monthly]) {

@@ -1,4 +1,5 @@
 use agentos::approvals::{self, Asker, Kind, Request};
+use agentos::attest;
 use agentos::broker::{self, Broker, Secret};
 use agentos::changes::{self, Summary};
 use agentos::config;
@@ -98,6 +99,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Doctor => cmd_doctor(&store),
         Command::Trust { path } => cmd_trust(&store, path),
         Command::Agents => cmd_agents(&store),
+        Command::Attest { task, verify, journal, trust, public } => cmd_attest(&store, task.as_deref(), verify, journal, trust, public),
         Command::Install { dir, yes, digest } => cmd_install(dir, yes, digest),
         Command::Uninstall { name } => cmd_uninstall(&name),
         Command::Packages => cmd_packages(),

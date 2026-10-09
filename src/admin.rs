@@ -364,3 +364,65 @@ pub(crate) fn cmd_packages() -> Result<i32> {
     }
     Ok(if intact { 0 } else { 1 })
 }
+
+/// `agent attest`: sign a task's journal as it stands, or check a receipt.
+pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<PathBuf>, journal: Option<PathBuf>, trust: Option<String>, public: bool) -> Result<i32> {
+    let out = Paint::stdout();
+    if public {
+        let id = attest::Identity::load_or_create(store.root())?;
+        println!("{}  {}", id.key_id(), id.public_hex());
+        return Ok(0);
+    }
+    if let Some(file) = verify {
+        let signed: attest::Signed = serde_json::from_slice(&fs::read(&file).with_context(|| format!("read {}", file.display()))?)
+            .with_context(|| format!("{}: not a receipt", file.display()))?;
+        let r = &signed.receipt;
+        let key = attest::key_id(&r.key);
+        if let Err(why) = signed.check() {
+            println!("{} {why}", out.red("✗"));
+            return Ok(1);
+        }
+        let ours = attest::Identity::load_or_create(store.root()).map(|i| i.key_id()).ok();
+        let whose = if ours.as_deref() == Some(key.as_str()) { " (this machine's)" } else { "" };
+        println!(
+            "{} signed by key {key}{whose} · task {} · journal head {} ({} events) · {}",
+            out.green("✓"),
+            r.task,
+            &r.head[..12],
+            r.events,
+            util::rfc3339(r.at_ms)
+        );
+        let mut code = 0;
+        match &trust {
+            Some(wanted) if wanted.len() >= 8 && key.starts_with(&wanted.to_ascii_lowercase()) => println!("{} that is the key you trust", out.green("✓")),
+            Some(wanted) => {
+                println!("{} the key is {key}, not {wanted}", out.red("✗"));
+                code = 1;
+            }
+            None => println!("{}", out.dim("whose key that is, only you can say: compare it with `agent attest --public` on that machine (or pass --trust KEY)")),
+        }
+        if let Some(path) = journal {
+            match signed.check_journal(&Journal::new(path)) {
+                Ok(0) => println!("{} the journal ends exactly where the receipt says", out.green("✓")),
+                Ok(more) => println!("{} the journal holds that history ({more} events since)", out.green("✓")),
+                Err(why) => {
+                    println!("{} {why}", out.red("✗"));
+                    code = 1;
+                }
+            }
+        }
+        return Ok(code);
+    }
+    let task = store.resolve(selector)?;
+    let signed = attest::Identity::load_or_create(store.root())?.issue(task.id(), &task.journal())?;
+    fs::write(attest::receipt_path(&task.dir), serde_json::to_vec_pretty(&signed)?)?;
+    let (cwd, home) = (std::env::current_dir()?, home_dir()?);
+    if let Some(url) = config::load(store.root(), &cwd, &home)?.witness {
+        match attest::witness(&url, &signed) {
+            Ok(status) => eprintln!("{} posted to the witness {url} ({status})", out.dim("receipt")),
+            Err(e) => eprintln!("{} couldn't reach the witness {url}: {e}", Paint::stderr().yellow("agent: warning:")),
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&signed)?);
+    Ok(0)
+}

@@ -124,6 +124,23 @@ pub(crate) enum Command {
     },
     /// List the agents you can use with `agent do --agent NAME`
     Agents,
+    /// Sign where a task's journal stands (a receipt), or check a receipt
+    Attest {
+        /// Task id or prefix (default: the latest task)
+        task: Option<String>,
+        /// Check this receipt instead (a file made by `agent attest`)
+        #[arg(long, value_name = "FILE")]
+        verify: Option<PathBuf>,
+        /// With --verify: also check that this journal (an events.jsonl) holds the history the receipt vouches for
+        #[arg(long, value_name = "FILE", requires = "verify")]
+        journal: Option<PathBuf>,
+        /// With --verify: the key you expect (its id, or a prefix of at least 8)
+        #[arg(long, value_name = "KEY", requires = "verify")]
+        trust: Option<String>,
+        /// Show this machine's receipt key
+        #[arg(long, conflicts_with_all = ["verify", "task"])]
+        public: bool,
+    },
     /// Install an agent package from a folder, after showing what it asks for
     Install {
         /// A folder with an agentos-package.toml

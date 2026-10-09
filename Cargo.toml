@@ -23,6 +23,8 @@ landlock = "0.4"
 libc = "0.2"
 nix = { version = "0.30", features = ["feature", "fs", "hostname", "mount", "poll", "process", "sched", "signal", "user"] }
 rcgen = "0.13"
+# Ed25519 for signed receipts (already here as rustls's crypto).
+ring = "0.17"
 # ring rather than the default aws-lc-rs: no cmake/C toolchain needed to build.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 seccompiler = "0.5"

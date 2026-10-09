@@ -6,6 +6,7 @@
 //! ends you review the diff and commit or roll back — all of it or per path.
 
 pub mod approvals;
+pub mod attest;
 pub mod broker;
 pub mod changes;
 pub mod config;

@@ -558,6 +558,28 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         "task.exited",
         json!({ "exit_code": exit_code, "duration_ms": ended - task.meta.started_at_ms, "changes": summary }),
     )?;
+    // Sign where the journal ended up, and tell your witness if you have one.
+    match attest::Identity::load_or_create(store.root()).and_then(|id| id.issue(task.id(), &journal)) {
+        Ok(signed) => {
+            let _ = fs::write(attest::receipt_path(&task.dir), serde_json::to_vec_pretty(&signed).unwrap_or_default());
+            let mut data = json!({ "head": signed.receipt.head, "events": signed.receipt.events, "key": attest::key_id(&signed.receipt.key) });
+            if let Some(url) = &plan.witness {
+                data["witness"] = match attest::witness(url, &signed) {
+                    Ok(status) if (200..300).contains(&status) => json!({ "url": url, "status": status }),
+                    Ok(status) => {
+                        eprintln!("{} the witness {url} answered {status}", err.yellow("agent: warning:"));
+                        json!({ "url": url, "status": status, "ok": false })
+                    }
+                    Err(e) => {
+                        eprintln!("{} couldn't reach the witness {url}: {e}", err.yellow("agent: warning:"));
+                        json!({ "url": url, "error": e, "ok": false })
+                    }
+                };
+            }
+            journal.append("receipt.signed", data)?;
+        }
+        Err(e) => eprintln!("{} no receipt for this task: {e:#}", err.yellow("agent: warning:")),
+    }
     if let Some(e) = setup_error {
         bail!("sandbox setup failed: {e}\n(run `agent doctor` to check this machine)");
     }

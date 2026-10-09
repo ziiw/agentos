@@ -15,6 +15,7 @@ dependencies = [
  "libc",
  "nix",
  "rcgen",
+ "ring",
  "rustls",
  "seccompiler",
  "serde",

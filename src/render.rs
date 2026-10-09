@@ -578,6 +578,14 @@ fn describe(p: Paint, e: &Event) -> String {
                 format!("{} {target} · {}", p.red("✗ blocked"), s(&d["reason"]))
             }
         }
+        "receipt.signed" => {
+            let witness = match (d["witness"]["status"].as_u64(), d["witness"]["ok"].as_bool()) {
+                (Some(status), None) => format!(" · posted to {} ({status})", s(&d["witness"]["url"])),
+                (_, Some(false)) => format!(" · {}", p.yellow("the witness didn't take it")),
+                _ => String::new(),
+            };
+            format!("signed receipt · key {} · head {} ({} events){witness}", s(&d["key"]), s(&d["head"]).chars().take(12).collect::<String>(), d["events"])
+        }
         "net.upstream" => format!("through your proxy {}", s(&d["proxy"])),
         "task.local" => {
             let ports: Vec<String> = d["ports"].as_array().into_iter().flatten().map(|p| format!("127.0.0.1:{p}")).collect();

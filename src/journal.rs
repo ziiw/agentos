@@ -2,9 +2,9 @@
 //!
 //! Each event commits to the hash of the one before it, so any edit, removal
 //! or reordering of past events breaks the chain. The journal lives outside
-//! the sandbox, so the agent can't reach it; anchoring the chain head
-//! somewhere the *user* can't rewrite either (TPM, remote witness) is a later
-//! phase.
+//! the sandbox, so the agent can't reach it. Anchoring the chain head
+//! somewhere the *user* can't rewrite either is `attest.rs`: signed receipts,
+//! and a witness that keeps them.
 
 use crate::util::{hex, now_ms};
 use anyhow::{Context, Result};

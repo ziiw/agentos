@@ -97,6 +97,7 @@ scripts/dev.sh shell
 | `agent doctor` | Check this machine |
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
 | `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
+| `agent attest [TASK]` / `--verify FILE [--journal FILE] [--trust KEY]` / `--public` | Sign a task's journal head (a receipt), check a receipt, show this machine's receipt key |
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent install DIR [--yes] [--digest HEX]` / `uninstall NAME` / `packages` | Agent packages: install one after reading what it asks for, remove it, list them and whether they're intact |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
@@ -372,6 +373,22 @@ when { !context.tainted };
 
 `agent policy check call github.create_issue --tainted web` asks what they'd say. The journal records each source (`taint.marked`), and the summary at the end of a tainted task says what it read, so you review its diff and held pushes with that in mind. A server's own `readOnlyHint` is still believed; it's the server's word, so give `taint = true` only to servers you'd believe it from.
 
+## Receipts: the journal's head, signed
+
+The journal is tamper-evident against the agent, which can't reach it. Against *you*, or whoever has your machine, a whole chain can be rewritten and still verify. A **receipt** closes part of that gap. When a task ends, agentos signs its journal's head (the hash that commits to every event) with this machine's key and keeps the receipt with the task (`receipt.json`). Anyone holding it can later check that a journal they're shown still contains the history it vouches for:
+
+```console
+$ agent attest --verify receipt.json --journal events.jsonl
+✓ signed by key 3f2a9c1e84b07d21 · task 7c1e04a2 · journal head 9ab4f10c77d2 (212 events) · 2026-10-09T16:02:11Z
+✓ that is the key you trust                     (with --trust 3f2a9c1e)
+✓ the journal holds that history (4 events since)
+```
+
+- **The key** is an Ed25519 key made on first use in the task store, which no sandbox can see. `agent attest --public` shows its id and public key. A receipt names its key but can't say whose it is: compare it with the one you trust (`--trust KEY`).
+- **A witness** makes the receipt outlive your machine. With `[journal] witness = "https://witness.example/receipts"` in your config, every finished task's signed receipt is posted there (a JSON POST; https, or this machine for testing). Rewriting a task's history later then means rewriting the witness's copy too. A witness that can't be reached is a warning.
+- `agent attest [TASK]` signs a task's journal as it stands now (after you've committed, say) and prints the receipt; it's posted to the witness too.
+- Not yet: keeping the key in a TPM, so even root on your machine can't sign for it.
+
 ## Budgets
 
 ```bash
@@ -471,6 +488,9 @@ env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 
 [prices]                              # your file only; USD per million tokens
 "gpt-*" = { input = 1.25, output = 10 }   # example figures: use your provider's
+
+[journal]                             # your file only: finished tasks' signed receipts go here
+witness = "https://witness.example/receipts"
 ```
 
 - **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`, `[mcp]` and `[prices]`; they're brokered whenever the variable has a value (in your environment, or from its `[secret_commands]` entry) and the task uses the allowlist network.
@@ -589,7 +609,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 - **Only the top-level `.gitignore` of a grant is read**, not nested ones.
 - **The outbox covers remotes that exist when the task starts.** A remote the agent adds itself has no outbox, and pushing to it fails for lack of network. Deleting a remote branch isn't held yet either.
 - **`agent trust` records what you saw, not what you understood.** Read the file it prints.
-- **The journal is tamper-evident against the agent, not against you.** Anchoring its head (TPM, remote witness) is a later phase.
+- **The journal is tamper-evident against the agent, not against you.** Receipts and a witness (above) anchor its head somewhere you can't rewrite after the fact, if you run one; keeping the signing key in a TPM is a later step.
 - **Landlock is best-effort.** It's used when the kernel has it (`agent doctor` tells you). Namespaces do the isolation either way.
 - **Grants are mounted at their canonical path.** If `~/app` is a symlink, the agent sees the real path.
 
@@ -599,6 +619,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 src/sandbox.rs   namespaces, root assembly, Landlock, exec
 src/changes.rs   reading/committing/rolling back overlay transactions
 src/journal.rs   hash-chained event log
+src/attest.rs    receipts: the journal head, signed; the witness
 src/store.rs     on-disk task store
 src/doctor.rs    environment checks
 src/profiles.rs  agent profiles (Claude Code) and their output

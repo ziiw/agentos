@@ -1671,6 +1671,75 @@ else
   check "...reaching the provider" grep -q '"error"' <<<"$out"
 fi
 
+section "receipts (a signed journal head, and a witness)"
+reset_proj
+cd "$PROJ"
+"$AGENT" run -- true >/dev/null 2>&1
+T="$(latest_task_dir)"
+check "a finished task has a signed receipt" test -f "${T}receipt.json"
+check "...which the journal records" grep -q '"kind":"receipt.signed"' "${T}events.jsonl"
+check "agent log shows it" grep -q 'signed receipt · key' <<<"$("$AGENT" log)"
+check "...and the chain with it still verifies" grep -q 'chain intact' <<<"$("$AGENT" log)"
+out="$("$AGENT" attest --verify "${T}receipt.json" --journal "${T}events.jsonl" 2>&1)"
+check "agent attest --verify checks the signature" grep -q "✓ signed by key .* (this machine's)" <<<"$out"
+check "...and that the journal still holds that history" grep -q 'the journal holds that history (1 events since)' <<<"$out"
+KEY="$("$AGENT" attest --public | cut -d' ' -f1)"
+check "--trust accepts the key it is" grep -q 'that is the key you trust' <<<"$("$AGENT" attest --verify "${T}receipt.json" --trust "$KEY")"
+check "...and refuses another" bash -c '! "$@" >/dev/null' _ "$AGENT" attest --verify "${T}receipt.json" --trust 0123456789abcdef
+sed 's/"events": [0-9]*/"events": 999/' "${T}receipt.json" > "$WORK/forged.json"
+check "a receipt edited afterwards fails" grep -q "the signature doesn't match" <<<"$("$AGENT" attest --verify "$WORK/forged.json")"
+cp "${T}events.jsonl" "$WORK/events.good"
+sed -i 's/"exit_code":0/"exit_code":9/' "${T}events.jsonl"
+out="$("$AGENT" attest --verify "${T}receipt.json" --journal "${T}events.jsonl" 2>&1)"
+check "a journal edited afterwards fails the check" grep -q 'the journal is broken' <<<"$out"
+cp "$WORK/events.good" "${T}events.jsonl"
+out="$("$AGENT" attest)"
+check "agent attest signs the journal as it stands now, receipt event and all" grep -q "\"events\": $(wc -l < "${T}events.jsonl")," <<<"$out"
+if command -v python3 >/dev/null; then
+  cat > "$WORK/witness.py" <<'PY'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        open(sys.argv[1], "ab").write(self.rfile.read(n) + b"\n")
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+  : > "$WORK/witnessed.jsonl"
+  python3 "$WORK/witness.py" "$WORK/witnessed.jsonl" > "$WORK/witness.port" &
+  WITNESS_PID=$!
+  for _ in $(seq 50); do [ -s "$WORK/witness.port" ] && break; sleep 0.1; done
+  WPORT="$(cat "$WORK/witness.port")"
+  printf '[journal]\nwitness = "http://127.0.0.1:%s/receipts"\n' "$WPORT" > "$WORK/witness.toml"
+  AGENTOS_CONFIG="$WORK/witness.toml" "$AGENT" run -- true >/dev/null 2>&1
+  T="$(latest_task_dir)"
+  check "[journal] witness: the signed receipt is posted when a task ends" test "$(wc -l < "$WORK/witnessed.jsonl")" -eq 1
+  check "...and the journal says the witness took it" grep -q '"witness":{"status":200,"url":"http://127.0.0.1:' "${T}events.jsonl"
+  head -1 "$WORK/witnessed.jsonl" > "$WORK/witnessed.receipt"
+  check "what the witness holds verifies against the journal" grep -q 'the journal holds that history' <<<"$("$AGENT" attest --verify "$WORK/witnessed.receipt" --journal "${T}events.jsonl")"
+  AGENTOS_CONFIG="$WORK/witness.toml" "$AGENT" attest "$(basename "$T")" >/dev/null 2>&1
+  check "agent attest posts to it too" test "$(wc -l < "$WORK/witnessed.jsonl")" -eq 2
+  kill "$WITNESS_PID" 2>/dev/null; wait "$WITNESS_PID" 2>/dev/null
+  out="$(AGENTOS_CONFIG="$WORK/witness.toml" "$AGENT" run -- true 2>&1)"
+  check "a witness that can't be reached is a warning, not a failure" grep -q "couldn't reach the witness" <<<"$out"
+  check "...and the receipt is signed all the same" grep -q '"kind":"receipt.signed"' "$(latest_task_dir)/events.jsonl"
+else
+  skip "the witness tests need python3"
+fi
+printf '[journal]\nwitness = "http://witness.example.com/receipts"\n' > "$WORK/badwitness.toml"
+check "a witness has to be https (or this machine)" grep -q 'a witness is an https' <<<"$(AGENTOS_CONFIG="$WORK/badwitness.toml" "$AGENT" run -- true 2>&1)"
+printf '[journal]\nwitness = "https://witness.example.com/receipts"\n' > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project can't choose who hears about your tasks" test $? -eq 2
+rm -f .agentos.toml
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7
