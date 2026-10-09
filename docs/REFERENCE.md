@@ -105,7 +105,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent install DIR\|NAME [--yes] [--digest HEX]` / `uninstall NAME` / `packages` / `search [TEXT]` | Agent packages: install one (from a folder, or by name from your registry) after reading what it asks for, remove it, list them and whether they're intact, search your registry |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
 | `agent schedules` / `agent hooks` | The tasks agentd starts on a timer, and when each runs next; the hooks that start one when an event arrives |
-| `agent users [add NAME --role ROLE \| remove NAME]` | Who else may use agentd's console (viewer, approver, admin), with their own tokens |
+| `agent users [add NAME --role ROLE [--project DIR]… \| remove NAME]` | Who else may use agentd's console (viewer, approver, admin), with their own tokens, optionally limited to some projects |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 | `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
 | `agent connect [NAME] [--forget]` | Sign in to one of your remote MCP servers, or list them |
@@ -540,7 +540,13 @@ Questions from agents appear at the top with **Allow for this task / Always / De
   | `approver` | also answer questions, stop tasks, take back what an agent was given, act on a task's screen |
   | `admin` | also start tasks, commit, push, roll back and raise budgets |
 
-  What a named person does to a task (an answer, a commit, a stop) is written into that task's journal under their name (`console.action`), and a task they start says who started it. `agent users` lists them, `agent users remove NAME` takes a token back at once. Put agentd on a private network (`--listen 0.0.0.0:7777` over Tailscale, say), not the open internet: it's a plain-HTTP console and the token is a bearer token. A viewer sees every task's diff and journal, so give that role the way you'd give read access to the repositories.
+  What a named person does to a task (an answer, a commit, a stop) is written into that task's journal under their name (`console.action`), and a task they start says who started it. `agent users` lists them, `agent users remove NAME` takes a token back at once. Put agentd on a private network (`--listen 0.0.0.0:7777` over Tailscale, say), not the open internet: it's a plain-HTTP console and the token is a bearer token. A viewer sees every task's diff and journal, so give that role the way you'd give read access to the repositories, or limit the token to the projects it's for:
+
+  ```bash
+  agent users add pia --role approver --project ~/code/app --project ~/code/lib
+  ```
+
+  A limited token sees, and can act on, only the tasks that ran in those folders (or below them): its task list, the questions waiting for an answer, the screens, the schedules, and the new-task form's projects are cut to them, and it can't start a task elsewhere. A task or a question outside looks to it like one that doesn't exist (the same error, and it must name a task by its whole id, since the start of an id could match one it can't see). Budgets across tasks aren't split by project, so they stay closed to a limited token. The console shows who a link is for, and only offers **New task** to admins.
 - **A task with a screen** (`--display`) shows it in its card, refreshed every second, scaled to fit. **Act on it** hands you the mouse and keyboard: click on the picture and type, and your input goes to the task's screen as a person's would (through `xdotool`, which must be installed on the machine running agentd). It's for stepping in when an agent is stuck on a dialog; every click, key and typed run is journaled with your name, never the text you typed. A viewer can watch; acting needs an approver or you. Once the task has ended the card shows its last picture.
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
 - `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only, or which budget ran out), and when a task finishes, with what it left for review.

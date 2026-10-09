@@ -121,9 +121,20 @@ struct Who {
     name: String,
     role: Role,
     owner: bool,
+    /// The folders whose tasks this person sees; none: every task.
+    projects: Vec<PathBuf>,
 }
 
 impl Who {
+    fn scoped(&self) -> bool {
+        !self.projects.is_empty()
+    }
+
+    /// Whether a task that ran in `cwd` is theirs to see.
+    fn sees(&self, cwd: &Path) -> bool {
+        users::covers(&self.projects, cwd)
+    }
+
     /// What the journal and a task's `started_by` call them.
     fn label(&self) -> String {
         if self.owner { "agentd console".to_string() } else { format!("agentd console ({})", self.name) }
@@ -153,9 +164,9 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
     let query_token = parts.query.split('&').find_map(|kv| kv.strip_prefix("token=")).map(str::to_string);
     let given = bearer.or(query_token);
     let who = match given.as_deref() {
-        Some(t) if t == token => Who { name: "you".into(), role: Role::Admin, owner: true },
+        Some(t) if t == token => Who { name: "you".into(), role: Role::Admin, owner: true, projects: Vec::new() },
         Some(t) => match users::authenticate(root, t) {
-            Some(u) => Who { name: u.name, role: u.role, owner: false },
+            Some(u) => Who { name: u.name, role: u.role, owner: false, projects: u.projects },
             None => return Reply::Json(401, json!({ "error": "missing or wrong token: open the link agent serve printed" })),
         },
         None => return Reply::Json(401, json!({ "error": "missing or wrong token: open the link agent serve printed" })),
@@ -175,6 +186,11 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         _ => None,
     };
     let body_for_note = parts.body.clone();
+    if who.scoped() {
+        if let Some(refusal) = outside(&store, &who, &parts, &segments) {
+            return refusal;
+        }
+    }
     // A picture, not JSON: what a task's screen shows (as it is now, or as it ended).
     if let (Method::Get, ["api", "tasks", id, "screen.png"]) = (&parts.method, segments.as_slice()) {
         return match screen(&store, id, &parts.query) {
@@ -183,11 +199,11 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         };
     }
     let result = match (&parts.method, segments.as_slice()) {
-        (Method::Get, ["api", "whoami"]) => Ok(json!({ "name": who.name, "role": who.role.name(), "owner": who.owner })),
-        (Method::Get, ["api", "tasks"]) => tasks(&store),
+        (Method::Get, ["api", "whoami"]) => Ok(json!({ "name": who.name, "role": who.role.name(), "owner": who.owner, "projects": who.projects })),
+        (Method::Get, ["api", "tasks"]) => tasks(&store, &who),
         (Method::Post, ["api", "tasks"]) => start(&store, &parts.body, &who.label(), None),
-        (Method::Get, ["api", "launchpad"]) => launchpad(&store),
-        (Method::Get, ["api", "schedules"]) => schedules(&store),
+        (Method::Get, ["api", "launchpad"]) => launchpad(&store, &who),
+        (Method::Get, ["api", "schedules"]) => schedules(&store, &who),
         (Method::Post, ["api", "schedules", name, "run"]) => run_schedule_now(&store, name, &who),
         (Method::Get, ["api", "tasks", id]) => task(&store, id),
         (Method::Post, ["api", "tasks", id, "revoke"]) => revoke(&store, id, &parts.body),
@@ -199,7 +215,8 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         (Method::Get, ["api", "approvals"]) => {
             // A task that ended while asking leaves its question behind.
             approvals::drop_stale(store.root(), |id| store.resolve(Some(id)).is_ok_and(|t| t.is_live()));
-            Ok(json!(approvals::questions(store.root())))
+            let asked = approvals::questions(store.root());
+            Ok(json!(asked.into_iter().filter(|q| !who.scoped() || store.resolve(Some(&q.task)).is_ok_and(|t| who.sees(&t.meta.cwd))).collect::<Vec<_>>()))
         }
         (Method::Post, ["api", "approvals", id]) => {
             let decision = std::mem::take(&mut parts.body);
@@ -218,6 +235,57 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
             Reply::Json(200, v)
         }
         Err(e) => Reply::Json(400, json!({ "error": format!("{e:#}") })),
+    }
+}
+
+/// What a token limited to some projects may not touch. A task or a
+/// question elsewhere is answered the way one that doesn't exist is, so
+/// nothing tells them it's there; such a token names a task by its whole id
+/// (a prefix could match one it can't see).
+fn outside(store: &Store, who: &Who, parts: &Parts, segments: &[&str]) -> Option<Reply> {
+    let refuse = |status: u16, why: String| Some(Reply::Json(status, json!({ "error": why })));
+    match (&parts.method, segments) {
+        (Method::Post, ["api", "tasks"]) => {
+            // (a body that isn't a request is for `start` to complain about)
+            let project = serde_json::from_str::<Value>(&parts.body).ok().and_then(|v| v["project"].as_str().map(PathBuf::from))?;
+            if fs::canonicalize(&project).is_ok_and(|p| who.sees(&p)) {
+                return None;
+            }
+            refuse(403, format!("{}'s token is limited to {}", who.name, who.projects.iter().map(|p| util::display_path(p)).collect::<Vec<_>>().join(", ")))
+        }
+        (_, ["api", "tasks", id, rest @ ..]) => {
+            if store.list().ok()?.iter().any(|t| t.id() == *id && who.sees(&t.meta.cwd)) {
+                return None;
+            }
+            refuse(if rest == ["screen.png"] { 404 } else { 400 }, format!("no task matching '{id}' (see `agent ls`)"))
+        }
+        (Method::Post, ["api", "approvals", id]) => {
+            let q = approvals::questions(store.root()).into_iter().find(|q| q.id == *id)?;
+            if store.resolve(Some(&q.task)).is_ok_and(|t| who.sees(&t.meta.cwd)) {
+                return None;
+            }
+            refuse(400, "no such question".into())
+        }
+        // Money across tasks isn't split by project.
+        (_, ["api", "spend", ..]) => refuse(403, format!("{}'s token is limited to some projects: budgets across tasks are for tokens that aren't", who.name)),
+        (Method::Post, ["api", "schedules", name, "run"]) => {
+            let home = crate::home_dir().ok()?;
+            let s = config::load(store.root(), &home, &home).ok()?.schedules.into_iter().find(|s| s.name == *name)?;
+            if fs::canonicalize(expand(&home, &s.project)).is_ok_and(|p| who.sees(&p)) {
+                return None;
+            }
+            refuse(400, format!("no [schedule.{name}] in your config"))
+        }
+        _ => None,
+    }
+}
+
+/// A project as a config writes it (`~/code/app` or absolute).
+fn expand(home: &Path, project: &str) -> PathBuf {
+    match project.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if project == "~" => home.to_path_buf(),
+        None => PathBuf::from(project),
     }
 }
 
@@ -269,8 +337,8 @@ fn live_budget(t: &Task, events: &[agentos::journal::Event]) -> Option<Budget> {
     raised.and_then(|e| serde_json::from_value(e.data["to"].clone()).ok()).or(t.meta.budget)
 }
 
-fn tasks(store: &Store) -> Result<Value> {
-    let list: Vec<Value> = store.list()?.iter().rev().take(50).map(task_json).collect();
+fn tasks(store: &Store, who: &Who) -> Result<Value> {
+    let list: Vec<Value> = store.list()?.iter().rev().filter(|t| who.sees(&t.meta.cwd)).take(50).map(task_json).collect();
     Ok(json!(list))
 }
 
@@ -336,7 +404,7 @@ fn projects(store: &Store, home: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// What the "new task" form offers: your projects and your agents.
-fn launchpad(store: &Store) -> Result<Value> {
+fn launchpad(store: &Store, who: &Who) -> Result<Value> {
     let home = crate::home_dir()?;
     let default = config::load(store.root(), &home, &home)?.agent.unwrap_or_else(|| "claude".into());
     let agents: Vec<Value> = profiles::available(&crate::agents_dir(&home))
@@ -345,6 +413,7 @@ fn launchpad(store: &Store) -> Result<Value> {
         .collect();
     let projects: Vec<Value> = projects(store, &home)?
         .iter()
+        .filter(|p| who.sees(p))
         .map(|p| json!({ "path": p, "shown": util::display_path(p) }))
         .collect();
     Ok(json!({ "projects": projects, "agents": agents }))
@@ -490,13 +559,14 @@ fn fire(store: &Store, home: &Path, s: &Schedule, state: &mut schedule::State, n
 }
 
 /// Your schedules and where each stands.
-fn schedules(store: &Store) -> Result<Value> {
+fn schedules(store: &Store, who: &Who) -> Result<Value> {
     let home = crate::home_dir()?;
     let settings = config::load(store.root(), &home, &home)?;
     let states = schedule::load(store.root());
     Ok(json!(settings
         .schedules
         .iter()
+        .filter(|s| !who.scoped() || fs::canonicalize(expand(&home, &s.project)).is_ok_and(|p| who.sees(&p)))
         .map(|s| {
             let state = states.get(&s.name).cloned().unwrap_or_default();
             let next = (state.first_seen_ms > 0).then(|| s.interval().ok().map(|every| state.next_ms(every))).flatten();

@@ -288,6 +288,9 @@ pub(crate) enum UsersCommand {
         /// viewer: reads. approver: also answers questions, stops tasks. admin: everything
         #[arg(long, default_value = "viewer", value_parser = ["viewer", "approver", "admin"])]
         role: String,
+        /// Limit them to the tasks that ran in this folder (and below); give it more than once for several
+        #[arg(long, value_name = "DIR")]
+        project: Vec<PathBuf>,
     },
     /// Take their token back
     Remove { name: String },

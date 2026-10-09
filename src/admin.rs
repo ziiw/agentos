@@ -468,13 +468,32 @@ pub(crate) fn cmd_users(store: &Store, command: Option<UsersCommand>) -> Result<
                 println!("nobody besides you: agent users add NAME --role viewer|approver|admin");
             }
             for u in all {
-                println!("{:<16} {:<9} {}  {}", u.name, u.role.name(), out.dim(u.role.describe()), out.dim(util::ago(u.created_ms)));
+                let scope = if u.projects.is_empty() { String::new() } else { format!(" · only {}", u.projects.iter().map(|p| display_path(p)).collect::<Vec<_>>().join(", ")) };
+                println!("{:<16} {:<9} {}  {}", u.name, u.role.name(), out.dim(format!("{}{scope}", u.role.describe())), out.dim(util::ago(u.created_ms)));
             }
         }
-        Some(UsersCommand::Add { name, role }) => {
+        Some(UsersCommand::Add { name, role, project }) => {
             let role = agentos::users::Role::parse(&role)?;
-            let token = agentos::users::add(store.root(), &name, role)?;
+            let home = home_dir()?;
+            let mut projects = Vec::new();
+            for p in project {
+                let p = match p.strip_prefix("~") {
+                    Ok(rest) => home.join(rest),
+                    Err(_) => p,
+                };
+                let p = fs::canonicalize(&p).with_context(|| format!("--project {}: no such folder", p.display()))?;
+                if !p.is_dir() {
+                    bail!("--project {}: not a folder", p.display());
+                }
+                if !projects.contains(&p) {
+                    projects.push(p);
+                }
+            }
+            let token = agentos::users::add(store.root(), &name, role, &projects)?;
             println!("{} {name} is {} {}: {}", out.green("✓"), if role == agentos::users::Role::Viewer { "a" } else { "an" }, role.name(), role.describe());
+            if !projects.is_empty() {
+                println!("  only the tasks that ran in {}", projects.iter().map(|p| display_path(p)).collect::<Vec<_>>().join(", "));
+            }
             let at = approvals::agentd(store.root()).map(|d| d.listen).unwrap_or_else(|| "HOST:7777".into());
             println!("  their link   http://{at}/#token={token}");
             println!("  {}", out.dim("shown once; it works wherever agentd is reachable (agent serve --listen 0.0.0.0:7777, over a private network)"));

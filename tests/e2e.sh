@@ -799,6 +799,44 @@ check "...and the journal still verifies" grep -q 'chain intact' <<<"$("$AGENT" 
 "$AGENT" users remove vera >/dev/null
 check "a removed token stops working" test "$(code "$VIEW" "$CONSOLE/api/tasks")" = 401
 check "...the others don't" test "$(code "$APPR" "$CONSOLE/api/tasks")" = 200
+
+# A token can be limited to projects: it sees their tasks, and nothing else is even there.
+mkdir -p "$WORK/proj2"
+( cd "$WORK/proj2" && "$AGENT" run -- sh -c 'echo two > two.txt' >/dev/null 2>&1 )
+ID2="$("$AGENT" ls | sed -n 2p | cut -d' ' -f1)"
+out="$("$AGENT" users add pia --role admin --project "$PROJ")"
+PIA="$(tok <<<"$out")"
+check "agent users add says what the token is limited to" grep -q "only the tasks that ran in $PROJ" <<<"$out"
+check "agent users lists the limit" grep -Eq "pia +admin .*only $PROJ" <<<"$("$AGENT" users)"
+check "a project that isn't a folder is refused" bash -c '! "$@" 2>/dev/null' _ "$AGENT" users add rex --role admin --project "$WORK/nonexistent"
+check "whoami says what a token is limited to" grep -q "\"projects\":\[\"$PROJ\"\]" <<<"$(as "$PIA" "$CONSOLE/api/whoami")"
+check "a limited token sees its project's tasks" grep -q "\"id\":\"$ID\"" <<<"$(as "$PIA" "$CONSOLE/api/tasks")"
+check "...and not another project's" bash -c '! grep -q "$1" <<<"$2"' _ "$ID2" "$(as "$PIA" "$CONSOLE/api/tasks")"
+check "...which you still see" grep -q "\"id\":\"$ID2\"" <<<"$(as "$TOKEN" "$CONSOLE/api/tasks")"
+other="$(as "$PIA" "$CONSOLE/api/tasks/$ID2" | sed "s/$ID2/ID/")"
+bogus="$(as "$PIA" "$CONSOLE/api/tasks/ffffffff" | sed "s/ffffffff/ID/")"
+check "another project's task looks like one that doesn't exist" test "$other" = "$bogus"
+check "...whatever is done to it" test "$(code "$PIA" -X POST "$CONSOLE/api/tasks/$ID2/commit")" = 400
+check "...so nothing of it was committed" test ! -f "$WORK/proj2/two.txt"
+check "...and not by the start of its id either" grep -q "no task matching" <<<"$(as "$PIA" "$CONSOLE/api/tasks/${ID2:0:4}")"
+check "a limited token can't start a task elsewhere" test "$(code "$PIA" -X POST -d "{\"project\":\"$WORK/proj2\",\"task\":\"x\"}" "$CONSOLE/api/tasks")" = 403
+check "...and the 403 says where it may" grep -q "pia's token is limited to $PROJ" <<<"$(as "$PIA" -X POST -d "{\"project\":\"$WORK/proj2\",\"task\":\"x\"}" "$CONSOLE/api/tasks")"
+check "...a path with .. doesn't get around it" test "$(code "$PIA" -X POST -d "{\"project\":\"$PROJ/../proj2\",\"task\":\"x\"}" "$CONSOLE/api/tasks")" = 403
+check "budgets across tasks aren't for a limited token" test "$(code "$PIA" "$CONSOLE/api/spend")" = 403
+check "the new-task form offers a limited token its projects only" bash -c '! grep -q proj2 <<<"$1"' _ "$(as "$PIA" "$CONSOLE/api/launchpad")"
+check "...yours offers both" grep -q "$WORK/proj2" <<<"$(as "$TOKEN" "$CONSOLE/api/launchpad")"
+( cd "$WORK/proj2" && exec "$AGENT" run --ask -- curl -sS -m 30 -o /dev/null -w 'HTTP%{http_code}' https://example.com ) >"$WORK/scoped.out" 2>&1 </dev/null &
+SCOPED_PID=$!
+Q=""
+for _ in $(seq 100); do Q="$(as "$TOKEN" "$CONSOLE/api/approvals")"; grep -q '"id"' <<<"$Q" && break; sleep 0.1; done
+QID2="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' <<<"$Q")"
+check "a question from another project reaches you" test -n "$QID2"
+check "...but not a limited token" bash -c '! grep -q "\"id\"" <<<"$1"' _ "$(as "$PIA" "$CONSOLE/api/approvals")"
+check "...which can't answer it either" grep -q "no such question" <<<"$(as "$PIA" -X POST -d '{"decision":"once"}' "$CONSOLE/api/approvals/$QID2")"
+as "$TOKEN" -X POST -d '{"decision":"once"}' "$CONSOLE/api/approvals/$QID2" >/dev/null
+wait $SCOPED_PID
+check "...and the task went on waiting for you" grep -q HTTP200 "$WORK/scoped.out"
+check "a limited token reads its own project's task in full" grep -q "\"id\":\"$ID\".*\"diff\"" <<<"$(as "$PIA" "$CONSOLE/api/tasks/$ID")"
 kill $SERVE_PID 2>/dev/null
 wait $SERVE_PID 2>/dev/null
 rm -f "$AGENTOS_HOME/users.json"
@@ -2055,6 +2093,14 @@ check "...and a name that isn't there is refused" grep -q 'no \[schedule.nope\]'
 for _ in $(seq 20); do [ "$(tasks_started)" -ge 2 ] && break; sleep 0.5; done
 check "the console's Run now made a second task" test "$(tasks_started)" -eq 2
 check "a viewer can't start one" bash -c 'tk="$("$1" users add vera --role viewer | sed -n "s/.*#token=\([0-9a-f]*\).*/\1/p")"; test "$(curl -sS -m 10 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $tk" -X POST -d "{}" "$2/api/schedules/overdue/run")" = 403' _ "$AGENT" "$CONSOLE"
+OTHERP="$WORK/other-proj"; mkdir -p "$OTHERP"
+LIM="$("$AGENT" users add lim --role admin --project "$OTHERP" | tok)"
+INN="$("$AGENT" users add inn --role admin --project "$PROJ" | tok)"
+sas() { local t="$1"; shift; curl -sS -m 10 -H "Authorization: Bearer $t" "$@"; }
+check "a token limited to another project sees none of this one's schedules" grep -q '^\[\]$' <<<"$(sas "$LIM" "$CONSOLE/api/schedules")"
+check "...one limited to this project sees them" grep -q '"name":"overdue"' <<<"$(sas "$INN" "$CONSOLE/api/schedules")"
+check "...and the other can't run it: it looks like it isn't there" grep -q 'no \[schedule.overdue\]' <<<"$(sas "$LIM" -X POST -d '{}' "$CONSOLE/api/schedules/overdue/run")"
+check "...but this project's token can" grep -Eq '"id":"[0-9a-f]{8}"' <<<"$(sas "$INN" -X POST -d '{}' "$CONSOLE/api/schedules/overdue/run")"
 kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
 before="$(tasks_started)"
 start_agentd AGENTOS_CONFIG="$WORK/sched/config.toml" AGENTOS_MIN_SCHEDULE=1s
