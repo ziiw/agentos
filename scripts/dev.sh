@@ -4,6 +4,8 @@
 #   scripts/dev.sh shell        shell as the unprivileged `dev` user, `agent` on PATH
 #   scripts/dev.sh exec CMD...  run CMD as `dev` in the same environment
 #   scripts/dev.sh test         build, run unit tests (root) and e2e tests (as `dev`)
+#   scripts/dev.sh e2e FROM [TO]  build, then only the e2e sections from the one whose name
+#                                 starts with FROM, up to (not including) the one starting with TO
 #   scripts/dev.sh build        just build
 #
 # --privileged only lets the *container* create nested user namespaces and
@@ -60,6 +62,27 @@ case "$CMD" in
   test) run "$SETUP
 TMPDIR=/data/tmp cargo test --release --quiet
 su - dev -c 'E2E_DIR=/data/tmp bash /src/tests/e2e.sh'" ;;
+  e2e)
+    FROM="${1:?usage: $0 e2e 'name of the first section' ['name of the section to stop before']}"
+    # The header (helpers) and footer (summary) of tests/e2e.sh around the sections asked for,
+    # written next to it so HERE (the tests folder) is right.
+    PART="$ROOT/tests/.e2e-part.sh"
+    trap 'rm -f "$PART"' EXIT
+    python3 - "$ROOT/tests/e2e.sh" "$PART" "$FROM" "${2:-}" <<'PY'
+import sys
+src, out, first, stop = sys.argv[1:5]
+lines = open(src).read().split("\n")
+sections = [i for i, l in enumerate(lines) if l.startswith('section "')]
+footer = next(i for i, l in enumerate(lines) if l.startswith("printf '\\n%d passed"))
+name = lambda i: lines[i][len('section "'):-1]
+start = next((i for i in sections if name(i).startswith(first)), None)
+if start is None:
+    sys.exit("no section starting with %r" % first)
+end = next((i for i in sections if i > start and stop and name(i).startswith(stop)), footer)
+open(out, "w").write("\n".join(lines[:sections[0]] + lines[start:end] + lines[footer:]))
+PY
+    run "$SETUP
+su - dev -c 'E2E_DIR=/data/tmp bash /src/tests/.e2e-part.sh'" ;;
   shell) run "$SETUP
 $CLAUDE
 echo 'agent is on PATH. Try: mkdir -p ~/app && cd ~/app && agent do \"say hello\"'
@@ -67,5 +90,5 @@ exec su - dev" ;;
   exec) run "$SETUP
 $CLAUDE
 su - dev $SU_PTY -c $(printf '%q' "$*")" ;;
-  *) echo "usage: $0 [shell|exec CMD...|test|build]" >&2; exit 2 ;;
+  *) echo "usage: $0 [shell|exec CMD...|test|e2e FROM [TO]|build]" >&2; exit 2 ;;
 esac

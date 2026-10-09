@@ -80,6 +80,8 @@ scripts/dev.sh test
 scripts/dev.sh shell
 ```
 
+While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configuration'` builds and runs only the end-to-end sections from the first name up to (not including) the second.
+
 ## Commands
 
 | | |
