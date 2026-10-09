@@ -1304,6 +1304,21 @@ check "agent agents lists it, with its program" grep -Eq 'echo .*echo.toml .*ech
 check "an unknown agent is refused, with what's available" grep -q "unknown agent 'nope' (available: claude, echo" <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do --agent nope x 2>&1)"
 echo 'agent = "echo"' > "$CFG"
 check "the default agent comes from your config" grep -q 'echo-agent got' <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do just do it 2>&1)"
+# What an agent reaches for that should stay closed is said once, and isn't a problem.
+cat > "$WORK/cfg/agents/reacher.toml" <<'TOML'
+run = ["sh", "-c", "curl -sS -m 5 -o /dev/null https://example.org; curl -sS -m 5 -o /dev/null https://example.org; curl -sS -m 5 -o /dev/null https://example.net; true"]
+allow = ["example.com"]
+
+[expected]
+"example.org" = "its usage statistics"
+TOML
+: > "$CFG"
+out="$(AGENTOS_CONFIG="$CFG" "$AGENT" do --agent reacher go 2>&1)"
+check "an agent file can name what it reaches for that stays closed: explained once" test "$(grep -c 'example.org stays closed: its usage statistics (--allow example.org opens it)' <<<"$out")" = 1
+check "...and not counted as a problem" bash -c '! grep -q "example.org:443: not in the allowlist" <<<"$1"' _ "$out"
+check "...while anything else it reaches for still is" grep -q 'blocked example.net:443' <<<"$out"
+check "...the journal keeps the difference" grep -q '"expected":true.*"host":"example.org"' "$(latest_task_dir)/events.jsonl"
+check "...in the summary only the other is counted" grep -q '1 connection blocked' <<<"$out"
 
 section "agent packages (an agent, and what it asks for)"
 reset_proj

@@ -760,12 +760,15 @@ ro = ["~/.gitconfig"]                      # files and folders it reads, read-on
 display = true                             # a virtual screen of its own (display_size = "1920x1080")
 
 [secrets]                                  # brokered: the agent only sees placeholders
-OPENAI_API_KEY = "api.openai.com"          # (the value: your environment, or [secret_commands])
+CODEX_API_KEY = "api.openai.com"           # (the value: your environment, or [secret_commands])
+
+[expected]                                 # what it reaches for that stays closed: said once, not counted as a problem
+"chatgpt.com" = "Codex's ChatGPT backend, which an API key doesn't use"
 ```
 
 An agent calling a model API other than Anthropic's or OpenAI's can list it before the first `[section]`, so its calls are metered and count against budgets: `models = [{ url = "https://openrouter.ai/api/v1/chat/completions", api = "openai" }]` (`api` is `anthropic`, `openai` or `gemini`; Gemini, Anthropic's and OpenAI's own APIs are built in; a trailing `*` in the URL matches any path under it).
 
-`agent do --agent codex "…"` runs it like Claude: same sandbox, transactions, outbox, allowlist and broker, and its own persistent home. `agent agents` lists what you have, and `agent = "codex"` in your config makes it the default. [examples/agents/](../examples/agents) has starting points for Codex, Gemini CLI and Aider. **Aider has been run end to end** (0.86.2, with a model server on your machine through `local`: `aider-local.toml`, and `scripts/verify-aider.sh` runs the real Aider against a stand-in server to check it again); its Anthropic variant uses the same broker as Claude Code but hasn't been run with a real key. Codex and Gemini's flags are checked against their `--help`, but neither has been run end to end under agentos yet.
+`agent do --agent codex "…"` runs it like Claude: same sandbox, transactions, outbox, allowlist and broker, and its own persistent home. `agent agents` lists what you have, and `agent = "codex"` in your config makes it the default. [examples/agents/](../examples/agents) has starting points for Codex, Gemini CLI and Aider. **Aider, Codex and Gemini CLI have been run end to end.** Aider (0.86.2) with a model server on your machine through `local` (`aider-local.toml`; `scripts/verify-aider.sh` runs the real Aider against a stand-in server). Codex (0.162.1) and Gemini CLI (0.63.0) with a made-up key (`scripts/verify-agents.sh`, no account needed): each starts in the sandbox, reaches its provider and nothing else, and the provider answers with an error about the key agentos added on the wire, while the agent only ever held a placeholder. What that taught the recipes: Codex's `codex exec` reads `CODEX_API_KEY`, not `OPENAI_API_KEY`, and its built-in provider opens a WebSocket (which can't go through a host agentos holds the key for), so `codex.toml` gives it a provider of its own over HTTPS. Neither has been run with a real key yet, and the Anthropic variant of Aider uses the same broker as Claude Code but hasn't either.
 
 **Agent packages** are agents that come with what they run, and say what they need. A package is a folder with an `agentos-package.toml`:
 
@@ -917,6 +920,7 @@ src/render.rs    output       src/web.rs   agentd's console
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run
 scripts/package.sh      .deb and .rpm (nfpm), from packaging/: the unit, the AppArmor profile, install scripts
-scripts/dev.sh          build and test in a Linux container (scripts/dev.Dockerfile: Rust, Xvfb, xdotool, D-Bus)
+scripts/dev.sh          build and test in a Linux container (scripts/dev.Dockerfile: Rust, Xvfb, xdotool, D-Bus, a software TPM)
+scripts/verify-agents.sh  the real Codex and Gemini CLIs under agentos, with a made-up key (scripts/agents.Dockerfile)
 .github/workflows/ci.yml   unit + e2e tests on real Ubuntu 24.04 (x86_64, arm64), Landlock required
 ```

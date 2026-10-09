@@ -154,6 +154,10 @@ pub struct AgentFile {
     /// Its size, WIDTHxHEIGHT (default 1280x800); implies `display`.
     #[serde(default)]
     pub display_size: Option<String>,
+    /// Hosts it reaches for that stay closed on purpose, and why (one line):
+    /// explained once in its output, journaled, and not counted as a problem.
+    #[serde(default)]
+    pub expected: std::collections::BTreeMap<String, String>,
     /// Set by `agent install` on the agent file it writes for a package: the
     /// package is checked against what you approved before every run.
     #[serde(default)]
@@ -240,7 +244,7 @@ fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, hom
         allow: def.allow,
         brokered,
         login: None,
-        expected_denials: Vec::new(),
+        expected_denials: def.expected.into_iter().map(|(host, why)| (host.to_ascii_lowercase(), why)).collect(),
         output,
         models,
         local: def.local,
@@ -465,6 +469,35 @@ fn tool_target(input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The example recipes are what people copy: each has to be a valid agent file,
+    /// with an allowlist, models and hosts that parse.
+    #[test]
+    fn the_example_recipes_are_valid_agent_files() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/agents");
+        let mut seen = 0;
+        for entry in fs::read_dir(&dir).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "toml")) {
+            let path = entry.path();
+            let text = fs::read_to_string(&path).unwrap();
+            let def: AgentFile = toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(!def.run.is_empty() && def.run.iter().any(|a| a.contains("{task}")), "{}: run has the task in it", path.display());
+            crate::proxy::Allowlist::parse(&def.allow).unwrap_or_else(|e| panic!("{}: allow: {e:#}", path.display()));
+            for m in &def.models {
+                Endpoint::parse(&m.url, m.api).unwrap_or_else(|e| panic!("{}: models: {e:#}", path.display()));
+            }
+            // A host an agent reaches for that stays closed isn't one it is allowed.
+            for host in def.expected.keys() {
+                assert!(!def.allow.contains(host), "{}: {host} is both allowed and expected to stay closed", path.display());
+            }
+            // A secret goes to a host the agent may reach.
+            for (var, target) in &def.secrets {
+                let host = target.split('/').next().unwrap_or_default();
+                assert!(def.allow.iter().any(|a| a == host) || !def.models.is_empty(), "{}: {var} is for {host}, which isn't in allow", path.display());
+            }
+            seen += 1;
+        }
+        assert!(seen >= 4, "the recipes: codex, gemini, aider, aider-local");
+    }
 
     #[test]
     fn parses_claude_stream_json() {

@@ -1,15 +1,42 @@
-# OpenAI Codex CLI. Flags checked against `codex --help`
-# (0.147.0); not yet run end to end under agentos. API-key mode only (not
-# "Sign in with ChatGPT"). Add a [prices] entry for your model, or calls count
-# at the highest rate.
+# OpenAI Codex CLI (0.162.1). Run end to end under agentos with a made-up key
+# (scripts/verify-agents.sh): it starts in the sandbox, reaches api.openai.com
+# and nothing else, and the key that arrives is the one agentos adds on the
+# wire (OpenAI answers "Incorrect API key provided: sk-fake-…"), while the
+# agent only ever holds a placeholder. API-key mode only (not "Sign in with
+# ChatGPT").
+#
+# Two things differ from Codex's defaults, on purpose:
+# - The key is CODEX_API_KEY, which `codex exec` reads; OPENAI_API_KEY isn't
+#   read in this mode.
+# - Codex talks to a provider of its own, "agentos", at api.openai.com with
+#   WebSockets off. Its built-in provider opens a WebSocket first, which can't
+#   go through a host agentos holds the key for (and can't be counted against
+#   a budget); over HTTPS the stream is metered like any other call.
+#
+# Add a [prices] entry for your model, or calls count at the highest rate.
 # Copy to ~/.config/agentos/agents/codex.toml, then: agent do --agent codex "…"
 #
 # agentos is the sandbox and the review step, so Codex's own approvals and
 # sandbox are turned off.
-run = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{task}"]
-interactive = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+run = [
+  "codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
+  "-c", "model_provider=\"agentos\"",
+  "-c", "model_providers.agentos={ name = \"OpenAI\", base_url = \"https://api.openai.com/v1\", env_key = \"CODEX_API_KEY\", wire_api = \"responses\", supports_websockets = false }",
+  "{task}",
+]
+interactive = [
+  "codex", "--dangerously-bypass-approvals-and-sandbox",
+  "-c", "model_provider=\"agentos\"",
+  "-c", "model_providers.agentos={ name = \"OpenAI\", base_url = \"https://api.openai.com/v1\", env_key = \"CODEX_API_KEY\", wire_api = \"responses\", supports_websockets = false }",
+]
 allow = ["api.openai.com"]
 
 [secrets]
 # The agent sees a placeholder; the proxy adds your key on the wire.
-OPENAI_API_KEY = "api.openai.com"
+CODEX_API_KEY = "api.openai.com"
+
+# What it reaches for that stays closed: said once, not counted as a problem.
+[expected]
+"chatgpt.com" = "Codex's ChatGPT backend, which an API key doesn't use"
+"github.com" = "Codex syncing its plugin marketplace"
+"api.github.com" = "Codex syncing its plugin marketplace"

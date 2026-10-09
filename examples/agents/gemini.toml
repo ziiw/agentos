@@ -1,7 +1,10 @@
-# Google Gemini CLI. Flags checked against `gemini --help` (0.55.1); not yet run
-# end to end under agentos. API-key mode only (not "Login with Google").
-# Model calls are metered; add a [prices] entry for your model, or they count
-# at the highest rate.
+# Google Gemini CLI (0.63.0). Run end to end under agentos with a made-up key
+# (scripts/verify-agents.sh): it starts in the sandbox, reaches
+# generativelanguage.googleapis.com and nothing else, and the key that arrives
+# is the one agentos adds on the wire (Google answers "API key not valid"),
+# while the agent only ever holds a placeholder. API-key mode only (not "Login
+# with Google"). Model calls are metered; add a [prices] entry for your model,
+# or they count at the highest rate.
 # Copy to ~/.config/agentos/agents/gemini.toml, then: agent do --agent gemini "…"
 run = ["gemini", "--yolo", "--skip-trust", "-p", "{task}"]
 interactive = ["gemini", "--yolo", "--skip-trust"]
@@ -9,3 +12,7 @@ allow = ["generativelanguage.googleapis.com"]
 
 [secrets]
 GEMINI_API_KEY = "generativelanguage.googleapis.com/x-goog-api-key"
+
+# What it reaches for that stays closed: said once, not counted as a problem.
+[expected]
+"play.googleapis.com" = "Gemini CLI's usage statistics"
