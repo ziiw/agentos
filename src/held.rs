@@ -107,7 +107,11 @@ pub fn hold_http(task_dir: &Path, part: HttpPart) -> Result<Held> {
     store(task_dir, "http", &part.method.clone(), args, Some(part))
 }
 
+/// Requests held from several connections at once must not take the same place in the queue.
+static QUEUE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn store(task_dir: &Path, server: &str, tool: &str, args: Value, http: Option<HttpPart>) -> Result<Held> {
+    let _one_at_a_time = QUEUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     fs::create_dir_all(dir(task_dir)).context("create held-calls")?;
     let seq = pending(task_dir)?.last().map_or(1, |h| h.seq + 1);
     let held = Held { seq, server: server.to_string(), tool: tool.to_string(), args, at_ms: crate::util::now_ms(), http };
@@ -199,6 +203,29 @@ mod tests {
         let c = hold(dir.path(), "chat", "post", &json!({})).unwrap();
         assert_eq!(c.seq, 3, "numbers aren't reused while later calls wait");
         assert_eq!(pending(dir.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn requests_held_at_the_same_moment_each_keep_their_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..24)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    hold_http(
+                        &path,
+                        HttpPart { method: "POST".into(), host: "api.example.com".into(), target: format!("/n/{i}"), headers: vec![], credentials: vec![], body: String::new() },
+                    )
+                    .unwrap()
+                    .seq
+                })
+            })
+            .collect();
+        let mut seqs: Vec<u32> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        seqs.sort();
+        assert_eq!(seqs, (1..=24).collect::<Vec<_>>(), "no two took the same place");
+        assert_eq!(pending(dir.path()).unwrap().len(), 24, "and none was overwritten");
     }
 
     #[test]
