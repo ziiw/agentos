@@ -872,6 +872,97 @@ check "an unknown agent is refused, with what's available" grep -q "unknown agen
 echo 'agent = "echo"' > "$CFG"
 check "the default agent comes from your config" grep -q 'echo-agent got' <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do just do it 2>&1)"
 
+section "agent packages (an agent, and what it asks for)"
+reset_proj
+cd "$PROJ"
+PKGCFG="$WORK/pkgcfg/config.toml"
+mkdir -p "$WORK/pkgcfg"
+: > "$PKGCFG"
+export AGENTOS_PACKAGES="$WORK/packages"
+pk() { AGENTOS_CONFIG="$PKGCFG" "$AGENT" "$@"; }
+SRC="$WORK/pkg-src"
+mkdir -p "$SRC/bin"
+echo 'readable by the package' > "$WORK/pkg-reads"
+cat > "$SRC/bin/run" <<'SH'
+#!/bin/sh
+echo "pkg-agent got: $*"
+echo "mode: ${E2E_PKG_MODE:-unset}"
+case "${E2E_PKG_KEY:-}" in agentos-placeholder-*) echo "key: placeholder" ;; "") echo "key: none" ;; *) echo "key: real" ;; esac
+echo "reads: $(cat "$E2E_PKG_READS" 2>/dev/null || echo cannot)"
+if echo x > "$(dirname "$0")/tamper" 2>/dev/null; then echo "tamper: wrote"; else echo "tamper: read-only"; fi
+echo done > pkg-ran.txt
+SH
+chmod +x "$SRC/bin/run"
+echo 'a stand-in agent that ships its own program' > "$SRC/README"
+cat > "$SRC/agentos-package.toml" <<TOML
+[package]
+name = "e2e-pkg"
+version = "0.1.0"
+description = "A stand-in agent that ships its own program"
+
+[agent]
+run = ["{pkg}/bin/run", "{task}"]
+allow = ["example.com"]
+local = [47999]
+ro = ["$WORK/pkg-reads"]
+
+[agent.secrets]
+E2E_PKG_KEY = "postman-echo.com/x-test-token"
+
+[agent.env]
+E2E_PKG_MODE = "test"
+E2E_PKG_READS = "$WORK/pkg-reads"
+TOML
+out="$(pk install "$SRC" </dev/null 2>&1)"
+check "install shows what the package asks for: hosts" grep -q 'network      example.com' <<<"$out"
+check "...secrets" grep -q 'secret       E2E_PKG_KEY → postman-echo.com/x-test-token' <<<"$out"
+check "...your machine" grep -q 'your machine 127.0.0.1:47999' <<<"$out"
+check "...what it reads" grep -q "reads        $WORK/pkg-reads (read-only)" <<<"$out"
+check "...and with no terminal to answer at, installs nothing" test ! -e "$WORK/packages/e2e-pkg"
+digest="$(sed -n 's/^  digest  \([0-9a-f]*\) .*/\1/p' <<<"$out")"
+check "--digest refuses a package that isn't the one you read" grep -q "isn't the one you meant" <<<"$(pk install "$SRC" --yes --digest 00000000 2>&1)"
+check "...and --yes with its digest installs it" grep -q 'installed to' <<<"$(pk install "$SRC" --yes --digest "$digest" 2>&1)"
+check "agent packages lists it, intact" grep -Eq 'e2e-pkg +0.1.0 .*intact' <<<"$(pk packages)"
+check "agent agents lists the agent it wrote" grep -q 'e2e-pkg' <<<"$(pk agents)"
+out="$(E2E_PKG_KEY=real-pkg-key pk do --agent e2e-pkg hello world 2>&1)"
+check "agent do --agent runs the package's own program" grep -q 'pkg-agent got: hello world' <<<"$out"
+check "...with the environment it declared" grep -q 'mode: test' <<<"$out"
+check "...its secret as a placeholder" grep -q 'key: placeholder' <<<"$out"
+check "...the file it asked to read" grep -q 'reads: readable by the package' <<<"$out"
+check "...and its own files read-only" grep -q 'tamper: read-only' <<<"$out"
+echo '# edited on the host' >> "$WORK/packages/e2e-pkg/bin/run"
+out="$(pk do --agent e2e-pkg again 2>&1)"
+check "a package changed since you installed it won't run" grep -q 'package e2e-pkg changed since you installed it (bin/run changed)' <<<"$out"
+check "...and agent packages says what" grep -q 'CHANGED: bin/run changed' <<<"$(pk packages)"
+check "...and fails" bash -c '! "$@" >/dev/null' _ env AGENTOS_CONFIG="$PKGCFG" "$AGENT" packages
+pk install "$SRC" --yes >/dev/null 2>&1
+check "installing it again puts it right" grep -q 'pkg-agent got: again' <<<"$(pk do --agent e2e-pkg again 2>&1)"
+sed -i 's/"example.com"/"example.com", "evil.example"/' "$WORK/pkgcfg/agents/e2e-pkg.toml"
+out="$(pk do --agent e2e-pkg widened 2>&1)"
+check "an agent file edited to ask for more won't run either" grep -q 'e2e-pkg.toml changed since you installed package e2e-pkg' <<<"$out"
+pk install "$SRC" --yes >/dev/null 2>&1
+sed -i 's/version = "0.1.0"/version = "0.2.0"/; s/allow = \["example.com"\]/allow = ["example.com", "pypi.org"]/' "$SRC/agentos-package.toml"
+out="$(pk install "$SRC" --yes 2>&1)"
+check "an upgrade shows what it asks for now, against what you approved" grep -q 'installed now: e2e-pkg 0.1.0' <<<"$out"
+check "...the new host" grep -q '+ network      example.com, pypi.org' <<<"$out"
+check "...and the one it replaced" grep -q -- '- network      example.com$' <<<"$out"
+ln -s /etc/passwd "$SRC/link"
+check "a package with a symlink is refused" grep -q "symlinks aren't allowed" <<<"$(pk install "$SRC" --yes 2>&1)"
+rm "$SRC/link"
+mkdir -p "$WORK/pkgcfg/agents"
+printf 'run = ["true"]\n' > "$WORK/pkgcfg/agents/mine.toml"
+sed 's/name = "e2e-pkg"/name = "mine"/' "$SRC/agentos-package.toml" > "$SRC/other.toml"
+mv "$SRC/other.toml" "$SRC/agentos-package.toml"
+check "a package can't replace an agent file of yours" grep -q 'an agent file of yours with that name' <<<"$(pk install "$SRC" --yes 2>&1)"
+sed -i 's/name = "mine"/name = "claude"/' "$SRC/agentos-package.toml"
+check "...nor take the built-in agent's name" grep -q 'claude is built in' <<<"$(pk install "$SRC" --yes 2>&1)"
+check "agent uninstall removes the package and its agent" grep -q 'removed package e2e-pkg' <<<"$(pk uninstall e2e-pkg 2>&1)"
+check "...the files" test ! -e "$WORK/packages/e2e-pkg"
+check "...and the agent file" test ! -e "$WORK/pkgcfg/agents/e2e-pkg.toml"
+check "...but not an agent file of yours" test -f "$WORK/pkgcfg/agents/mine.toml"
+check "uninstalling what isn't installed says so" grep -q 'no package named e2e-pkg' <<<"$(pk uninstall e2e-pkg 2>&1)"
+unset AGENTOS_PACKAGES
+
 section "your MCP servers, through agentos (gateway)"
 if ! command -v python3 >/dev/null; then
   skip "the stand-in MCP server needs python3"

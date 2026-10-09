@@ -98,6 +98,7 @@ scripts/dev.sh shell
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
 | `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
+| `agent install DIR [--yes] [--digest HEX]` / `uninstall NAME` / `packages` | Agent packages: install one after reading what it asks for, remove it, list them and whether they're intact |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 | `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
@@ -498,6 +499,8 @@ Headless runs (`agent do "TASK"`) stream progress and journal every tool call, t
 run = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{task}"]   # headless
 interactive = ["codex"]                    # agent do --agent codex, with no task
 allow = ["api.openai.com"]                 # hosts it needs
+local = [11434]                            # ports on your loopback it uses (--local)
+ro = ["~/.gitconfig"]                      # files and folders it reads, read-only
 
 [secrets]                                  # brokered: the agent only sees placeholders
 OPENAI_API_KEY = "api.openai.com"          # (the value: your environment, or [secret_commands])
@@ -506,6 +509,40 @@ OPENAI_API_KEY = "api.openai.com"          # (the value: your environment, or [s
 An agent calling a model API other than Anthropic's or OpenAI's can list it before the first `[section]`, so its calls are metered and count against budgets: `models = [{ url = "https://openrouter.ai/api/v1/chat/completions", api = "openai" }]` (`api` is `anthropic`, `openai` or `gemini`; Gemini, Anthropic's and OpenAI's own APIs are built in; a trailing `*` in the URL matches any path under it).
 
 `agent do --agent codex "…"` runs it like Claude: same sandbox, transactions, outbox, allowlist and broker, and its own persistent home. `agent agents` lists what you have, and `agent = "codex"` in your config makes it the default. [examples/agents/](../examples/agents) has starting points for Codex, Gemini CLI and Aider. Codex and Gemini's flags are checked against their `--help`, but neither has been run end to end under agentos yet; Aider is an untested sketch.
+
+**Agent packages** are agents that come with what they run, and say what they need. A package is a folder with an `agentos-package.toml`:
+
+```toml
+[package]
+name = "local-aider"
+version = "0.1.0"
+description = "Aider, with a model on this machine"
+
+[agent]                                  # an agent file, as above
+run = ["{pkg}/bin/run", "{task}"]        # {pkg}: where the package is installed
+allow = ["pypi.org"]
+local = [11434]                          # a server on your machine (--local)
+ro = ["~/.gitconfig"]                    # files and folders it reads
+
+[agent.secrets]
+OPENAI_API_KEY = "api.openai.com"
+```
+
+```console
+$ agent install ./local-aider
+agent ▸ package local-aider 0.1.0: Aider, with a model on this machine
+  digest  3f2a9c1e84b07d21 (4 files, 12.3 kB)
+  it gets:
+    runs         {pkg}/bin/run {task}
+    network      pypi.org
+    secret       OPENAI_API_KEY → api.openai.com (a placeholder in the sandbox; …)
+    your machine 127.0.0.1:11434 (a server on your machine)
+agent ▸ install local-aider 0.1.0? [y/N] y
+✓ installed to ~/.local/share/agentos-packages/local-aider
+$ agent do --agent local-aider "…"
+```
+
+`[agent]` *is* the agent file `agent install` writes, so the list you read is exactly what is enforced; there is no separate declaration to drift from it. The files are copied to a folder the agent can only read, their hashes are recorded, and **before every run** agentos checks that neither the files nor the agent file have changed since you approved them. A package that asks for more later (an upgrade) shows the difference first (`+`/`-` against what you installed). Without a terminal, install needs `--yes`; `--digest HEX` makes sure it's the package you read. `agent packages` lists what's installed and whether it's intact; `agent uninstall NAME` removes a package and the agent file it wrote. A package can't contain symlinks, can't take the name of a built-in agent, and can't replace an agent file you wrote yourself. A package is a folder for now: there's no registry yet.
 
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 
@@ -548,6 +585,7 @@ src/control.rs   the agent's requests from inside (control socket), and what may
 src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway to yours
 src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refresh
 src/policy.rs    your rules (Cedar): answers given in advance
+src/packages.rs  agent packages: review, install, check before every run
 src/taint.rs     whether a task has read untrusted input
 src/held.rs      held tool calls (the outbox for MCP tools)
 src/main.rs      entry point and dispatch; the rest of the CLI, one file per concern:

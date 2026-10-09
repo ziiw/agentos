@@ -280,3 +280,87 @@ pub(crate) fn cmd_doctor(store: &Store) -> Result<i32> {
     }
     Ok(if checks.iter().any(|c| c.level == Level::Fail) { 1 } else { 0 })
 }
+
+/// `agent install DIR`: what the package asks for, then your answer.
+pub(crate) fn cmd_install(dir: PathBuf, yes: bool, digest: Option<String>) -> Result<i32> {
+    let home = home_dir()?;
+    let (out, err) = (Paint::stdout(), Paint::stderr());
+    let review = agentos::packages::review(&dir)?;
+    if let Some(wanted) = &digest {
+        let wanted = wanted.to_ascii_lowercase();
+        if wanted.len() < 8 || !review.digest.starts_with(&wanted) {
+            bail!("this package's digest is {}, not {wanted}: it isn't the one you meant to install", review.digest);
+        }
+    }
+    let size = |n: u64| if n >= 1_000_000 { format!("{:.1} MB", n as f64 / 1e6) } else { format!("{:.1} kB", n as f64 / 1e3) };
+    println!("{} {} {}{}", out.cyan("agent ▸ package"), out.bold(&review.name), review.version, if review.description.is_empty() { String::new() } else { format!(": {}", review.description) });
+    println!("  digest  {} ({}, {})", out.dim(&review.digest[..16]), plural(review.files.len(), "file"), size(review.bytes));
+    println!("  it gets:");
+    for line in &review.permissions {
+        println!("    {line}");
+    }
+    if let Some(old) = agentos::packages::installed(&home, &review.name) {
+        println!("  installed now: {} {}", old.name, old.version);
+        let (gone, new): (Vec<_>, Vec<_>) = (
+            old.permissions.iter().filter(|l| !review.permissions.contains(l)).collect(),
+            review.permissions.iter().filter(|l| !old.permissions.contains(l)).collect(),
+        );
+        if gone.is_empty() && new.is_empty() {
+            println!("    {}", out.dim("it asks for the same as before"));
+        }
+        for line in gone {
+            println!("    {} {line}", out.red("-"));
+        }
+        for line in new {
+            println!("    {} {line}", out.green("+"));
+        }
+    }
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("not installed: run it at a terminal to answer, or pass --yes once you've read the above (and --digest {} to pin it)", &review.digest[..16]);
+        }
+        eprint!("{} install {} {}? [y/N] ", err.cyan("agent ▸"), review.name, review.version);
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("not installed");
+            return Ok(1);
+        }
+    }
+    let target = agentos::packages::install(&review, &dir, &home, &agents_dir(&home))?;
+    println!("{} installed to {}\n  use it: agent do --agent {} \"…\"", out.green("✓"), display_path(&target), review.name);
+    Ok(0)
+}
+
+pub(crate) fn cmd_uninstall(name: &str) -> Result<i32> {
+    let home = home_dir()?;
+    agentos::packages::uninstall(name, &home, &agents_dir(&home))?;
+    println!("{} removed package {name} and its agent", Paint::stdout().green("✓"));
+    Ok(0)
+}
+
+pub(crate) fn cmd_packages() -> Result<i32> {
+    let (home, out) = (home_dir()?, Paint::stdout());
+    let all = agentos::packages::list(&home);
+    if all.is_empty() {
+        println!("no agent packages installed: agent install DIR");
+    }
+    let mut intact = true;
+    for (record, dir) in &all {
+        let problems = agentos::packages::problems(&dir, record);
+        let agent_file = agents_dir(&home).join(format!("{}.toml", record.name));
+        let agent_ok = std::fs::read(&agent_file).is_ok_and(|t| agentos::packages::sha256(&t) == record.agent_file_sha256);
+        let status = if problems.is_empty() && agent_ok {
+            out.green("intact")
+        } else {
+            intact = false;
+            out.red(format!("CHANGED: {}", if agent_ok { problems.join("; ") } else { "its agent file".to_string() }))
+        };
+        println!("{:<16} {:<10} {}  {}", record.name, record.version, out.dim(&record.digest[..8]), status);
+        let gets: Vec<String> = record.permissions.iter().skip(1).map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+        if !gets.is_empty() {
+            println!("    {}", out.dim(gets.join(" · ")));
+        }
+    }
+    Ok(if intact { 0 } else { 1 })
+}

@@ -42,6 +42,10 @@ pub struct Profile {
     pub output: Output,
     /// Model APIs it calls beyond the well-known ones, metered by the gateway.
     pub models: Vec<Endpoint>,
+    /// Ports on your loopback it uses (a local model server).
+    pub local: Vec<u16>,
+    /// Files and folders it reads, granted read-only.
+    pub ro: Vec<PathBuf>,
 }
 
 /// `task: None` opens an interactive session. Agents other than the
@@ -101,6 +105,9 @@ pub fn available(agents_dir: &Path) -> Vec<Available> {
 /// allow = ["api.openai.com"]                         # hosts it needs
 /// output = "text"                                    # or "claude-stream"
 ///
+/// local = [11434]                                    # ports on your loopback it may reach
+/// ro = ["~/.gitconfig"]                              # files and folders it reads
+///
 /// [secrets]                                          # brokered when set in your environment
 /// OPENAI_API_KEY = "api.openai.com"                  # header: authorization (Bearer)
 ///
@@ -116,35 +123,62 @@ pub fn available(agents_dir: &Path) -> Vec<Available> {
 /// ```
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentFile {
-    run: Vec<String>,
+pub struct AgentFile {
+    pub run: Vec<String>,
     #[serde(default)]
-    interactive: Option<Vec<String>>,
+    pub interactive: Option<Vec<String>>,
     #[serde(default)]
-    allow: Vec<String>,
+    pub allow: Vec<String>,
     #[serde(default)]
-    output: Option<String>,
+    pub output: Option<String>,
     #[serde(default)]
-    secrets: std::collections::BTreeMap<String, String>,
+    pub secrets: std::collections::BTreeMap<String, String>,
     #[serde(default)]
-    env: std::collections::BTreeMap<String, String>,
+    pub env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
-    pass_env: Vec<String>,
+    pub pass_env: Vec<String>,
     #[serde(default)]
-    models: Vec<ModelEntry>,
+    pub models: Vec<ModelEntry>,
+    /// Ports on your loopback it uses, at the same port in the sandbox.
+    #[serde(default)]
+    pub local: Vec<u16>,
+    /// Files and folders it reads (`~/…` is your home), read-only.
+    #[serde(default)]
+    pub ro: Vec<String>,
+    /// Set by `agent install` on the agent file it writes for a package: the
+    /// package is checked against what you approved before every run.
+    #[serde(default)]
+    pub package: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModelEntry {
-    url: String,
-    api: Api,
+pub struct ModelEntry {
+    pub url: String,
+    pub api: Api,
 }
 
 fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, home: &Path) -> Result<Profile> {
     let text = fs::read_to_string(file)?;
     let def: AgentFile = toml::from_str(&text).with_context(|| format!("{}: invalid agent definition", file.display()))?;
     crate::proxy::Allowlist::parse(&def.allow).with_context(|| format!("{}: allow", file.display()))?;
+    if let Some(package) = &def.package {
+        crate::packages::verify(package, file, home)?;
+    }
+    let ro = def
+        .ro
+        .iter()
+        .map(|entry| {
+            let path = match entry.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(entry),
+            };
+            if !path.is_absolute() {
+                bail!("{}: ro {entry}: use an absolute path or ~/…", file.display());
+            }
+            fs::canonicalize(&path).with_context(|| format!("{}: ro {entry}: no such file or directory", file.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let models = def
         .models
         .iter()
@@ -200,6 +234,8 @@ fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, hom
         expected_denials: Vec::new(),
         output,
         models,
+        local: def.local,
+        ro,
     })
 }
 
@@ -283,6 +319,8 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path, mcp: &[String]) ->
             .and_then(|base| Endpoint::parse(&format!("{}/v1/messages", base.trim_end_matches('/')), Api::Anthropic).ok())
             .into_iter()
             .collect(),
+        local: Vec::new(),
+        ro: Vec::new(),
     })
 }
 

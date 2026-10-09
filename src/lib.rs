@@ -19,6 +19,7 @@ pub mod limits;
 pub mod mcp;
 pub mod oauth;
 pub mod outbox;
+pub mod packages;
 pub mod policy;
 pub mod profiles;
 pub mod proxy;

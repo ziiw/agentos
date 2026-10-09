@@ -124,6 +124,24 @@ pub(crate) enum Command {
     },
     /// List the agents you can use with `agent do --agent NAME`
     Agents,
+    /// Install an agent package from a folder, after showing what it asks for
+    Install {
+        /// A folder with an agentos-package.toml
+        dir: PathBuf,
+        /// Install without asking (once you've read what it asks for)
+        #[arg(long)]
+        yes: bool,
+        /// Only install a package with this digest (a prefix of at least 8 is enough)
+        #[arg(long, value_name = "HEX")]
+        digest: Option<String>,
+    },
+    /// Remove an installed agent package
+    Uninstall {
+        /// The package, as `agent packages` lists it
+        name: String,
+    },
+    /// List the installed agent packages, and whether they're as you approved them
+    Packages,
     /// Review a project's .agentos.toml and let agentos apply it
     Trust {
         /// The file (default: the nearest .agentos.toml from here)

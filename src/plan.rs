@@ -291,7 +291,9 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         None => format!("{} (interactive)", profile.name),
     };
     let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
-    let local = local_ports(applied.local, &args.grants.local);
+    // What the agent's own definition asks for: servers on your machine, files to read.
+    let local = local_ports(applied.local.into_iter().chain(profile.local.iter().copied()).collect(), &args.grants.local);
+    args.grants.ro.extend(profile.ro.iter().cloned());
     let net = args.net.unwrap_or(profile.net);
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
     if net != Net::Proxy && !args.grants.allow.is_empty() {
