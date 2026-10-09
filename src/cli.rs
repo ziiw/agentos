@@ -160,6 +160,9 @@ pub(crate) enum Command {
         /// With --verify: the key you expect (its id, or a prefix of at least 8)
         #[arg(long, value_name = "KEY", requires = "verify")]
         trust: Option<String>,
+        /// With --verify: the value you expect a PCR to have, as N=HEX (more than once for several)
+        #[arg(long = "expect-pcr", value_name = "N=HEX", requires = "verify")]
+        expect_pcr: Vec<String>,
         /// Show this machine's receipt key
         #[arg(long, conflicts_with_all = ["verify", "task"])]
         public: bool,

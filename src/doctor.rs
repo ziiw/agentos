@@ -37,7 +37,7 @@ pub fn run(store_root: &Path) -> Vec<Check> {
         sandbox(store_root)
     };
     let userns = userns_policy(sandbox.level == Level::Ok);
-    vec![kernel(), user(), userns, store, sandbox, landlock(), seccomp(), limits(), display()]
+    vec![kernel(), user(), userns, store, sandbox, landlock(), seccomp(), limits(), display(), tpm()]
 }
 
 fn kernel() -> Check {
@@ -152,6 +152,14 @@ fn display() -> Check {
     match crate::display::xvfb() {
         Some(path) => check("display", Level::Ok, format!("--display: Xvfb at {}", path.display())),
         None => check("display", Level::Ok, "--display needs Xvfb (apt install xvfb, dnf install xorg-x11-server-Xvfb); nothing else does"),
+    }
+}
+
+fn tpm() -> Check {
+    // Only for `[journal] key = "tpm"`: nothing else needs it.
+    match crate::tpm::check() {
+        Ok(()) => check("tpm", Level::Ok, "[journal] key = \"tpm\": a TPM answers (tpm2-tools)"),
+        Err(why) => check("tpm", Level::Ok, format!("[journal] key = \"tpm\" needs tpm2-tools and a TPM ({})", why.lines().next().unwrap_or(""))),
     }
 }
 

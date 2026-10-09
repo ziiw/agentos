@@ -2667,6 +2667,76 @@ printf '[journal]\nwitness = "https://witness.example.com/receipts"\n' > .agento
 check "a project can't choose who hears about your tasks" test $? -eq 2
 rm -f .agentos.toml
 
+section "receipts signed by the TPM (a software one here)"
+if ! command -v swtpm >/dev/null || ! command -v tpm2_createprimary >/dev/null || ! command -v tpm2_pcrextend >/dev/null; then
+  skip "the TPM tests need swtpm and tpm2-tools"
+else
+  mkdir -p "$WORK/tpm"
+  tpm_up() {
+    swtpm socket --tpm2 --tpmstate dir="$WORK/tpm" --ctrl type=unixio,path="$WORK/tpm/sock.ctrl" --server type=unixio,path="$WORK/tpm/sock" --flags startup-clear >"$WORK/tpm/swtpm.log" 2>&1 &
+    SWTPM_PID=$!
+    for _ in $(seq 50); do [ -S "$WORK/tpm/sock" ] && break; sleep 0.1; done
+  }
+  tpm_up
+  export TPM2TOOLS_TCTI="swtpm:path=$WORK/tpm/sock"
+  if ! tpm2_getrandom --hex 4 >/dev/null 2>&1; then
+    skip "the software TPM doesn't answer (tpm2-tools needs its swtpm interface)"
+    kill $SWTPM_PID 2>/dev/null
+  else
+    reset_proj
+    cd "$PROJ"
+    printf '[journal]\nkey = "tpm"\npcrs = [0, 7]\n' > "$WORK/tpm/config.toml"
+    tp() { AGENTOS_CONFIG="$WORK/tpm/config.toml" "$AGENT" "$@"; }
+    # What the machine "booted": a measurement in PCR 7.
+    tpm2_pcrextend 7:sha256="$(printf 'secure boot policy' | sha256sum | cut -d' ' -f1)" >/dev/null 2>&1
+    PCR7="$(tpm2_pcrread sha256:7 2>/dev/null | sed -n 's/^ *7 : 0x\([0-9A-Fa-f]*\)$/\1/p' | tr 'A-F' 'a-f')"
+    check "(the TPM has a measurement in PCR 7)" test "${#PCR7}" -eq 64
+    out="$(tp run -- true 2>&1)"
+    T="$(latest_task_dir)"
+    check "a task's receipt is signed by the TPM's key" grep -q '"alg": "ecdsa-p256"' "${T}receipt.json"
+    check "...and carries the PCRs you asked for" grep -q "\"7\": \"$PCR7\"" "${T}receipt.json"
+    check "...which the journal notes too" grep -Eq '"kind":"receipt.signed".*"alg":"ecdsa-p256"' "${T}events.jsonl"
+    check "the private key never left the TPM: the store holds it only wrapped" bash -c '! grep -q "BEGIN" "$1"/identity/tpm/* 2>/dev/null' _ "$AGENTOS_HOME"
+    out="$(tp attest --verify "${T}receipt.json" 2>&1)"
+    check "agent attest --verify checks it, and knows the key as the TPM's" grep -q "signed by key [0-9a-f]* (this machine's TPM) · ecdsa-p256" <<<"$out"
+    check "...and shows the PCRs" grep -q '0=0000000000.* 7=' <<<"$out"
+    check "agent attest --public names the TPM's key" grep -Eq '^[0-9a-f]{16}  ecdsa-p256  04[0-9a-f]{128}$' <<<"$(tp attest --public 2>&1)"
+    check "...with --expect-pcr, the state you expect" tp attest --verify "${T}receipt.json" --expect-pcr "7=$PCR7"
+    check "...and not another" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" attest --verify "${T}receipt.json" --expect-pcr "7=$(printf '0%.0s' $(seq 64))"
+    check "...nor a PCR the receipt doesn't carry" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" attest --verify "${T}receipt.json" --expect-pcr "4=$PCR7"
+    check "a receipt is checked without any TPM" bash -c 'TPM2TOOLS_TCTI=none "$@" 2>&1 | grep -q "signed by key"' _ "$AGENT" attest --verify "${T}receipt.json"
+    sed 's/"events": \([0-9]*\)/"events": 99/' "${T}receipt.json" > "$WORK/tpm/forged.json"
+    check "...a changed receipt isn't accepted" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" attest --verify "$WORK/tpm/forged.json"
+    python3 - "${T}receipt.json" "$WORK/tpm/pcr-forged.json" <<'PY' 2>/dev/null
+import json, sys
+r = json.load(open(sys.argv[1]))
+r["receipt"]["pcrs"]["7"] = "00" * 32
+json.dump(r, open(sys.argv[2], "w"))
+PY
+    check "...nor one whose PCRs were rewritten" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" attest --verify "$WORK/tpm/pcr-forged.json"
+    check "a second task signs with the same key" test "$(tp run -- true >/dev/null 2>&1; grep -o '"key": "[0-9a-f]*"' "$(latest_task_dir)receipt.json")" = "$(grep -o '"key": "[0-9a-f]*"' "${T}receipt.json")"
+    # A copy of the store, on a machine whose TPM is another, can't sign: a fresh software TPM has other seeds.
+    kill $SWTPM_PID 2>/dev/null; wait $SWTPM_PID 2>/dev/null
+    mv "$WORK/tpm" "$WORK/tpm-first"
+    mkdir -p "$WORK/tpm" && cp "$WORK/tpm-first/config.toml" "$WORK/tpm/"
+    tpm_up
+    out="$(tp attest "$(basename "$T")" 2>&1)"
+    check "another TPM can't use the key blobs: nothing is signed" grep -qi 'tpm2_load\|load the signing key' <<<"$out"
+    check "a task then has no receipt, and says so" grep -q 'no receipt for this task' <<<"$(tp run -- true 2>&1)"
+    kill $SWTPM_PID 2>/dev/null; wait $SWTPM_PID 2>/dev/null
+    unset TPM2TOOLS_TCTI
+    # Settings are yours.
+    printf '[journal]\nkey = "yubikey"\n' > "$WORK/tpm/bad.toml"
+    check "a key has to be file or tpm" grep -q 'receipts are signed with a "file" key or a "tpm" key' <<<"$(AGENTOS_CONFIG="$WORK/tpm/bad.toml" "$AGENT" attest --public 2>&1)"
+    printf '[journal]\npcrs = [24]\n' > "$WORK/tpm/bad.toml"
+    check "...and a PCR has to exist" grep -q "PCR 24 doesn't exist" <<<"$(AGENTOS_CONFIG="$WORK/tpm/bad.toml" "$AGENT" attest --public 2>&1)"
+    printf '[journal]\nkey = "tpm"\n' > .agentos.toml
+    "$AGENT" trust >/dev/null 2>&1
+    check "a project can't choose how your receipts are signed" test $? -eq 2
+    rm -f .agentos.toml
+  fi
+fi
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7

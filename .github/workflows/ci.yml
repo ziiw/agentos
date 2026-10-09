@@ -41,8 +41,12 @@ jobs:
       - name: agent doctor
         run: agent doctor
 
-      - name: A virtual display for the --display tests, and a bus for the D-Bus ones
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-utils xdotool dbus-daemon
+      - name: A virtual display for the --display tests, a bus for the D-Bus ones, a software TPM for the receipts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb x11-utils xdotool dbus-daemon
+          # (the TPM tests skip themselves if these aren't there; the package for swtpm's TCTI is named differently across releases)
+          sudo apt-get install -y -qq swtpm swtpm-tools tpm2-tools libtss2-tcti-swtpm0t64 || sudo apt-get install -y -qq swtpm swtpm-tools tpm2-tools libtss2-tcti-swtpm0 || true
 
       - name: End-to-end tests
         run: REQUIRE_LANDLOCK=1 bash tests/e2e.sh
@@ -134,6 +138,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           mkdir -p /tmp/e2e && chmod 1777 /tmp/e2e
           docker run --rm --privileged -v "$PWD:/src:ro" -v /tmp/e2e:/e2e agentos:ci bash -c '
+            dnf -y install swtpm swtpm-tools >/dev/null 2>&1 || true
             cat /usr/lib/os-release | grep PRETTY_NAME
             agent --version
             useradd -m tester

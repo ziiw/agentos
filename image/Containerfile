@@ -27,9 +27,10 @@ FROM quay.io/fedora/fedora-bootc:42
 # does nothing on a machine that has none.
 # Xvfb and xdotool are for `agent do --display`: a screen of its own for an agent
 # that drives a graphical program, which you can watch and act on. The three small
-# X tools are what the end-to-end tests draw with.
+# X tools are what the end-to-end tests draw with. tpm2-tools lets receipts be signed
+# by the machine's TPM ([journal] key = "tpm" in your config).
 RUN dnf -y install git-core curl python3 util-linux util-linux-script cloud-init \
-        xorg-x11-server-Xvfb xdotool xmessage xwininfo xev xdpyinfo && dnf clean all
+        xorg-x11-server-Xvfb xdotool xmessage xwininfo xev xdpyinfo tpm2-tools && dnf clean all
 
 COPY --from=build /src/target/release/agent /usr/bin/agent
 COPY image/rootfs/ /

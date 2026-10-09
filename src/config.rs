@@ -131,6 +131,12 @@ struct RegistrySection {
 struct JournalSection {
     #[serde(default)]
     witness: Option<String>,
+    /// "file" (default) or "tpm": which key signs receipts.
+    #[serde(default)]
+    key: Option<String>,
+    /// TPM PCRs (sha256) to put in each receipt.
+    #[serde(default)]
+    pcrs: Vec<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -234,6 +240,9 @@ pub struct Settings {
     pub agent: Option<String>,
     /// Where finished tasks' signed receipts are posted.
     pub witness: Option<String>,
+    /// Which key signs a task's receipt, and the TPM PCRs it carries.
+    pub receipt_key: crate::attest::KeyKind,
+    pub receipt_pcrs: Vec<u32>,
     /// The index `agent install NAME` and `agent search` read.
     pub registry: Option<String>,
     /// How people sign in to agentd's console with your identity provider, if they can.
@@ -375,7 +384,7 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         s.agent = file.agent.clone();
     }
     // A cloned repo must never choose who hears about your tasks.
-    if project.is_some() && file.journal.witness.is_some() {
+    if project.is_some() && (file.journal.witness.is_some() || file.journal.key.is_some() || !file.journal.pcrs.is_empty()) {
         bail!("{shown}: [journal] only belongs in your own config, never in a project's");
     }
     // …nor which tasks agentd starts on its own.
@@ -424,6 +433,18 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
                 s.registry_keys.push(key);
             }
         }
+    }
+    if let Some(kind) = &file.journal.key {
+        s.receipt_key = crate::attest::KeyKind::parse(kind).map_err(|e| anyhow::anyhow!("{shown}: [journal] key: {e}"))?;
+    }
+    if !file.journal.pcrs.is_empty() {
+        if let Some(bad) = file.journal.pcrs.iter().find(|i| **i > 23) {
+            bail!("{shown}: [journal] pcrs: PCR {bad} doesn't exist (0 to 23)");
+        }
+        let mut pcrs = file.journal.pcrs.clone();
+        pcrs.sort_unstable();
+        pcrs.dedup();
+        s.receipt_pcrs = pcrs;
     }
     if let Some(url) = &file.journal.witness {
         crate::attest::valid_witness(url).map_err(|e| anyhow::anyhow!("{shown}: [journal] witness: {e}"))?;

@@ -107,6 +107,14 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The bytes a hex string spells; none if it isn't hex.
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 || !s.is_ascii() {
+        return None;
+    }
+    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()).collect()
+}
+
 /// Standard base64, with padding (RFC 4648).
 pub fn base64(data: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -123,6 +131,15 @@ pub fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_both_ways() {
+        assert_eq!(unhex(&hex(&[0, 1, 0xab, 0xff])), Some(vec![0, 1, 0xab, 0xff]));
+        for bad in ["a", "zz", "0x12", "é1", "12 "] {
+            assert_eq!(unhex(bad), None, "{bad:?}");
+        }
+        assert_eq!(unhex(""), Some(vec![]));
+    }
 
     #[test]
     fn base64_matches_the_rfc_vectors() {

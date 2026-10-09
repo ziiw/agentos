@@ -32,6 +32,7 @@ pub mod sandbox;
 pub mod schedule;
 pub mod store;
 pub mod taint;
+pub mod tpm;
 pub mod users;
 pub mod util;
 pub mod vault;

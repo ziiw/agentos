@@ -597,10 +597,18 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         json!({ "exit_code": exit_code, "duration_ms": ended - task.meta.started_at_ms, "changes": summary }),
     )?;
     // Sign where the journal ended up, and tell your witness if you have one.
-    match attest::Identity::load_or_create(store.root()).and_then(|id| id.issue(task.id(), &journal)) {
+    let signing = attest::Identity::open(store.root(), plan.receipt_key)
+        .and_then(|id| agentos::tpm::pcrs(&plan.receipt_pcrs).and_then(|pcrs| id.issue_with(task.id(), &journal, pcrs)));
+    match signing {
         Ok(signed) => {
             let _ = fs::write(attest::receipt_path(&task.dir), serde_json::to_vec_pretty(&signed).unwrap_or_default());
             let mut data = json!({ "head": signed.receipt.head, "events": signed.receipt.events, "key": attest::key_id(&signed.receipt.key) });
+            if signed.receipt.alg != "ed25519" {
+                data["alg"] = json!(signed.receipt.alg);
+            }
+            if !signed.receipt.pcrs.is_empty() {
+                data["pcrs"] = json!(signed.receipt.pcrs.keys().collect::<Vec<_>>());
+            }
             if let Some(url) = &plan.witness {
                 data["witness"] = match attest::witness(url, &signed) {
                     Ok(status) if (200..300).contains(&status) => json!({ "url": url, "status": status }),

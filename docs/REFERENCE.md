@@ -100,7 +100,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
 | `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
 | `agent screen [TASK] [-o FILE]` | Save a PNG of a task's screen (a task started with `--display`), now or as it ended |
-| `agent attest [TASK]` / `--verify FILE [--journal FILE] [--trust KEY]` / `--public` | Sign a task's journal head (a receipt), check a receipt, show this machine's receipt key |
+| `agent attest [TASK]` / `--verify FILE [--journal FILE] [--trust KEY] [--expect-pcr N=HEX]` / `--public` | Sign a task's journal head (a receipt), check a receipt (and the machine state it carries), show this machine's receipt key |
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent install DIR\|NAME [--yes] [--digest HEX]` / `uninstall NAME` / `packages` / `search [TEXT]` | Agent packages: install one (from a folder, or by name from your registry) after reading what it asks for, remove it, list them and whether they're intact, search your registry |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
@@ -466,7 +466,8 @@ $ agent attest --verify receipt.json --journal events.jsonl
 - **The key** is an Ed25519 key made on first use in the task store, which no sandbox can see. `agent attest --public` shows its id and public key. A receipt names its key but can't say whose it is: compare it with the one you trust (`--trust KEY`).
 - **A witness** makes the receipt outlive your machine. With `[journal] witness = "https://witness.example/receipts"` in your config, every finished task's signed receipt is posted there (a JSON POST; https, or this machine for testing). Rewriting a task's history later then means rewriting the witness's copy too. A witness that can't be reached is a warning.
 - `agent attest [TASK]` signs a task's journal as it stands now (after you've committed, say) and prints the receipt; it's posted to the witness too.
-- Not yet: keeping the key in a TPM, so even root on your machine can't sign for it.
+- **A TPM can hold the key.** With `[journal] key = "tpm"` (your config only), receipts are signed by an ECDSA P-256 key the machine's TPM made and holds: its private half leaves the TPM only wrapped by it, so a copy of the task store (a backup, a stolen disk, another machine) can't sign anything, which a file key can. It needs `tpm2-tools` and a TPM your user may open (a user in the `tss` group, with `/dev/tpmrm0`); `TPM2TOOLS_TCTI` points the tools at a software TPM for testing. Checking a receipt needs no TPM at all: it carries the public key (`agent attest --public` shows this machine's, with its algorithm). If the TPM isn't there when a task ends, the task has no receipt and says why.
+- **What the machine booted** can ride in the receipt: `[journal] pcrs = [0, 2, 4, 7]` puts those PCRs (sha256) as the TPM held them when the task ended, signed with the rest. They show the state the firmware, boot loader and kernel measured. They mean something only if you know what good values are, so pin them when you check: `agent attest --verify receipt.json --expect-pcr 7=589f…` is ✗ unless PCR 7 is what you said. (A software that can talk to the TPM can extend a PCR but not unmake a measurement; PCR values prove what was measured into them since boot, not that nothing else was.)
 
 ## Budgets
 
@@ -685,6 +686,8 @@ task = "These arrived: {event}. Sort them."
 
 [journal]                             # your file only: finished tasks' signed receipts go here
 witness = "https://witness.example/receipts"
+key = "tpm"                           # sign them with a key your TPM holds (default "file")
+pcrs = [7]                            # and carry these TPM PCRs
 
 [registry]                            # your file only: where `agent install NAME` looks
 url = "https://agents.example.com/index.json"
@@ -873,6 +876,7 @@ src/sandbox.rs   namespaces, root assembly, Landlock, exec
 src/changes.rs   reading/committing/rolling back overlay transactions
 src/journal.rs   hash-chained event log
 src/attest.rs    receipts: the journal head, signed; the witness
+src/tpm.rs       the machine's TPM through tpm2-tools: a signing key it holds, PCRs
 src/users.rs     people besides you for agentd's console: tokens and roles, and sign-in sessions
 src/oidc.rs      signing in with your identity provider (OpenID Connect): the flow, the ID token's checks, roles
 src/schedule.rs  tasks agentd starts on a timer, and what it remembers of them

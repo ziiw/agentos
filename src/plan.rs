@@ -68,6 +68,9 @@ pub(crate) struct Plan {
     pub(crate) hold: Vec<String>,
     /// Where the task's signed receipt is posted when it ends.
     pub(crate) witness: Option<String>,
+    /// Which key signs the receipt, and the TPM PCRs it carries.
+    pub(crate) receipt_key: agentos::attest::KeyKind,
+    pub(crate) receipt_pcrs: Vec<u32>,
     /// A virtual screen of its own, and its size.
     pub(crate) display: Option<(u32, u32)>,
 }
@@ -75,6 +78,8 @@ pub(crate) struct Plan {
 /// What the config files add to a task beyond its grants.
 pub(crate) struct Applied {
     pub(crate) witness: Option<String>,
+    pub(crate) receipt_key: agentos::attest::KeyKind,
+    pub(crate) receipt_pcrs: Vec<u32>,
     pub(crate) allow: Vec<String>,
     pub(crate) proxy: Option<String>,
     pub(crate) no_proxy: Vec<String>,
@@ -101,7 +106,7 @@ pub(crate) fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Appl
     settings.allow.extend(approvals::remembered(store.root(), &approvals::project_root(&cwd, &home))?);
     grants.ro.extend(settings.ro);
     grants.hide.extend(settings.hide);
-    Ok(Applied { witness: settings.witness, allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, local: settings.local, hold: settings.hold, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
+    Ok(Applied { witness: settings.witness, receipt_key: settings.receipt_key, receipt_pcrs: settings.receipt_pcrs, allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, local: settings.local, hold: settings.hold, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
 }
 
 /// The proxy the egress proxy goes through: your config's, else the one in
@@ -388,6 +393,8 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             local,
             hold,
             witness: applied.witness,
+            receipt_key: applied.receipt_key,
+            receipt_pcrs: applied.receipt_pcrs,
             display: screen,
         },
     )
@@ -454,6 +461,8 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             local,
             hold,
             witness: applied.witness,
+            receipt_key: applied.receipt_key,
+            receipt_pcrs: applied.receipt_pcrs,
             display: screen,
         },
     )?;

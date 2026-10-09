@@ -398,11 +398,13 @@ pub(crate) fn cmd_packages() -> Result<i32> {
 }
 
 /// `agent attest`: sign a task's journal as it stands, or check a receipt.
-pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<PathBuf>, journal: Option<PathBuf>, trust: Option<String>, public: bool) -> Result<i32> {
+pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<PathBuf>, journal: Option<PathBuf>, trust: Option<String>, expect_pcr: Vec<String>, public: bool) -> Result<i32> {
     let out = Paint::stdout();
+    let (cwd, home) = (std::env::current_dir()?, home_dir()?);
+    let settings = config::load(store.root(), &cwd, &home)?;
     if public {
-        let id = attest::Identity::load_or_create(store.root())?;
-        println!("{}  {}", id.key_id(), id.public_hex());
+        let id = attest::Identity::open(store.root(), settings.receipt_key)?;
+        println!("{}  {}  {}", id.key_id(), id.alg(), id.public_hex());
         return Ok(0);
     }
     if let Some(file) = verify {
@@ -414,10 +416,19 @@ pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<P
             println!("{} {why}", out.red("✗"));
             return Ok(1);
         }
-        let ours = attest::Identity::load_or_create(store.root()).map(|i| i.key_id()).ok();
-        let whose = if ours.as_deref() == Some(key.as_str()) { " (this machine's)" } else { "" };
+        // Whose key it is: the one this machine signs with (a TPM key only if asked for and answering).
+        let ours = attest::Identity::open(store.root(), attest::KeyKind::File).map(|i| i.key_id()).ok();
+        let tpm_key = (settings.receipt_key == attest::KeyKind::Tpm).then(|| attest::Identity::open(store.root(), attest::KeyKind::Tpm).map(|i| i.key_id()).ok()).flatten();
+        let whose = if ours.as_deref() == Some(key.as_str()) {
+            " (this machine's)"
+        } else if tpm_key.as_deref() == Some(key.as_str()) {
+            " (this machine's TPM)"
+        } else {
+            ""
+        };
+        let how = if r.alg == "ed25519" { String::new() } else { format!(" · {}", r.alg) };
         println!(
-            "{} signed by key {key}{whose} · task {} · journal head {} ({} events) · {}",
+            "{} signed by key {key}{whose}{how} · task {} · journal head {} ({} events) · {}",
             out.green("✓"),
             r.task,
             &r.head[..12],
@@ -433,6 +444,27 @@ pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<P
             }
             None => println!("{}", out.dim("whose key that is, only you can say: compare it with `agent attest --public` on that machine (or pass --trust KEY)")),
         }
+        if !r.pcrs.is_empty() {
+            println!("  {}", out.dim(format!("the TPM's PCRs when it ended: {}", r.pcrs.iter().map(|(i, v)| format!("{i}={}", &v[..12])).collect::<Vec<_>>().join(" "))));
+        }
+        for want in &expect_pcr {
+            let Some((index, value)) = want.split_once('=').and_then(|(i, v)| Some((i.trim().parse::<u32>().ok()?, v.trim().trim_start_matches("0x").to_ascii_lowercase()))) else {
+                println!("{} --expect-pcr {want:?}: expected N=HEX, like 7=589f…", out.red("✗"));
+                code = 1;
+                continue;
+            };
+            match r.pcrs.get(&index) {
+                Some(got) if *got == value => println!("{} PCR {index} is what you expect", out.green("✓")),
+                Some(got) => {
+                    println!("{} PCR {index} is {got}, not {value}: the machine was not in the state you expect", out.red("✗"));
+                    code = 1;
+                }
+                None => {
+                    println!("{} the receipt doesn't carry PCR {index}", out.red("✗"));
+                    code = 1;
+                }
+            }
+        }
         if let Some(path) = journal {
             match signed.check_journal(&Journal::new(path)) {
                 Ok(0) => println!("{} the journal ends exactly where the receipt says", out.green("✓")),
@@ -446,10 +478,10 @@ pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<P
         return Ok(code);
     }
     let task = store.resolve(selector)?;
-    let signed = attest::Identity::load_or_create(store.root())?.issue(task.id(), &task.journal())?;
+    let pcrs = agentos::tpm::pcrs(&settings.receipt_pcrs)?;
+    let signed = attest::Identity::open(store.root(), settings.receipt_key)?.issue_with(task.id(), &task.journal(), pcrs)?;
     fs::write(attest::receipt_path(&task.dir), serde_json::to_vec_pretty(&signed)?)?;
-    let (cwd, home) = (std::env::current_dir()?, home_dir()?);
-    if let Some(url) = config::load(store.root(), &cwd, &home)?.witness {
+    if let Some(url) = settings.witness {
         match attest::witness(&url, &signed) {
             Ok(status) => eprintln!("{} posted to the witness {url} ({status})", out.dim("receipt")),
             Err(e) => eprintln!("{} couldn't reach the witness {url}: {e}", Paint::stderr().yellow("agent: warning:")),
