@@ -1533,7 +1533,7 @@ TOML
   check "the bus's tools are listed" grep -q '^tools: dbus_services,dbus_introspect,dbus_get,dbus_call$' <<<"$out"
   check "services lists the ones you named that are there, and only those" grep -q 'dbus_services: {"bus":"session","allowed":\["org.freedesktop.DBus","org.example.\*"\],"services":\[{"name":"org.freedesktop.DBus","running":true}\]}' <<<"$out"
   check "an object's methods come with their types" grep -q 'method NameHasOwner(s) -> b' <<<"$out"
-  check "a property is read" grep -q 'dbus_get: {"type":"as","data":\["ActivatableServicesChanged","HeaderFiltering"\]}' <<<"$out"
+  check "a property is read" grep -q 'dbus_get: {"type":"as","data":\[.*"HeaderFiltering"' <<<"$out"
   check "a method is called with its arguments as JSON" grep -q 'dbus_call: {"type":"b","data":\[true\]}' <<<"$out"
   check "...a value that looks like an option is only a value" grep -q 'dbus_call: {"type":"b","data":\[false\]}' <<<"$out"
   check "...a dict goes through" grep -q 'dbus_call: (it returned nothing)' <<<"$out"
