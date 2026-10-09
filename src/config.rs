@@ -14,6 +14,8 @@
 //! allow = ["@pypi", "api.github.com"]     # presets: @pypi @npm @crates @github @go
 //! proxy = "http://user:pw@proxy.corp:3128" # your file only: reach the internet through this
 //! no_proxy = ["*.corp.example"]           # proxy (default: HTTPS_PROXY and NO_PROXY); "" = direct
+//! hold = ["api.github.com"]               # reachable, but writes (POST, PUT, PATCH, DELETE) wait for
+//!                                         # your review: sent when you commit
 //! local = [11434]                         # your file only: servers on your loopback agents may
 //!                                         # reach at the same port (a local model server)
 //!
@@ -133,6 +135,8 @@ struct Network {
     no_proxy: Vec<String>,
     #[serde(default)]
     local: Vec<u16>,
+    #[serde(default)]
+    hold: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -154,6 +158,8 @@ pub struct Settings {
     pub no_proxy: Vec<String>,
     /// Ports on your loopback that tasks may reach (a local model server).
     pub local: Vec<u16>,
+    /// Hosts whose writes wait for your review (and which tasks may reach).
+    pub hold: Vec<String>,
     /// Existing paths only: a pattern like `.env` needn't exist everywhere.
     pub hide: Vec<PathBuf>,
     pub ro: Vec<PathBuf>,
@@ -264,6 +270,11 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         bail!("{shown}: [network] local: 0 isn't a port");
     }
     s.local.extend(file.network.local);
+    // Holding only restricts, so a project may ask for it too.
+    for host in &file.network.hold {
+        crate::held::valid_host(host).map_err(|e| anyhow::anyhow!("{shown}: [network] hold: {e}"))?;
+    }
+    s.hold.extend(file.network.hold.iter().map(|h| h.to_ascii_lowercase()));
     if let Some(url) = file.network.proxy.as_deref().filter(|u| !u.is_empty()) {
         crate::proxy::Upstream::parse(url, &file.network.no_proxy).with_context(|| format!("{shown}: [network] proxy"))?;
     }

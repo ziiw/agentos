@@ -67,26 +67,53 @@ impl Secret {
         }
     }
 
+    /// Whether this is the header, holding exactly the placeholder (or
+    /// `Bearer <placeholder>`): `Some(bearer)` if so.
+    fn carries(&self, name: &str, value: &str) -> Option<bool> {
+        if !name.eq_ignore_ascii_case(&self.header) {
+            None
+        } else if value == self.placeholder {
+            Some(false)
+        } else if value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")) == Some(&self.placeholder) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     /// Replaces the placeholder in this header, if this is the header and it
     /// holds exactly the placeholder (or `Bearer <placeholder>`).
     fn inject(&self, name: &str, value: &mut String) -> bool {
-        if !name.eq_ignore_ascii_case(&self.header) {
-            return false;
-        }
-        if *value == self.placeholder {
-            *value = self.value.clone();
-        } else if value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")) == Some(&self.placeholder) {
-            *value = format!("Bearer {}", self.value);
-        } else {
-            return false;
+        match self.carries(name, value) {
+            Some(false) => *value = self.value.clone(),
+            Some(true) => *value = format!("Bearer {}", self.value),
+            None => return false,
         }
         true
     }
 }
 
+/// A write the agent made to a host whose writes are held for review.
+pub struct HeldRequest {
+    pub method: String,
+    pub host: String,
+    /// Path and query.
+    pub target: String,
+    /// Without framing; a credential's header is blank (see `credentials`).
+    pub headers: Vec<(String, String)>,
+    /// (index into `headers`, the variable it came from, whether it was `Bearer …`)
+    pub credentials: Vec<(usize, String, bool)>,
+    pub body: Vec<u8>,
+}
+
+/// Queues a request instead of sending it; says where it stands in the queue.
+pub type HoldFn = Arc<dyn Fn(HeldRequest) -> std::result::Result<u32, String> + Send + Sync>;
+
 /// The per-task CA and TLS settings for brokered hosts.
 pub struct Broker {
     secrets: Vec<Secret>,
+    /// Hosts whose writes are held, and how.
+    hold: Option<(Vec<String>, HoldFn)>,
     /// An agent's sealed login, and the hosts it's used with.
     vault: Option<(Arc<Vault>, Vec<String>)>,
     /// Meters model calls on the hosts relayed here.
@@ -99,7 +126,12 @@ pub struct Broker {
 impl Broker {
     /// `meter`: the task's model gateway, and the hosts to relay for it even
     /// without a credential to add (model APIs, when there's a budget).
-    pub fn new(secrets: Vec<Secret>, vault: Option<(Arc<Vault>, Vec<String>)>, meter: Option<(Arc<Meter>, Vec<String>)>) -> Result<Broker> {
+    pub fn new(
+        secrets: Vec<Secret>,
+        vault: Option<(Arc<Vault>, Vec<String>)>,
+        meter: Option<(Arc<Meter>, Vec<String>)>,
+        hold: Option<(Vec<String>, HoldFn)>,
+    ) -> Result<Broker> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let ca_key = KeyPair::generate()?;
         let mut ca = CertificateParams::new(Vec::<String>::new())?;
@@ -111,7 +143,8 @@ impl Broker {
         let mut servers = HashMap::new();
         let vault_hosts = vault.iter().flat_map(|(_, hosts)| hosts.iter().cloned());
         let metered_hosts = meter.iter().flat_map(|(_, hosts)| hosts.iter().cloned());
-        for host in secrets.iter().map(|s| s.host.clone()).chain(vault_hosts).chain(metered_hosts) {
+        let held_hosts = hold.iter().flat_map(|(hosts, _)| hosts.iter().map(|h| h.to_ascii_lowercase()));
+        for host in secrets.iter().map(|s| s.host.clone()).chain(vault_hosts).chain(metered_hosts).chain(held_hosts) {
             if servers.contains_key(&host) {
                 continue;
             }
@@ -138,7 +171,7 @@ impl Broker {
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let meter = meter.map(|(m, _)| m);
-        Ok(Broker { secrets, vault, meter, servers, client: Arc::new(client), ca_pem: ca_cert.pem() })
+        Ok(Broker { secrets, hold, vault, meter, servers, client: Arc::new(client), ca_pem: ca_cert.pem() })
     }
 
     /// The CA certificate (public) the sandbox must trust.
@@ -159,7 +192,8 @@ impl Broker {
         let remote = StreamOwned::new(ClientConnection::new(self.client.clone(), name)?, upstream);
         let secrets: Vec<&Secret> = self.secrets.iter().filter(|s| s.host == host).collect();
         let vault = self.vault.as_ref().filter(|(_, hosts)| hosts.iter().any(|h| h == host)).map(|(v, _)| v.as_ref());
-        relay_http(agent, remote, host, &secrets, vault, self.meter.as_deref())
+        let hold = self.hold.as_ref().filter(|(hosts, _)| hosts.iter().any(|h| h.eq_ignore_ascii_case(host))).map(|(_, f)| f);
+        relay_http_with(agent, remote, host, &secrets, vault, self.meter.as_deref(), hold)
     }
 }
 
@@ -398,9 +432,7 @@ fn response_body(method: &str, status: u16, h: &Head) -> Body {
     }
 }
 
-/// HTTP/1.1, one exchange at a time: parse each request head (to inject
-/// credentials and spot model calls) and frame bodies so the next head can
-/// be found; stream the responses back as they arrive.
+#[cfg(test)]
 fn relay_http<A: Read + Write, B: Read + Write>(
     agent: A,
     remote: B,
@@ -409,12 +441,98 @@ fn relay_http<A: Read + Write, B: Read + Write>(
     vault: Option<&Vault>,
     meter: Option<&Meter>,
 ) -> Result<(u64, u64, u64, u64)> {
+    relay_http_with(agent, remote, host, secrets, vault, meter, None)
+}
+
+/// Writes (POST, PUT, PATCH, DELETE) to a host whose writes are held.
+fn is_write(method: &str) -> bool {
+    ["POST", "PUT", "PATCH", "DELETE"].iter().any(|m| method.eq_ignore_ascii_case(m))
+}
+
+/// Headers that frame a message or belong to one connection: not part of what was asked.
+fn is_framing(name: &str) -> bool {
+    ["host", "content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade", "expect", "proxy-connection"]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// HTTP/1.1, one exchange at a time: parse each request head (to inject
+/// credentials and spot model calls) and frame bodies so the next head can
+/// be found; stream the responses back as they arrive. With `hold`, writes
+/// aren't sent: they're queued, and answered with a 202.
+fn relay_http_with<A: Read + Write, B: Read + Write>(
+    agent: A,
+    remote: B,
+    host: &str,
+    secrets: &[&Secret],
+    vault: Option<&Vault>,
+    meter: Option<&Meter>,
+    hold: Option<&HoldFn>,
+) -> Result<(u64, u64, u64, u64)> {
     let mut agent = BufReader::new(agent);
     let mut remote = BufReader::new(remote);
     let (mut up, mut down, mut requests, mut injected) = (0, 0, 0, 0);
     let result = (|| -> io::Result<()> {
         while let Some(raw) = read_head(&mut agent)? {
             let mut req = Head::parse(&raw);
+            // A write to a host whose writes are held: queued with the
+            // credential left out (it's added when the request is sent, not
+            // before), never sent now. Model APIs and logins are not held.
+            if let Some(hold) = hold.filter(|_| vault.is_none() && is_write(req.start.split_whitespace().next().unwrap_or_default())) {
+                let mut parts = req.start.split_whitespace();
+                let (method, target) = (parts.next().unwrap_or_default().to_string(), parts.next().unwrap_or("/").to_string());
+                let path = target.split('?').next().unwrap_or_default();
+                if meter.is_none_or(|m| m.endpoint(host, path).is_none()) {
+                    if req.has_token("expect", "100-continue") {
+                        agent.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                        agent.get_mut().flush()?;
+                    }
+                    let close = req.has_token("connection", "close");
+                    let reply = |agent: &mut BufReader<A>, status: &str, body: String| -> io::Result<u64> {
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nX-Agentos-Held: 1\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        agent.get_mut().write_all(resp.as_bytes())?;
+                        agent.get_mut().flush()?;
+                        Ok(resp.len() as u64)
+                    };
+                    let payload = match read_body(request_body(&req), &mut agent) {
+                        Ok(p) => p,
+                        Err(e) if e.kind() == io::ErrorKind::Other => {
+                            let body = format!("{{\"agentos\":\"refused\",\"message\":\"this host's writes are held for the user's review, and this one is too large to hold (1 MiB)\"}}");
+                            down += reply(&mut agent, "413 Payload Too Large", body)?;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    let mut headers: Vec<(String, String)> = req.headers.iter().filter(|(n, _)| !is_framing(n)).cloned().collect();
+                    let mut credentials = Vec::new();
+                    for (i, (name, value)) in headers.iter_mut().enumerate() {
+                        if let Some((s, bearer)) = secrets.iter().find_map(|s| s.carries(name, value).map(|b| (s, b))) {
+                            credentials.push((i, s.env.clone(), bearer));
+                            value.clear();
+                        }
+                    }
+                    up += raw.len() as u64 + payload.len() as u64;
+                    let held = HeldRequest { method: method.clone(), host: host.to_string(), target, headers, credentials, body: payload };
+                    let answer = match hold(held) {
+                        Ok(n) => (
+                            "202 Accepted",
+                            format!("{{\"agentos\":\"held\",\"queue\":{n},\"message\":\"This {method} to {host} was held for the user's review and has not been sent. It is sent when the user commits this task.\"}}"),
+                        ),
+                        Err(e) => (
+                            "503 Service Unavailable",
+                            format!("{{\"agentos\":\"refused\",\"message\":{}}}", serde_json::to_string(&format!("this host's writes are held for review, and this one couldn't be queued ({e}); it was not sent")).unwrap_or_default()),
+                        ),
+                    };
+                    down += reply(&mut agent, answer.0, answer.1)?;
+                    if close {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
             for (name, value) in req.headers.iter_mut() {
                 if secrets.iter().any(|s| s.inject(name, value)) || vault.is_some_and(|v| v.inject_header(name, value)) {
                     injected += 1;
@@ -634,6 +752,66 @@ mod tests {
         assert_eq!(sent.matches("real-key").count(), 1);
         assert!(got.ends_with("\r\n\r\nok"));
         assert_eq!((n, injected), (1, 1));
+    }
+
+    #[test]
+    fn writes_to_a_held_host_are_queued_not_sent() {
+        let s = secret();
+        let queue: Arc<std::sync::Mutex<Vec<HeldRequest>>> = Arc::default();
+        let q = queue.clone();
+        let hold: HoldFn = Arc::new(move |r| {
+            let mut q = q.lock().unwrap();
+            q.push(r);
+            Ok(q.len() as u32)
+        });
+        let body = r#"{"title":"one"}"#;
+        let requests = format!(
+            "GET /v1/issues HTTP/1.1\r\nHost: api.example.com\r\nx-api-key: PLACEHOLDER\r\n\r\n\
+             POST /v1/issues?draft=1 HTTP/1.1\r\nHost: api.example.com\r\nx-api-key: PLACEHOLDER\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}\
+             DELETE /v1/issues/7 HTTP/1.1\r\nHost: api.example.com\r\nx-api-key: PLACEHOLDER\r\nExpect: 100-continue\r\n\r\n",
+            body.len()
+        );
+        let (mut agent, mut remote) = (pipe(&requests), pipe("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"));
+        let (_, _, n, injected) = relay_http_with(&mut agent, &mut remote, "api.example.com", &[&s], None, None, Some(&hold)).unwrap();
+        let (sent, got) = (String::from_utf8(remote.output).unwrap(), String::from_utf8(agent.output).unwrap());
+        // The read went out, with its credential; the writes did not.
+        assert!(sent.starts_with("GET /v1/issues HTTP/1.1") && sent.contains("x-api-key: real-key"), "{sent}");
+        assert!(!sent.contains("POST") && !sent.contains("DELETE") && !sent.contains("one"), "{sent}");
+        assert_eq!((n, injected), (1, 1));
+        assert_eq!(got.matches("HTTP/1.1 202 Accepted").count(), 2, "{got}");
+        assert!(got.contains("X-Agentos-Held: 1") && got.contains("has not been sent") && got.contains("\"queue\":2"), "{got}");
+
+        let q = queue.lock().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!((q[0].method.as_str(), q[0].target.as_str(), q[1].method.as_str()), ("POST", "/v1/issues?draft=1", "DELETE"));
+        assert_eq!(q[0].body, body.as_bytes());
+        // The credential is nowhere in what was queued, only marked where it goes.
+        assert!(q.iter().all(|r| r.headers.iter().all(|(_, v)| !v.contains("real-key") && !v.contains("PLACEHOLDER"))));
+        let (index, env, bearer) = &q[0].credentials[0];
+        assert_eq!((q[0].headers[*index].0.as_str(), env.as_str(), *bearer), ("x-api-key", "API_KEY", false));
+        assert!(q[0].headers.iter().all(|(n, _)| !is_framing(n)), "framing isn't part of what was asked: {:?}", q[0].headers);
+        assert!(q[0].headers.iter().any(|(n, v)| n == "Content-Type" && v == "application/json"));
+    }
+
+    #[test]
+    fn a_write_that_cannot_be_held_is_not_sent_either() {
+        let s = secret();
+        let failing: HoldFn = Arc::new(|_| Err("disk full".into()));
+        let req = "POST /v1/x HTTP/1.1\r\nHost: api.example.com\r\nx-api-key: PLACEHOLDER\r\nContent-Length: 2\r\n\r\nhi";
+        let (mut agent, mut remote) = (pipe(req), pipe(""));
+        relay_http_with(&mut agent, &mut remote, "api.example.com", &[&s], None, None, Some(&failing)).unwrap();
+        assert!(remote.output.is_empty(), "nothing goes upstream");
+        let got = String::from_utf8(agent.output).unwrap();
+        assert!(got.starts_with("HTTP/1.1 503 ") && got.contains("couldn't be queued (disk full); it was not sent"), "{got}");
+        // Too large to hold: refused, and the connection ends.
+        let big = "PUT /v1/x HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 5000000\r\n\r\n";
+        let (mut agent, mut remote) = (pipe(big), pipe(""));
+        relay_http_with(&mut agent, &mut remote, "api.example.com", &[], None, None, Some(&failing)).unwrap();
+        assert!(remote.output.is_empty() && String::from_utf8(agent.output).unwrap().starts_with("HTTP/1.1 413 "));
+        // Without a hold, writes go through as before.
+        let (mut agent, mut remote) = (pipe(req), pipe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+        relay_http_with(&mut agent, &mut remote, "api.example.com", &[&s], None, None, None).unwrap();
+        assert!(String::from_utf8(remote.output).unwrap().starts_with("POST /v1/x"));
     }
 
     #[test]

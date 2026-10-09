@@ -106,7 +106,7 @@ scripts/dev.sh shell
 | `agent spend` | What agents spent today, this week and this month, against your budgets |
 | `agent raise AMOUNT [--task ID \| --today \| --this-week \| --this-month [--project]]` | Raise a budget that's used up: a running task's, or one across tasks until it resets |
 
-`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--local PORT`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
+`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--hold HOST`, `--local PORT`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
 
 ## What the agent sees
 
@@ -283,6 +283,29 @@ agent connect             # your remote servers, and whether you're signed in
 
 agentos finds where to sign in from the server itself, registers there as a client, and has you approve in your browser, which comes back to agentos on a loopback address. Over SSH, open the printed link anywhere and paste back the address your browser ends up on. The tokens are kept in the task store's vault, which no sandbox can see. They're refreshed when they expire, or when the server refuses them. `agent connect NAME --forget` forgets them.
 
+## API writes wait in the outbox too
+
+```bash
+agent do --hold api.github.com "triage the open issues"     # or: [network] hold = ["api.github.com"]
+```
+
+`--hold HOST` lets the agent reach HOST, but its **writes** (POST, PUT, PATCH, DELETE) don't leave your machine. Each is answered with a `202` that says it was queued, and held in the task like git pushes and held tool calls: `agent diff` lists it with its URL and a preview of its body, `agent commit` (or `agent push`) sends it from outside the sandbox, in order, and `agent rollback` drops it. Reads (GET, HEAD, OPTIONS) go through as usual.
+
+```console
+$ agent diff
+  held API requests (sent by `agent commit` or `agent push`, with your credentials)
+  ⏸  POST api.github.com/repos/acme/app/issues/12/comments  {"body":"Looks like a duplicate of #9","bytes":38}
+$ agent commit
+  ↑ sent POST api.github.com/repos/acme/app/issues/12/comments → 201
+```
+
+A credential the agent holds only as a placeholder (`--secret`, `[secrets]`) is never stored with the request. It's added when the request is sent, from your environment or your `[secret_commands]`; if it isn't available then, the request stays held.
+
+- **Exact host names.** agentos reads the method by terminating the TLS connection with the task's CA, so a wildcard has no certificate to match. Model APIs and logins aren't held.
+- **The agent can't see the result.** A client waiting for the id of the thing it created gets a `202` with no resource. Hold hosts whose writes don't need an answer (post a comment, file an issue). Some APIs use POST to read (GraphQL, search): don't hold those, or the agent can't read.
+- **A request that fails stays held**: any answer other than 2xx, no network, a missing credential. `agent push` tries again. Redirects aren't followed. A body over 1 MiB is refused, not held.
+- A project's `.agentos.toml` may ask for holds too: it only restricts.
+
 ## Rules: answers you've already given
 
 Everything agentos would ask you about (a host, a folder, a tool call) can be answered in advance, in `~/.config/agentos/policy.cedar`, next to your config. The rules are [Cedar](https://www.cedarpolicy.com) policies, the language behind AWS Verified Permissions, evaluated by deterministic code:
@@ -425,6 +448,7 @@ Two optional files, in TOML:
 allow = ["@pypi", "api.github.com"]   # presets: @pypi @npm @crates @github @go
 proxy = "http://proxy.corp:3128"      # your file only: see Network (default: HTTPS_PROXY)
 local = [11434]                       # your file only: ports on your loopback agents may reach
+hold = ["api.github.com"]             # reachable, but writes wait for your review (see API writes)
 
 [files]
 hide = [".env"]
@@ -587,7 +611,7 @@ src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refre
 src/policy.rs    your rules (Cedar): answers given in advance
 src/packages.rs  agent packages: review, install, check before every run
 src/taint.rs     whether a task has read untrusted input
-src/held.rs      held tool calls (the outbox for MCP tools)
+src/held.rs      held tool calls and API requests (the outbox for tools and APIs)
 src/main.rs      entry point and dispatch; the rest of the CLI, one file per concern:
   src/cli.rs           arguments            src/plan.rs     `do`/`run`: arguments and config into a plan
   src/task.rs          running a task       src/owner.rs    your side of a running task (give back, raise)

@@ -207,18 +207,43 @@ pub(crate) fn send_calls(store: &Store, task: &Task, calls: &[agentos::held::Hel
     }
     let (out, err) = (Paint::stdout(), Paint::stderr());
     if wait {
-        eprintln!("{} {} waiting for the failed push: `agent push {}` once it's sorted out", err.yellow("agent:"), plural(calls.len(), "held tool call"), task.id());
+        eprintln!("{} {} waiting for the failed push: `agent push {}` once it's sorted out", err.yellow("agent:"), plural(calls.len(), &format!("held {}", agentos::held::noun(calls))), task.id());
         return Ok(calls.len());
     }
     let journal = task.journal();
     let (cwd, home) = (task.meta.cwd.clone(), home_dir()?);
-    let servers = config::load(store.root(), &cwd, &home)?.mcp;
+    let settings = config::load(store.root(), &cwd, &home)?;
+    let (servers, commands) = (settings.mcp, settings.secret_commands);
     let tell: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |text| eprintln!("{} {text}", Paint::stderr().yellow("agent: warning:")));
     let taint = Arc::new(taint::Taint::new(None, Vec::new()));
     let gateway = agentos::mcp::Gateway::new(servers, cwd, task.dir.clone(), Box::new(|_| None), None, Vec::new(), journal.clone(), tell, store.root().to_path_buf(), taint);
     let mut failed = 0;
     for c in calls {
         let what = json!({ "server": c.server, "tool": c.tool, "arguments": approvals::sanitize(&c.args.to_string(), 1000), "seq": c.seq });
+        // An API request, not a tool call: sent from here, with its credential put back.
+        if c.http.is_some() {
+            match agentos::held::send_http(c, &|env| secret_value(env, &commands)) {
+                Ok((status, first)) if (200..300).contains(&status) => {
+                    agentos::held::remove(&task.dir, c.seq);
+                    let mut what = what;
+                    what["result"] = json!(status);
+                    journal.append("outbox.called", what)?;
+                    println!("  {} sent {} \u{2192} {status} {}", out.green("\u{2191}"), c.target(), out.dim(render::first_line(&first, 60)));
+                }
+                other => {
+                    failed += 1;
+                    let why = match other {
+                        Ok((status, first)) => format!("the server answered {status}: {}", render::first_line(&first, 120)),
+                        Err(e) => e,
+                    };
+                    let mut what = what;
+                    what["error"] = json!(approvals::sanitize(&why, 500));
+                    journal.append("outbox.call_failed", what)?;
+                    eprintln!("  {} {}: {}", err.red("\u{2717} request"), c.target(), render::first_line(&why, 200));
+                }
+            }
+            continue;
+        }
         match gateway.release(&c.server, &c.tool, &c.args) {
             Ok(r) if !r.is_error => {
                 agentos::held::remove(&task.dir, c.seq);
@@ -242,7 +267,7 @@ pub(crate) fn send_calls(store: &Store, task: &Task, calls: &[agentos::held::Hel
     }
     gateway.stop_all();
     if failed > 0 {
-        eprintln!("{} {} still held. Once you've sorted it out: `agent push {}`", err.yellow("agent:"), plural(failed, "tool call"), task.id());
+        eprintln!("{} {} still held. Once you've sorted it out: `agent push {}`", err.yellow("agent:"), plural(failed, agentos::held::noun(calls)), task.id());
     }
     Ok(failed)
 }
@@ -284,7 +309,7 @@ pub(crate) fn cmd_rollback(store: &Store, selector: Option<&str>, paths: &[PathB
             what = format!("{what} and {}", plural(pushes.len(), "held push"));
         }
         if !calls.is_empty() {
-            what = format!("{what} and {}", plural(calls.len(), "held tool call"));
+            what = format!("{what} and {}", plural(calls.len(), &format!("held {}", agentos::held::noun(&calls))));
         }
         if committed_before {
             println!("rolled back the remaining {what} from task {}", task.id());

@@ -64,6 +64,8 @@ pub(crate) struct Plan {
     pub(crate) no_proxy: Vec<String>,
     /// Ports on your loopback the agent reaches at the same port (a local model server).
     pub(crate) local: Vec<u16>,
+    /// Hosts it may reach, whose writes wait for your review.
+    pub(crate) hold: Vec<String>,
 }
 
 /// What the config files add to a task beyond its grants.
@@ -72,6 +74,7 @@ pub(crate) struct Applied {
     pub(crate) proxy: Option<String>,
     pub(crate) no_proxy: Vec<String>,
     pub(crate) local: Vec<u16>,
+    pub(crate) hold: Vec<String>,
     /// `(NAME, HOST[/HEADER])`: brokered if NAME has a value (see [`secret_value`]).
     pub(crate) secrets: Vec<(String, String)>,
     pub(crate) secret_commands: keychain::Commands,
@@ -93,7 +96,7 @@ pub(crate) fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Appl
     settings.allow.extend(approvals::remembered(store.root(), &approvals::project_root(&cwd, &home))?);
     grants.ro.extend(settings.ro);
     grants.hide.extend(settings.hide);
-    Ok(Applied { allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, local: settings.local, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
+    Ok(Applied { allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, local: settings.local, hold: settings.hold, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
 }
 
 /// The proxy the egress proxy goes through: your config's, else the one in
@@ -104,6 +107,18 @@ pub(crate) fn upstream_proxy(configured: Option<&str>, no_proxy: &[String]) -> R
         Some(url) => Some(proxy::Upstream::parse(url, &[]).context("[network] proxy")?.bypassing(no_proxy)),
         None => proxy::Upstream::from_env()?.map(|u| u.bypassing(no_proxy)),
     })
+}
+
+/// The hosts whose writes a task holds: your config's and --hold's, once each.
+pub(crate) fn hold_hosts(configured: Vec<String>, flags: &[String]) -> Result<Vec<String>> {
+    let mut hosts = configured;
+    for host in flags {
+        agentos::held::valid_host(host).map_err(|e| anyhow::anyhow!("--hold: {e}"))?;
+        hosts.push(host.to_ascii_lowercase());
+    }
+    hosts.sort();
+    hosts.dedup();
+    Ok(hosts)
 }
 
 /// The loopback ports a task gets: your config's and --local's, once each.
@@ -293,6 +308,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
     // What the agent's own definition asks for: servers on your machine, files to read.
     let local = local_ports(applied.local.into_iter().chain(profile.local.iter().copied()).collect(), &args.grants.local);
+    let hold = hold_hosts(applied.hold, &args.grants.hold)?;
     args.grants.ro.extend(profile.ro.iter().cloned());
     let net = args.net.unwrap_or(profile.net);
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
@@ -356,6 +372,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             proxy: applied.proxy,
             no_proxy: applied.no_proxy,
             local,
+            hold,
         },
     )
 }
@@ -369,13 +386,14 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     let applied = apply_config(store, &mut args.grants)?;
     let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
     let local = local_ports(applied.local, &args.grants.local);
+    let hold = hold_hosts(applied.hold, &args.grants.hold)?;
     let mut secrets = parse_secrets(&args.grants.secret, &commands)?;
     let ask = args.grants.ask;
-    let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask;
+    let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask || !args.grants.hold.is_empty();
     let net = match args.net {
-        Some(Net::Host) if asked => bail!("--allow/--secret/--ask and --net host contradict each other: they mean only those hosts"),
+        Some(Net::Host) if asked => bail!("--allow/--secret/--hold/--ask and --net host contradict each other: they mean only those hosts"),
         Some(net) => net,
-        None if asked || !config_allow.is_empty() => Net::Proxy,
+        None if asked || !config_allow.is_empty() || !hold.is_empty() => Net::Proxy,
         None => Net::None,
     };
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
@@ -417,6 +435,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             proxy: applied.proxy,
             no_proxy: applied.no_proxy,
             local,
+            hold,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {

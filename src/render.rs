@@ -179,7 +179,8 @@ pub fn exit_summary(p: Paint, task: &Task, s: &Summary, pushes: &[Push], outcome
     }
     if !calls.is_empty() {
         let targets: Vec<String> = calls.iter().map(|c| c.target()).collect();
-        let what = if calls.len() == 1 { "1 tool call".to_string() } else { format!("{} tool calls", calls.len()) };
+        let noun = agentos::held::noun(calls);
+        let what = if calls.len() == 1 { format!("1 {noun}") } else { format!("{} {noun}s", calls.len()) };
         held.push(format!("{what} ({})", targets.join(", ")));
     }
     let mut out = format!("{head} · {} held for review{ignored}", held.join(" and "));
@@ -395,7 +396,12 @@ pub fn diff(p: Paint, task: &Task, changes: &[Change], pushes: &[HeldPush], call
         }
     }
     if !calls.is_empty() {
-        let _ = writeln!(out, "\n  {}", p.bold("held tool calls (run by `agent commit` or `agent push`, with your credentials)"));
+        let heading = match agentos::held::noun(calls) {
+            "API request" => "held API requests (sent by `agent commit` or `agent push`, with your credentials)",
+            "held call" => "held calls (run or sent by `agent commit` or `agent push`, with your credentials)",
+            _ => "held tool calls (run by `agent commit` or `agent push`, with your credentials)",
+        };
+        let _ = writeln!(out, "\n  {}", p.bold(heading));
         for h in calls {
             let _ = writeln!(out, "  {}  {}  {}", p.cyan("\u{23f8}"), p.bold(h.target()), truncate(&h.args.to_string(), 100));
         }

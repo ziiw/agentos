@@ -8,6 +8,11 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
     if plan.net == Net::Host && !plan.local.is_empty() {
         bail!("--local is for sandboxes with a network of their own; --net host already shares yours");
     }
+    if plan.net == Net::Host && !plan.hold.is_empty() {
+        bail!("--hold is enforced in the egress proxy, which --net host bypasses");
+    }
+    // Hosts whose writes wait for your review: reachable, and relayed by the broker.
+    let hold_hosts: Vec<String> = if plan.net == Net::Proxy { plan.hold.clone() } else { Vec::new() };
 
     let mut grants: Vec<Grant> = Vec::new();
     for (paths, access, flag) in [(&plan.grants.rw, Access::Rw, "--rw"), (&plan.grants.ro, Access::Ro, "--ro")] {
@@ -48,10 +53,15 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
     }
     let mut allow = if plan.net == Net::Proxy { plan.allow } else { Vec::new() };
-    // A brokered credential's host is reachable by definition.
+    // A brokered credential's host is reachable by definition, and so is one you hold writes to.
     for secret in &plan.secrets {
         if !allow.contains(&secret.host) {
             allow.push(secret.host.clone());
+        }
+    }
+    for host in &hold_hosts {
+        if !allow.contains(host) {
+            allow.push(host.clone());
         }
     }
     let allowlist = Allowlist::parse(&allow)?;
@@ -99,7 +109,7 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
 
     let mut env = build_env(&plan.grants.env, &home)?;
     let brokered_env = plan.secrets.iter().map(|s| (s.env.clone(), s.placeholder.clone()));
-    let brokering = !plan.secrets.is_empty() || plan.login.as_ref().is_some_and(|l| l.brokered) || !intercept.is_empty();
+    let brokering = !plan.secrets.is_empty() || plan.login.as_ref().is_some_and(|l| l.brokered) || !intercept.is_empty() || !hold_hosts.is_empty();
     // A shared budget that's already used up: don't start what can't run.
     if brokering {
         if let Some(over) = ledger.over(&periodic, util::now_ms()) {
@@ -199,6 +209,10 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         eprintln!("  {}", err.dim(format!("through your proxy {}", u.describe())));
         journal.append("net.upstream", json!({ "proxy": u.describe() }))?;
     }
+    if !hold_hosts.is_empty() {
+        eprintln!("  {}", err.dim(format!("writes to {} wait for your review (--hold)", hold_hosts.join(", "))));
+        journal.append("task.hold", json!({ "hosts": hold_hosts }))?;
+    }
     if !plan.local.is_empty() {
         let ports: Vec<String> = plan.local.iter().map(|p| format!("127.0.0.1:{p}")).collect();
         eprintln!("  {}", err.dim(format!("your machine's {} (--local)", ports.join(", "))));
@@ -287,7 +301,26 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         None
     } else {
         let vault = login.as_ref().filter(|l| l.brokered).map(|l| (l.vault.clone(), l.hosts.clone()));
-        let broker = Broker::new(plan.secrets, vault, meter.clone().map(|m| (m, intercept)))?;
+        // Writes to a held host are queued in the task instead of sent.
+        let hold = (!hold_hosts.is_empty()).then(|| {
+            let (dir, journal) = (task.dir.clone(), journal.clone());
+            let queue: broker::HoldFn = Arc::new(move |r: broker::HeldRequest| {
+                let part = agentos::held::HttpPart {
+                    method: r.method,
+                    host: r.host,
+                    target: r.target,
+                    headers: r.headers,
+                    credentials: r.credentials.into_iter().map(|(header, env, bearer)| agentos::held::Credential { header, env, bearer }).collect(),
+                    body: util::hex(&r.body),
+                };
+                let held = agentos::held::hold_http(&dir, part).map_err(|e| format!("{e:#}"))?;
+                let _ = journal.append("outbox.held_request", json!({ "request": held.target(), "seq": held.seq, "bytes": r.body.len() }));
+                say(format!("{} held {} until you commit (`agent diff` shows it)", err.cyan("agent \u{25b8}"), held.target()));
+                Ok(held.seq)
+            });
+            (hold_hosts.clone(), queue)
+        });
+        let broker = Broker::new(plan.secrets, vault, meter.clone().map(|m| (m, intercept)), hold)?;
         let (ca, bundle) = (task.dir.join("ca.pem"), task.dir.join("ca-bundle.pem"));
         fs::write(&ca, broker.ca_pem())?;
         fs::write(&bundle, broker::ca_bundle(broker.ca_pem()))?;

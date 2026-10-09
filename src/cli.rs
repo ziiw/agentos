@@ -247,6 +247,11 @@ pub(crate) struct GrantArgs {
     /// *.DOMAIN or HOST:PORT; port 443 by default). Nothing else is reachable.
     #[arg(long, value_name = "HOST")]
     pub(crate) allow: Vec<String>,
+    /// Let the agent reach this host, but hold its writes (POST, PUT, PATCH,
+    /// DELETE) for your review: answered with a 202 and sent, with the
+    /// credential --secret would add, when you commit. Exact host names.
+    #[arg(long, value_name = "HOST")]
+    pub(crate) hold: Vec<String>,
     /// Let the agent reach a server on this machine's loopback, at the same
     /// port on its own (--local 11434 for a local model server like Ollama).
     /// Only that port; the rest of your loopback stays out of reach.

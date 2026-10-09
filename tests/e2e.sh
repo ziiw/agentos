@@ -1337,6 +1337,51 @@ TOML
   : > "$CFG"
 fi
 
+section "held API requests (the outbox for HTTP)"
+reset_proj
+cd "$PROJ"
+# postman-echo.com answers a POST with what it received: a 200 means the request got there.
+HCFG="$WORK/hold.toml"
+printf '[secrets]\nAGENTOS_E2E_HOLD = "postman-echo.com/x-test-token"\n' > "$HCFG"
+hh2() { AGENTOS_CONFIG="$HCFG" AGENTOS_E2E_HOLD=held-secret-value "$AGENT" "$@"; }
+POSTX='curl -sS -m 20 -X POST -H "x-test-token: $AGENTOS_E2E_HOLD" -d "hello=held" https://postman-echo.com/post'
+out="$(hh2 run --hold postman-echo.com -- sh -c "$POSTX; echo; curl -sS -m 20 'https://postman-echo.com/get?read=1'" 2>&1)"
+events="$(latest_task_dir)/events.jsonl"
+HELD_TASK="$(basename "$(latest_task_dir)")"
+check "--hold: a write to the host is answered with a 202 that says it was held" grep -q "was held for the user's review and has not been sent" <<<"$out"
+check "...while a read of the same host goes through" grep -q '"read": *"1"' <<<"$out"
+check "...the task says so at the start" grep -q 'writes to postman-echo.com wait for your review (--hold)' <<<"$out"
+check "...and when it happens" grep -q 'held POST postman-echo.com/post until you commit' <<<"$out"
+check "...and in the exit summary" grep -q '1 API request (POST postman-echo.com/post)' <<<"$out"
+check "the journal records it" grep -q '"kind":"outbox.held_request".*"request":"POST postman-echo.com/post"' "$events"
+check "...and the connection that carried it relayed nothing" grep -q '"kind":"net.connect".*"requests":0' "$events"
+d="$("$AGENT" diff)"
+check "agent diff lists the held request" grep -q 'held API requests (sent by `agent commit`' <<<"$d"
+check "...with its method and URL" grep -q 'POST postman-echo.com/post' <<<"$d"
+check "...and a preview of the body" grep -q 'hello=held' <<<"$d"
+check "the credential is nowhere in the task store" bash -c "! grep -rq held-secret-value '$AGENTOS_HOME'"
+out="$("$AGENT" commit 2>&1)"
+check "a commit without the credential's value can't send it" grep -q 'AGENTOS_E2E_HOLD isn.t set in your environment' <<<"$out"
+check "...so it stays held" grep -q 'POST postman-echo.com/post' <<<"$("$AGENT" diff)"
+out="$(hh2 commit 2>&1)"
+check "agent commit sends it, with the credential put back" grep -Eq 'sent POST postman-echo.com/post → 200' <<<"$out"
+check "...and it is no longer held" test -z "$(ls "$AGENTOS_HOME/tasks/$HELD_TASK/held-calls" 2>/dev/null)"
+check "...journaled as called" grep -q '"kind":"outbox.called".*"server":"http"' "$AGENTOS_HOME/tasks/$HELD_TASK/events.jsonl"
+check "...and the credential still isn't in the store" bash -c "! grep -rq held-secret-value '$AGENTOS_HOME'"
+hh2 run --hold postman-echo.com -- sh -c "$POSTX" >/dev/null 2>&1
+out="$("$AGENT" rollback 2>&1)"
+check "agent rollback drops a held request" grep -q '1 held API request' <<<"$out"
+printf '[network]\nhold = ["postman-echo.com"]\n[secrets]\nAGENTOS_E2E_HOLD = "postman-echo.com/x-test-token"\n' > "$HCFG"
+out="$(hh2 run -- sh -c "$POSTX" 2>&1)"
+check "[network] hold in your config does the same, for tasks with a network" grep -q "has not been sent" <<<"$out"
+hh2 rollback >/dev/null 2>&1
+check "--hold wants a host name, not a pattern" grep -q "isn't a host name" <<<"$("$AGENT" run --hold '*.example.com' -- true 2>&1)"
+check "--hold with --net host is rejected" grep -q 'contradict' <<<"$("$AGENT" run --net host --hold example.com -- true 2>&1)"
+printf '[network]\nhold = ["example.com"]\n' > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project may ask for holds too (it only restricts)" test $? -eq 0
+rm -f .agentos.toml
+
 section "project rules (.agentos.cedar): they can only forbid"
 reset_proj
 cd "$PROJ"
