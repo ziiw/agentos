@@ -138,7 +138,8 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           mkdir -p /tmp/e2e && chmod 1777 /tmp/e2e
           docker run --rm --privileged -v "$PWD:/src:ro" -v /tmp/e2e:/e2e agentos:ci bash -c '
-            dnf -y install swtpm swtpm-tools >/dev/null 2>&1 || true
+            # (a bus and a software TPM for the tests that use them; they skip themselves without)
+            dnf -y install swtpm swtpm-tools dbus-daemon >/dev/null 2>&1 || true
             cat /usr/lib/os-release | grep PRETTY_NAME
             agent --version
             useradd -m tester
