@@ -23,9 +23,12 @@
 //! What a rule sees:
 //! - principal `Agent::"claude"` (the agent's name; `Agent::"command"` for `agent run`);
 //! - actions `Action::"connect"`, `"read"`, `"write"` (folders asked for
-//!   mid-task) and `"call"` (tools of your MCP servers);
+//!   mid-task), `"call"` (tools of your MCP servers) and `"release"` (what a
+//!   finished task left held: sent without you when a rule permits it);
 //! - resources `Host::"pypi.org"` {name, port}, `Path::"/home/you/code/lib"`
-//!   {path}, `Tool::"github.create_issue"` {server, name};
+//!   {path}, `Tool::"github.create_issue"` {server, name}, and for `release`
+//!   also `Push::"origin feature"` {remote, branch, refname} and
+//!   `Request::"POST api.github.com/repos/acme/app/issues"` {method, host, path};
 //! - context {agent, task, project, reason (the agent's own words, when it
 //!   asked), args (a tool call's arguments), tainted (the task has read
 //!   untrusted input), taint (which kinds: "web", "tool", "file")}.
@@ -65,6 +68,8 @@ pub enum Action {
     Read,
     Write,
     Call,
+    /// Sending what a finished task left held (a push, a tool call, an API request).
+    Release,
 }
 
 impl Action {
@@ -74,11 +79,12 @@ impl Action {
             Action::Read => "read",
             Action::Write => "write",
             Action::Call => "call",
+            Action::Release => "release",
         }
     }
 
     pub fn parse(s: &str) -> Option<Action> {
-        [Action::Connect, Action::Read, Action::Write, Action::Call].into_iter().find(|a| a.name() == s)
+        [Action::Connect, Action::Read, Action::Write, Action::Call, Action::Release].into_iter().find(|a| a.name() == s)
     }
 }
 
@@ -112,6 +118,36 @@ impl Question {
             attrs: json!({ "server": server, "name": tool }),
             reason: None,
             args: Some(args.clone()),
+        }
+    }
+
+    /// Sending a held tool call.
+    pub fn release_call(server: &str, tool: &str, args: &Value) -> Question {
+        Question { action: Action::Release, ..Question::call(server, tool, args) }
+    }
+
+    /// Sending a held git push.
+    pub fn release_push(remote: &str, refname: &str) -> Question {
+        let branch = refname.strip_prefix("refs/heads/").unwrap_or(refname);
+        Question {
+            action: Action::Release,
+            kind: "Push",
+            id: format!("{remote} {branch}"),
+            attrs: json!({ "remote": remote, "branch": branch, "refname": refname }),
+            reason: None,
+            args: None,
+        }
+    }
+
+    /// Sending a held API request: `path` without the query.
+    pub fn release_request(method: &str, host: &str, path: &str) -> Question {
+        Question {
+            action: Action::Release,
+            kind: "Request",
+            id: format!("{method} {host}{path}"),
+            attrs: json!({ "method": method, "host": host, "path": path }),
+            reason: None,
+            args: None,
         }
     }
 
@@ -401,5 +437,43 @@ mod tests {
         assert!(load(&dir.path().join(FILE), Path::new("/h")).unwrap().is_none());
         std::fs::write(dir.path().join(FILE), "permit (principal, action, resource").unwrap();
         assert!(load(&dir.path().join(FILE), Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn rules_say_what_may_leave_without_you() {
+        let set = PolicySet::from_str(
+            r#"
+            @id("comments go")
+            permit (principal, action == Action::"release", resource)
+            when { resource has method && resource.method == "POST" && resource.host == "api.github.com" && resource.path like "/repos/acme/*/comments" };
+            @id("our branches go")
+            permit (principal, action == Action::"release", resource)
+            when { resource has branch && resource.remote == "origin" && resource.branch like "agent/*" };
+            @id("clean tasks file issues")
+            permit (principal, action == Action::"release", resource == Tool::"github.create_issue")
+            when { !context.tainted };
+            @id("never to main")
+            forbid (principal, action == Action::"release", resource)
+            when { resource has branch && resource.branch == "main" };
+            "#,
+        )
+        .unwrap();
+        let p = Policy::new(set, "claude", "t1", Path::new("/p"));
+        assert!(matches!(p.decide(&Question::release_request("POST", "api.github.com", "/repos/acme/app/comments")), Verdict::Permit(r) if r == "comments go"));
+        assert_eq!(p.decide(&Question::release_request("DELETE", "api.github.com", "/repos/acme/app/comments")), Verdict::Undecided);
+        assert_eq!(p.decide(&Question::release_request("POST", "api.github.com", "/repos/other/app/comments")), Verdict::Undecided);
+        assert!(matches!(p.decide(&Question::release_push("origin", "refs/heads/agent/fix")), Verdict::Permit(r) if r == "our branches go"));
+        assert_eq!(p.decide(&Question::release_push("origin", "refs/heads/feature")), Verdict::Undecided);
+        assert_eq!(p.decide(&Question::release_push("fork", "refs/heads/agent/fix")), Verdict::Undecided);
+        assert!(matches!(p.decide(&Question::release_push("origin", "refs/heads/main")), Verdict::Forbid(r) if r == "never to main"));
+        assert!(matches!(p.decide(&Question::release_call("github", "create_issue", &json!({}))), Verdict::Permit(r) if r == "clean tasks file issues"));
+        // Rules for what leaves don't answer what agentos asks while a task runs.
+        assert_eq!(p.decide(&Question::connect("api.github.com", 443)), Verdict::Undecided);
+        assert_eq!(p.decide(&Question::call("github", "create_issue", &json!({}))), Verdict::Undecided);
+        // A tainted task's issues stay held.
+        let taint = Arc::new(Taint::new(None, Vec::new()));
+        taint.mark(crate::taint::Source::Web, "a page");
+        let tainted = Policy::new(PolicySet::from_str(r#"@id("clean tasks file issues") permit (principal, action == Action::"release", resource == Tool::"github.create_issue") when { !context.tainted };"#).unwrap(), "claude", "t2", Path::new("/p")).with_taint(taint);
+        assert_eq!(tainted.decide(&Question::release_call("github", "create_issue", &json!({}))), Verdict::Undecided);
     }
 }

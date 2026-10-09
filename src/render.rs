@@ -578,6 +578,7 @@ fn describe(p: Paint, e: &Event) -> String {
                 format!("{} {target} · {}", p.red("✗ blocked"), s(&d["reason"]))
             }
         }
+        "outbox.released" => format!("{} released by your rule \u{201c}{}\u{201d}", s(&d["what"]), s(&d["rule"])),
         "console.action" => {
             let decision = d["decision"].as_str().map(|x| format!(" ({x})")).unwrap_or_default();
             format!("{} ({}) in agentd's console: {}{decision}", s(&d["by"]), s(&d["role"]), s(&d["action"]))

@@ -336,7 +336,7 @@ What a rule sees:
 | | |
 |---|---|
 | principal | `Agent::"claude"` (the agent's name; `Agent::"command"` for `agent run`) |
-| actions | `Action::"connect"`, `"read"` and `"write"` (folders asked for mid-task), `"call"` (your MCP servers' tools) |
+| actions | `Action::"connect"`, `"read"` and `"write"` (folders asked for mid-task), `"call"` (your MCP servers' tools), `"release"` (what a finished task left held: see below) |
 | resources | `Host::"pypi.org"` {name, port}, `Path::"/home/you/code/lib"` {path}, `Tool::"github.create_issue"` {server, name} |
 | context | `agent`, `task`, `project`, `reason` (the agent's own words, when it asked), `args` (a tool call's arguments), `tainted` and `taint` (see Taint, below) |
 
@@ -351,6 +351,36 @@ when { resource.name like "*.prod.example.com" };
 Project rules can only forbid, so they apply without review, and they beat your own `permit` and `--allow`. A project file with a `permit` in it, or one that doesn't parse, stops the task: a protection the project asked for is never silently dropped. An agent can't loosen them for itself: rules are read when the task starts, and `agent diff` flags any change it makes to the file.
 
 `"~/…"` in a string means your home. `agent policy` lists your rules and the project's, and `agent policy check read ~/code/lib` (or `connect pypi.org`, or `call github.create_issue --args '{"repo":"x"}'`) tells you what they'd say. Every decision a rule makes is journaled with the rule's name. A rules file that doesn't parse stops tasks rather than being skipped, and agents can never be granted it.
+
+## Rules can release what a task left held
+
+Held git pushes, tool calls and API requests wait for your `agent commit`. For tasks nobody is watching (`--bg`, started from your phone), your rules can say which of them may leave on their own, when the task ends, with the `release` action:
+
+```cedar
+@id("our own branches")
+permit (principal, action == Action::"release", resource)
+when { resource has branch && resource.remote == "origin" && resource.branch like "agent/*" };
+
+@id("comments on our repo")
+permit (principal, action == Action::"release", resource)
+when { resource has method && resource.method == "POST" && resource.host == "api.github.com"
+       && resource.path like "/repos/acme/app/issues/*/comments" };
+
+@id("clean tasks may file issues")
+permit (principal, action == Action::"release", resource == Tool::"github.create_issue")
+when { !context.tainted && context.args.repo == "app" };
+
+@id("never main")
+forbid (principal, action == Action::"release", resource)
+when { resource has branch && resource.branch == "main" };
+```
+
+| | |
+|---|---|
+| resources | `Push::"origin agent/fix"` {remote, branch, refname}, `Request::"POST api.github.com/repos/…"` {method, host, path}, `Tool::"github.create_issue"` {server, name} (with `context.args`) |
+| context | the same as for the other actions, including `tainted` |
+
+What a permit matches is sent when the task ends, from outside the sandbox with your credentials, exactly as `agent commit` would send it: the exit summary says `released by your rules: …` and the journal has an `outbox.released` event with the rule's name. A `forbid` beats a `permit`, and what no rule permits stays held for review. Only your own rules can release; a project's can only forbid. The task's file changes are never released this way. `agent policy check release git:origin/agent/fix` (or `POST:api.github.com/repos/acme/app/issues/1/comments`, or `github.create_issue --args '{…}'`) tells you what your rules would do.
 
 ## Taint: what it read changes what it may do
 

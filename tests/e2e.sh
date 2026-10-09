@@ -1513,6 +1513,65 @@ printf '[network]\nhold = ["example.com"]\n' > .agentos.toml
 check "a project may ask for holds too (it only restricts)" test $? -eq 0
 rm -f .agentos.toml
 
+section "rules that release what a task left held"
+reset_proj
+cd "$PROJ"
+RELDIR="$WORK/rel"
+mkdir -p "$RELDIR"
+printf '[secrets]\nAGENTOS_E2E_HOLD = "postman-echo.com/x-test-token"\n' > "$RELDIR/config.toml"
+cat > "$RELDIR/policy.cedar" <<'CEDAR'
+@id("posts to the echo may go")
+permit (principal, action == Action::"release", resource)
+when { resource has method && resource.method == "POST" && resource.host == "postman-echo.com" && resource.path == "/post" };
+CEDAR
+rl() { AGENTOS_CONFIG="$RELDIR/config.toml" AGENTOS_E2E_HOLD=held-secret-value "$AGENT" "$@"; }
+out="$(rl run --hold postman-echo.com -- sh -c 'curl -sS -m 20 -X POST -H "x-test-token: $AGENTOS_E2E_HOLD" -d a=1 https://postman-echo.com/post >/dev/null; curl -sS -m 20 -X PUT -d b=2 https://postman-echo.com/put >/dev/null' 2>&1)"
+check "a held request your rules permit is sent when the task ends" grep -q 'released by your rules: POST postman-echo.com/post' <<<"$out"
+check "...and the line says which rule" grep -q 'posts to the echo may go' <<<"$out"
+check "...with its credential put back (the echo took it)" grep -Eq 'sent POST postman-echo.com/post → 200' <<<"$out"
+check "what no rule permits stays held" grep -q '1 API request (PUT postman-echo.com/put)' <<<"$out"
+check "...and only that is left to review" test "$(grep -c '^  ⏸' <<<"$(rl diff)")" -eq 1
+check "the journal records the release and the rule" grep -q '"kind":"outbox.released".*"rule":"posts to the echo may go"' "$(latest_task_dir)/events.jsonl"
+rl rollback >/dev/null 2>&1
+check "agent policy check release asks the same question" grep -q 'permitted by .*posts to the echo may go' <<<"$(rl policy check release POST:postman-echo.com/post)"
+check "...and a method no rule names stays undecided" grep -q 'no rule' <<<"$(rl policy check release PUT:postman-echo.com/put)"
+cat >> "$RELDIR/policy.cedar" <<'CEDAR'
+@id("never the echo")
+forbid (principal, action == Action::"release", resource)
+when { resource has host && resource.host == "postman-echo.com" };
+CEDAR
+check "a forbid beats the permit" grep -q 'forbidden by your rule .*never the echo' <<<"$(rl policy check release POST:postman-echo.com/post)"
+out="$(rl run --hold postman-echo.com -- sh -c 'curl -sS -m 20 -X POST -d a=1 https://postman-echo.com/post >/dev/null' 2>&1)"
+check "...so that request waits" grep -q '1 API request (POST postman-echo.com/post)' <<<"$out"
+rl rollback >/dev/null 2>&1
+if command -v git >/dev/null; then
+  REMOTE2="$WORK/rel-remote.git"
+  me2() { git -c user.name=me -c user.email=me@example.com "$@"; }
+  AGIT2='git -c user.name=agent -c user.email=agent@example.com'
+  rm -rf "$REMOTE2" "$PROJ" && git init -q --bare "$REMOTE2"
+  mkdir -p "$PROJ" && cd "$PROJ" && git init -q -b main && git remote add origin "$REMOTE2"
+  echo one > a.txt && git add a.txt && me2 commit -qm one && git push -q origin main
+  MAIN_BEFORE="$(git --git-dir="$REMOTE2" rev-parse main)"
+  cat > "$RELDIR/policy.cedar" <<'CEDAR'
+@id("agent branches may go")
+permit (principal, action == Action::"release", resource)
+when { resource has branch && resource.remote == "origin" && resource.branch like "agent/*" };
+@id("never main")
+forbid (principal, action == Action::"release", resource)
+when { resource has branch && resource.branch == "main" };
+CEDAR
+  out="$(rl run -- sh -c "$AGIT2 commit -q --allow-empty -m a1 && git push -q origin HEAD:refs/heads/agent/fix && git push -q origin HEAD:refs/heads/feature && git push -q origin HEAD:refs/heads/main" 2>&1)"
+  check "a held push your rules permit is sent when the task ends" test -n "$(git --git-dir="$REMOTE2" rev-parse -q --verify refs/heads/agent/fix)"
+  check "...and says so" grep -q 'released by your rules: origin agent/fix' <<<"$out"
+  check "the pushes no rule permits wait" test -z "$(git --git-dir="$REMOTE2" rev-parse -q --verify refs/heads/feature)"
+  check "...and so does the one a forbid names" test "$(git --git-dir="$REMOTE2" rev-parse main)" = "$MAIN_BEFORE"
+  check "...both still held for review" grep -q '2 git pushes (origin feature, origin main)' <<<"$out"
+  rl rollback >/dev/null 2>&1
+else
+  skip "releasing pushes needs git"
+fi
+rm -f "$RELDIR/policy.cedar"
+
 section "project rules (.agentos.cedar): they can only forbid"
 reset_proj
 cd "$PROJ"

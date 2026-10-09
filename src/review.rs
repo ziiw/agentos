@@ -359,3 +359,41 @@ pub(crate) fn cmd_log(store: &Store, selector: Option<&str>, raw: bool) -> Resul
         }
     }
 }
+
+/// What a finished task left held and your rules permit is sent now, so that
+/// nobody has to be there: `Action::"release"` rules, yours only (a project's
+/// can only forbid). Whatever no rule permits stays held for your review.
+pub(crate) fn auto_release(store: &Store, task: &Task, rules: &policy::Policy) -> Result<()> {
+    let (out, journal) = (Paint::stdout(), task.journal());
+    let mut released: Vec<String> = Vec::new();
+    let mut note = |kind: &str, what: String, rule: &str| {
+        let _ = journal.append("outbox.released", json!({ "kind": kind, "what": what, "rule": rule }));
+        released.push(format!("{what} (rule \u{201c}{rule}\u{201d})"));
+    };
+
+    let mut pushes = Vec::new();
+    for p in outbox::pending(&task.dir)? {
+        if let Verdict::Permit(rule) = rules.decide(&Question::release_push(&p.remote, &p.refname)) {
+            note("push", format!("{} {}", p.remote, p.short_ref()), &rule);
+            pushes.push(p);
+        }
+    }
+    let failed = send_pushes(task, &pushes, false)?;
+
+    let mut calls = Vec::new();
+    for c in agentos::held::pending(&task.dir)? {
+        let question = match &c.http {
+            Some(h) => Question::release_request(&h.method, &h.host, h.target.split('?').next().unwrap_or_default()),
+            None => Question::release_call(&c.server, &c.tool, &c.args),
+        };
+        if let Verdict::Permit(rule) = rules.decide(&question) {
+            note(if c.http.is_some() { "request" } else { "call" }, c.target(), &rule);
+            calls.push(c);
+        }
+    }
+    send_calls(store, task, &calls, failed > 0)?;
+    if !released.is_empty() {
+        println!("{} released by your rules: {}", out.cyan("agent \u{25b8}"), released.join(", "));
+    }
+    Ok(())
+}

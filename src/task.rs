@@ -510,6 +510,12 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
             Err(e) => eprintln!("{} couldn't seal the agent's login: {e:#}", err.yellow("agent: warning:")),
         }
     }
+    // What your rules permit to leave is sent now; the rest waits for you.
+    if let Some(rules) = &rules {
+        if let Err(e) = auto_release(store, &task, rules) {
+            eprintln!("{} releasing what your rules permit: {e:#}", err.yellow("agent: warning:"));
+        }
+    }
     let pushes = outbox::pending(&task.dir)?;
     if !pushes.is_empty() {
         let held: Vec<_> = pushes.iter().map(|p| json!({ "remote": p.remote, "ref": p.refname, "sha": p.sha })).collect();

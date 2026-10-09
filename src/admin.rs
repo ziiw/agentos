@@ -67,7 +67,24 @@ pub(crate) fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
                     };
                     Question::call(server, tool, &args)
                 }
-                None => bail!("{action}: expected connect, read, write or call"),
+                Some(policy::Action::Release) => {
+                    // git:REMOTE/BRANCH, METHOD:HOST/PATH, or SERVER.TOOL (with --args)
+                    if let Some(rest) = target.strip_prefix("git:") {
+                        let (remote, branch) = rest.split_once('/').context("release: git:REMOTE/BRANCH, e.g. git:origin/feature")?;
+                        Question::release_push(remote, &format!("refs/heads/{branch}"))
+                    } else if let Some((method, url)) = target.split_once(':').filter(|(m, _)| m.chars().all(|c| c.is_ascii_uppercase())) {
+                        let (host, path) = url.split_once('/').map_or((url, String::new()), |(h, p)| (h, format!("/{p}")));
+                        Question::release_request(method, &host.to_ascii_lowercase(), &path)
+                    } else {
+                        let (server, tool) = target.split_once('.').context("release: git:REMOTE/BRANCH, METHOD:HOST/PATH, or SERVER.TOOL")?;
+                        let args: serde_json::Value = match args {
+                            Some(a) => serde_json::from_str(&a).context("--args: not JSON")?,
+                            None => json!({}),
+                        };
+                        Question::release_call(server, tool, &args)
+                    }
+                }
+                None => bail!("{action}: expected connect, read, write, call or release"),
             };
             let project = approvals::project_root(&std::env::current_dir()?, &home);
             let sources = tainted
