@@ -395,30 +395,37 @@ impl Image {
         Image { width, height, rgb }
     }
 
-    /// As a PNG. Uncompressed (deflate's stored blocks): large but simple, and every viewer reads it.
+    /// As a PNG: each row filtered the way that leaves it with the smallest
+    /// numbers, then deflated. A desktop is mostly flat colour, so this is
+    /// a few percent of the raw size, which is what a phone watching it over a
+    /// connection (or a console polling it every second) needs.
     pub fn png(&self) -> Vec<u8> {
+        let stride = self.width as usize * 3;
         let mut raw = Vec::with_capacity(self.rgb.len() + self.height as usize);
-        for row in self.rgb.chunks_exact(self.width as usize * 3) {
-            raw.push(0); // filter: none
-            raw.extend_from_slice(row);
+        let blank = vec![0u8; stride];
+        let mut prev: &[u8] = &blank;
+        let (mut best, mut trial) = (Vec::with_capacity(stride), Vec::with_capacity(stride));
+        for row in self.rgb.chunks_exact(stride) {
+            let mut lowest = (u64::MAX, 0);
+            for kind in 0..=4u8 {
+                filter(kind, row, prev, &mut trial);
+                // The usual guess: the smaller the numbers (as signed bytes), the better it deflates.
+                let cost: u64 = trial.iter().map(|b| (*b as i8).unsigned_abs() as u64).sum();
+                if cost < lowest.0 {
+                    lowest = (cost, kind);
+                    std::mem::swap(&mut best, &mut trial);
+                }
+            }
+            raw.push(lowest.1);
+            raw.extend_from_slice(&best);
+            prev = row;
         }
-        let mut z = vec![0x78, 0x01];
-        let mut blocks = raw.chunks(65535).peekable();
-        if blocks.peek().is_none() {
-            z.extend([1, 0, 0, 0xff, 0xff]);
-        }
-        while let Some(block) = blocks.next() {
-            z.push(u8::from(blocks.peek().is_none()));
-            z.extend((block.len() as u16).to_le_bytes());
-            z.extend((!(block.len() as u16)).to_le_bytes());
-            z.extend(block);
-        }
-        z.extend(adler32(&raw).to_be_bytes());
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&raw, DEFLATE_LEVEL);
 
         let mut ihdr = Vec::new();
         ihdr.extend(self.width.to_be_bytes());
         ihdr.extend(self.height.to_be_bytes());
-        ihdr.extend([8, 2, 0, 0, 0]); // 8 bits, RGB, deflate, no filter scheme, no interlace
+        ihdr.extend([8, 2, 0, 0, 0]); // 8 bits, RGB, deflate, adaptive filtering, no interlace
         let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
         for (kind, body) in [(b"IHDR", ihdr.as_slice()), (b"IDAT", z.as_slice()), (b"IEND", &[][..])] {
             out.extend((body.len() as u32).to_be_bytes());
@@ -429,6 +436,39 @@ impl Image {
             out.extend(crc.to_be_bytes());
         }
         out
+    }
+}
+
+/// How hard to deflate: 1 is quick and leaves most of the gain on screens.
+const DEFLATE_LEVEL: u8 = 2;
+
+/// One of PNG's five row filters over RGB pixels (3 bytes each), into `out`.
+fn filter(kind: u8, row: &[u8], prev: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    for (i, x) in row.iter().enumerate() {
+        let a = if i >= 3 { row[i - 3] } else { 0 };
+        let b = prev[i];
+        let c = if i >= 3 { prev[i - 3] } else { 0 };
+        out.push(x.wrapping_sub(match kind {
+            0 => 0,
+            1 => a,
+            2 => b,
+            3 => ((a as u16 + b as u16) / 2) as u8,
+            _ => paeth(a, b, c),
+        }));
+    }
+}
+
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let (a, b, c) = (a as i16, b as i16, c as i16);
+    let p = a + b - c;
+    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
     }
 }
 
@@ -450,19 +490,6 @@ const CRC_TABLE: [u32; 256] = {
 
 fn crc32(data: &[u8]) -> u32 {
     !data.iter().fold(!0u32, |c, b| CRC_TABLE[((c ^ *b as u32) & 0xff) as usize] ^ (c >> 8))
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for chunk in data.chunks(5552) {
-        for byte in chunk {
-            a += *byte as u32;
-            b += a;
-        }
-        a %= 65521;
-        b %= 65521;
-    }
-    (b << 16) | a
 }
 
 #[cfg(test)]
@@ -499,8 +526,8 @@ mod tests {
         assert!(parse_xwd(&wrong).unwrap_err().to_string().contains("not an XWD"));
     }
 
-    /// Reads back a PNG made of stored blocks: (width, height, rows without their filter bytes).
-    fn unpng(png: &[u8]) -> (u32, u32, Vec<u8>) {
+    /// Reads a PNG back: (width, height, the pixels, the filters undone), and the filter each row used.
+    fn unpng(png: &[u8]) -> (u32, u32, Vec<u8>, Vec<u8>) {
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         let (mut i, mut idat, mut dims) = (8, Vec::new(), (0, 0));
         let mut kinds = Vec::new();
@@ -519,38 +546,118 @@ mod tests {
             i += 12 + len;
         }
         assert_eq!(kinds, ["IHDR", "IDAT", "IEND"]);
-        assert_eq!(&idat[..2], [0x78, 0x01]);
-        let (mut j, mut raw) = (2, Vec::new());
-        loop {
-            let last = idat[j] & 1 == 1;
-            let len = u16::from_le_bytes([idat[j + 1], idat[j + 2]]) as usize;
-            assert_eq!(u16::from_le_bytes([idat[j + 3], idat[j + 4]]), !(len as u16));
-            raw.extend(&idat[j + 5..j + 5 + len]);
-            j += 5 + len;
-            if last {
-                break;
+        let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat).expect("a zlib stream");
+        let stride = dims.0 as usize * 3;
+        assert_eq!(raw.len(), (stride + 1) * dims.1 as usize);
+        let (mut pixels, mut used, mut prev) = (Vec::new(), Vec::new(), vec![0u8; stride]);
+        for line in raw.chunks(stride + 1) {
+            used.push(line[0]);
+            let mut row = vec![0u8; stride];
+            for i in 0..stride {
+                let a = if i >= 3 { row[i - 3] } else { 0 };
+                let b = prev[i];
+                let c = if i >= 3 { prev[i - 3] } else { 0 };
+                let predicted = match line[0] {
+                    0 => 0,
+                    1 => a,
+                    2 => b,
+                    3 => ((a as u16 + b as u16) / 2) as u8,
+                    4 => paeth(a, b, c),
+                    other => panic!("filter {other}"),
+                };
+                row[i] = line[1 + i].wrapping_add(predicted);
             }
+            pixels.extend(&row);
+            prev = row;
         }
-        assert_eq!(u32::from_be_bytes(idat[j..j + 4].try_into().unwrap()), adler32(&raw));
-        let row = dims.0 as usize * 3 + 1;
-        let rows = raw.chunks(row).flat_map(|r| {
-            assert_eq!(r[0], 0, "no filter");
-            r[1..].to_vec()
-        });
-        (dims.0, dims.1, rows.collect())
+        (dims.0, dims.1, pixels, used)
     }
 
     #[test]
     fn a_png_reads_back_as_the_picture_it_was() {
         let image = Image { width: 3, height: 2, rgb: (0..18).collect() };
-        assert_eq!(unpng(&image.png()), (3, 2, (0..18).collect::<Vec<u8>>()));
-        // Bigger than one stored block (65535 bytes), too.
-        let big = Image { width: 200, height: 150, rgb: (0..200 * 150 * 3).map(|i| (i % 251) as u8).collect() };
-        let (w, h, rows) = unpng(&big.png());
-        assert_eq!((w, h, rows == big.rgb), (200, 150, true));
-        // Known values of the checksums.
+        let (w, h, pixels, _) = unpng(&image.png());
+        assert_eq!((w, h, pixels), (3, 2, (0..18).collect::<Vec<u8>>()));
+        // A bigger one with patterns (rows that want different filters), and noise.
+        let mut noise = 0x2545_f491u32;
+        let rgb: Vec<u8> = (0..200 * 150 * 3)
+            .map(|i| match (i / 600) % 3 {
+                0 => (i % 251) as u8,
+                1 => 90,
+                _ => {
+                    noise ^= noise << 13;
+                    noise ^= noise >> 17;
+                    noise ^= noise << 5;
+                    noise as u8
+                }
+            })
+            .collect();
+        let big = Image { width: 200, height: 150, rgb };
+        let (w, h, pixels, _) = unpng(&big.png());
+        assert_eq!((w, h, pixels == big.rgb), (200, 150, true));
+        // No picture, no rows: still a PNG.
+        let nothing = Image { width: 1, height: 1, rgb: vec![9, 8, 7] };
+        assert_eq!(unpng(&nothing.png()).2, [9, 8, 7]);
+        // Known value of the checksum.
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-        assert_eq!(adler32(b"Wikipedia"), 0x11e6_0398);
+    }
+
+    #[test]
+    fn every_filter_can_be_undone() {
+        // Rows that are neither flat nor smooth, so no filter can pass for another.
+        let (mut above, mut row, mut state) = (vec![0u8; 30], vec![0u8; 30], 7u32);
+        for _ in 0..2 {
+            for byte in above.iter_mut().chain(row.iter_mut()) {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (state >> 24) as u8;
+            }
+        }
+        for kind in 0..=4u8 {
+            let mut out = Vec::new();
+            filter(kind, &row, &above, &mut out);
+            let mut back = vec![0u8; row.len()];
+            for i in 0..row.len() {
+                let a = if i >= 3 { back[i - 3] } else { 0 };
+                let b = above[i];
+                let c = if i >= 3 { above[i - 3] } else { 0 };
+                let predicted = match kind {
+                    0 => 0,
+                    1 => a,
+                    2 => b,
+                    3 => ((a as u16 + b as u16) / 2) as u8,
+                    _ => paeth(a, b, c),
+                };
+                back[i] = out[i].wrapping_add(predicted);
+            }
+            assert_eq!(back, row, "filter {kind}");
+        }
+    }
+
+    #[test]
+    fn a_desktop_is_a_few_percent_of_its_size() {
+        // A grey desktop with a lighter window and a gradient bar: flat areas, edges and one smooth ramp.
+        let (w, h) = (1280u32, 800u32);
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let pixel = match (x, y) {
+                    (200..900, 150..600) => [235, 235, 235],
+                    (0..1280, 770..800) => [(x / 5) as u8, 80, 160],
+                    _ => [40, 44, 52],
+                };
+                rgb.extend(pixel);
+            }
+        }
+        let image = Image { width: w, height: h, rgb };
+        let png = image.png();
+        assert!(png.len() < image.rgb.len() / 50, "{} bytes for {}", png.len(), image.rgb.len());
+        let (_, _, pixels, used) = unpng(&png);
+        assert!(pixels == image.rgb);
+        // The gradient row wants Sub; flat rows are fine with anything cheap.
+        assert!(used.iter().any(|k| *k != 0), "some rows are filtered: {used:?}");
+        let started = std::time::Instant::now();
+        let _ = image.png();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "a frame takes {:?}", started.elapsed());
     }
 
     #[test]

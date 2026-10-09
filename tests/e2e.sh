@@ -48,7 +48,7 @@ reset_proj() {
 }
 
 latest_task_dir() { ls -td "$AGENTOS_HOME"/tasks/*/ | head -1; }
-# Reads a PNG made by `agent screen`: prints "WIDTH HEIGHT NONZERO-BYTES".
+# Reads a PNG made by `agent screen` (rows filtered, then deflated): prints "WIDTH HEIGHT NONZERO-BYTES".
 png_info() {
   [ -f "$WORK/png-info.py" ] || cat > "$WORK/png-info.py" <<'PY'
 import struct, sys, zlib
@@ -64,7 +64,20 @@ while i < len(d):
     i += 12 + n
 raw = zlib.decompress(idat)
 assert len(raw) == h * (1 + 3 * w), "wrong amount of pixels"
-print(w, h, sum(1 for b in raw if b))
+def paeth(a, b, c):
+    pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+    return a if pa <= pb and pa <= pc else b if pb <= pc else c
+stride, prev, lit = 3 * w, bytes(3 * w), 0
+for y in range(h):
+    kind, row = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+    if kind == 2: row = bytearray((p + q) & 255 for p, q in zip(row, prev))
+    elif kind:
+        for x in range(stride):
+            a, b, c = (row[x - 3], prev[x], prev[x - 3]) if x >= 3 else (0, prev[x], 0)
+            row[x] = (row[x] + (a if kind == 1 else (a + b) // 2 if kind == 3 else paeth(a, b, c))) & 255
+    lit += sum(1 for v in row if v)
+    prev = bytes(row)
+print(w, h, lit)
 PY
   python3 "$WORK/png-info.py" "$@"
 }
