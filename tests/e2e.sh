@@ -2392,7 +2392,8 @@ else
   # Two calls, then one too many, then a retry loop that shouldn't get far.
   cat > "$WORK/tools/model-agent/model-agent" <<SH
 #!/bin/sh
-call() { curl -sS -m 20 "\$1"; echo; }
+# (the stand-in API is a public service: a call it fumbles, with no usage and no refusal in the answer, is made again)
+call() { for n in 1 2 3 4; do r="\$(curl -sS -m 20 "\$1" 2>&1)"; case "\$r" in *usage*|*invalid_request_error*) break;; esac; sleep 1; done; printf '%s\\n' "\$r"; }
 call "$JSON_CALL"
 call "$SSE_CALL"
 call "$JSON_CALL"
@@ -2440,7 +2441,8 @@ else
   STORE2="$WORK/store-spend"
   cat > "$WORK/tools/model-agent/one-call" <<SH
 #!/bin/sh
-curl -sS -m 20 "$JSON_CALL"; echo
+for n in 1 2 3 4; do r="\$(curl -sS -m 20 "$JSON_CALL" 2>&1)"; case "\$r" in *usage*|*invalid_request_error*) break;; esac; sleep 1; done
+printf '%s\\n' "\$r"
 SH
   chmod +x "$WORK/tools/model-agent/one-call"
   cat > "$WORK/cfg/agents/onecall.toml" <<TOML
@@ -2477,7 +2479,10 @@ else
   # Three calls at $0.30: the third finds a $0.50 budget used up, and waits.
   cat > "$WORK/tools/model-agent/three-calls" <<SH
 #!/bin/sh
-for i in 1 2 3; do curl -sS -m 200 "$JSON_CALL"; echo; done
+for i in 1 2 3; do
+  for n in 1 2 3 4; do r="\$(curl -sS -m 200 "$JSON_CALL" 2>&1)"; case "\$r" in *usage*|*invalid_request_error*) break;; esac; sleep 1; done
+  printf '%s\\n' "\$r"
+done
 echo done-calling
 SH
   chmod +x "$WORK/tools/model-agent/three-calls"
