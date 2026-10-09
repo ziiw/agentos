@@ -385,6 +385,11 @@ pub(crate) struct GrantArgs {
     /// credential --secret would add, when you commit. Exact host names.
     #[arg(long, value_name = "HOST")]
     pub(crate) hold: Vec<String>,
+    /// Which syscalls the agent may make: "default" refuses a list of
+    /// dangerous ones, "strict" allows only those Docker's default profile
+    /// does (everything else is refused)
+    #[arg(long, value_parser = ["default", "strict"], value_name = "MODE")]
+    pub(crate) seccomp: Option<String>,
     /// Give the task a screen of its own: a private virtual display (Xvfb)
     /// the agent's graphical programs draw on. `agent screen` shows it.
     #[arg(long)]

@@ -372,6 +372,7 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         proxy: proxy_socket.clone(),
         locals: plan.local.clone(),
         display: screen.is_some(),
+        strict_seccomp: plan.strict_seccomp,
         run_mounts,
         hostname: format!("agent-{}", task.id()),
         home,

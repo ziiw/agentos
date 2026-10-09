@@ -107,6 +107,16 @@ struct ConfigFile {
     hook: BTreeMap<String, crate::schedule::Hook>,
     #[serde(default)]
     watch: BTreeMap<String, crate::watch::Watch>,
+    #[serde(default)]
+    sandbox: SandboxSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxSection {
+    /// "default" (a denylist of dangerous syscalls) or "strict" (an allowlist: Docker's profile).
+    #[serde(default)]
+    seccomp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +250,8 @@ pub struct Settings {
     pub agent: Option<String>,
     /// Where finished tasks' signed receipts are posted.
     pub witness: Option<String>,
+    /// An allowlist of syscalls for every task, not just a denylist.
+    pub strict_seccomp: bool,
     /// Which key signs a task's receipt, and the TPM PCRs it carries.
     pub receipt_key: crate::attest::KeyKind,
     pub receipt_pcrs: Vec<u32>,
@@ -396,6 +408,12 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         hook.validate().with_context(|| format!("{shown}: [hook.{}]", hook.name))?;
         s.hooks.retain(|x| x.name != hook.name);
         s.hooks.push(hook);
+    }
+    // (a project may only tighten this: "default" changes nothing)
+    match file.sandbox.seccomp.as_deref() {
+        None | Some("default") => {}
+        Some("strict") => s.strict_seccomp = true,
+        Some(other) => bail!("{shown}: [sandbox] seccomp is \"default\" or \"strict\", not {other:?}"),
     }
     for (name, mut watch) in file.watch {
         watch.name = name;

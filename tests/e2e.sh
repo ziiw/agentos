@@ -166,7 +166,7 @@ check "store refused as a writable grant" test $? -eq 2
 check "/usr is read-only" "$AGENT" run -- sh -c '! touch /usr/agentos-probe'
 
 section "syscall filter (seccomp)"
-check "seccomp is enforced" bash -c "'$AGENT' run -- true 2>/dev/null; grep -q '\"seccomp\":\"enforced\"' \"\$(ls -td '$AGENTOS_HOME'/tasks/*/ | head -1)events.jsonl\""
+check "seccomp is enforced" bash -c "'$AGENT' run -- true 2>/dev/null; grep -q '\"seccomp\":\"enforced' \"\$(ls -td '$AGENTOS_HOME'/tasks/*/ | head -1)events.jsonl\""
 check "no new namespaces from inside (nested sandbox escape)" "$AGENT" run -- sh -c '! unshare -U true 2>/dev/null'
 if command -v python3 >/dev/null && command -v script >/dev/null; then
   cat > "$PROJ/tiocsti.py" <<'PY'
@@ -186,6 +186,29 @@ subprocess.run(["sh", "-c", "true"], check=True)'
   rm -f "$PROJ/tiocsti.py"
 else
   skip "TIOCSTI and thread checks need python3 and script(1)"
+fi
+# A stricter filter: an allowlist (Docker's default profile) in place of a list of what is refused.
+if command -v python3 >/dev/null; then
+  cat > "$PROJ/kcmp.py" <<'PY'
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+n = 312 if os.uname().machine == "x86_64" else 272   # kcmp: harmless, and not on Docker's list
+print("kcmp", libc.syscall(n, os.getpid(), os.getpid(), 0, 0, 0), ctypes.get_errno())
+PY
+  check "by default a syscall that is on no list works (kcmp)" grep -q 'kcmp 0 0' <<<"$(env -u AGENTOS_SECCOMP "$AGENT" run -- python3 kcmp.py 2>&1)"
+  out="$("$AGENT" run --seccomp strict -- python3 kcmp.py 2>&1)"
+  check "--seccomp strict refuses it: only what Docker's profile allows is allowed" grep -q 'kcmp -1 1' <<<"$out"
+  check "...and the journal says so" grep -q '"seccomp":"enforced (strict)"' "$(latest_task_dir)/events.jsonl"
+  check "ordinary programs still run under it: threads, fork and exec, sockets" "$AGENT" run --seccomp strict -- python3 -c '
+import socket, subprocess, threading
+t = threading.Thread(target=lambda: None); t.start(); t.join()
+subprocess.run(["sh", "-c", "true"], check=True)
+socket.socket(socket.AF_INET).close(); socket.socket(socket.AF_UNIX).close()'
+  check "...and no new namespaces from inside, still" "$AGENT" run --seccomp strict -- sh -c '! unshare -U true 2>/dev/null'
+  check "a mode that isn't one is refused" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" run --seccomp loose -- true
+  rm -f "$PROJ/kcmp.py"
+else
+  skip "the strict filter checks need python3"
 fi
 
 section "secrets stay out"
@@ -1319,6 +1342,34 @@ check "...and not counted as a problem" bash -c '! grep -q "example.org:443: not
 check "...while anything else it reaches for still is" grep -q 'blocked example.net:443' <<<"$out"
 check "...the journal keeps the difference" grep -q '"expected":true.*"host":"example.org"' "$(latest_task_dir)/events.jsonl"
 check "...in the summary only the other is counted" grep -q '1 connection blocked' <<<"$out"
+# The strict syscall filter can be asked for by an agent's file, your config, or a project (which can only tighten).
+cat > "$WORK/cfg/agents/careful.toml" <<'TOML'
+run = ["sh", "-c", "echo careful"]
+seccomp = "strict"
+TOML
+strict_in() { grep -q '"seccomp":"enforced (strict)"' "$(latest_task_dir)/events.jsonl"; }
+: > "$CFG"
+env -u AGENTOS_SECCOMP AGENTOS_CONFIG="$CFG" "$AGENT" do --agent careful go >/dev/null 2>&1
+check "an agent's file can ask for the strict syscall filter" strict_in
+env -u AGENTOS_SECCOMP AGENTOS_CONFIG="$CFG" "$AGENT" do --agent echo go >/dev/null 2>&1
+check "...and one that doesn't isn't given it" bash -c '! grep -q "enforced (strict)" "$1/events.jsonl"' _ "$(latest_task_dir)"
+printf '[sandbox]\nseccomp = "strict"\n' > "$CFG"
+env -u AGENTOS_SECCOMP AGENTOS_CONFIG="$CFG" "$AGENT" do --agent echo go >/dev/null 2>&1
+check "your config can ask for it for every task" strict_in
+printf '[sandbox]\nseccomp = "loose"\n' > "$CFG"
+check "...but only by a mode it knows" grep -q 'seccomp is "default" or "strict"' <<<"$(AGENTOS_CONFIG="$CFG" "$AGENT" do --agent echo go 2>&1)"
+: > "$CFG"
+printf '[sandbox]\nseccomp = "strict"\n' > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+env -u AGENTOS_SECCOMP "$AGENT" run -- true >/dev/null 2>&1
+check "a project can ask for it, since that only tightens" strict_in
+printf '[sandbox]\nseccomp = "default"\n' > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+printf '[sandbox]\nseccomp = "strict"\n' > "$CFG"
+env -u AGENTOS_SECCOMP AGENTOS_CONFIG="$CFG" "$AGENT" run -- true >/dev/null 2>&1
+check "...but can't take away what your config asked for" strict_in
+rm -f .agentos.toml
+: > "$CFG"
 
 section "agent packages (an agent, and what it asks for)"
 reset_proj

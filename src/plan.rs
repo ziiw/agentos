@@ -73,10 +73,13 @@ pub(crate) struct Plan {
     pub(crate) receipt_pcrs: Vec<u32>,
     /// A virtual screen of its own, and its size.
     pub(crate) display: Option<(u32, u32)>,
+    /// Only the syscalls of the strict list.
+    pub(crate) strict_seccomp: bool,
 }
 
 /// What the config files add to a task beyond its grants.
 pub(crate) struct Applied {
+    pub(crate) strict_seccomp: bool,
     pub(crate) witness: Option<String>,
     pub(crate) receipt_key: agentos::attest::KeyKind,
     pub(crate) receipt_pcrs: Vec<u32>,
@@ -106,7 +109,7 @@ pub(crate) fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Appl
     settings.allow.extend(approvals::remembered(store.root(), &approvals::project_root(&cwd, &home))?);
     grants.ro.extend(settings.ro);
     grants.hide.extend(settings.hide);
-    Ok(Applied { witness: settings.witness, receipt_key: settings.receipt_key, receipt_pcrs: settings.receipt_pcrs, allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, local: settings.local, hold: settings.hold, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
+    Ok(Applied { strict_seccomp: settings.strict_seccomp, witness: settings.witness, receipt_key: settings.receipt_key, receipt_pcrs: settings.receipt_pcrs, allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, local: settings.local, hold: settings.hold, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
 }
 
 /// The proxy the egress proxy goes through: your config's, else the one in
@@ -125,6 +128,12 @@ pub(crate) fn screen_for(grants: &GrantArgs, agent_wants: Option<(u32, u32)>) ->
         return Ok(Some(display::parse_size(grants.display_size.as_deref().unwrap_or(display::DEFAULT_SIZE)).context("--display-size")?));
     }
     Ok(agent_wants)
+}
+
+/// Whether a task gets only the strict list of syscalls: its flag, your config, its agent's
+/// file, or `AGENTOS_SECCOMP=strict` (for running the tests under it). Each only tightens.
+pub(crate) fn strict_seccomp_for(grants: &GrantArgs, configured: bool, agent_wants: bool) -> bool {
+    grants.seccomp.as_deref() == Some("strict") || configured || agent_wants || std::env::var("AGENTOS_SECCOMP").is_ok_and(|v| v == "strict")
 }
 
 /// The hosts whose writes a task holds: your config's and --hold's, once each.
@@ -357,6 +366,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     let local = local_ports(applied.local.into_iter().chain(profile.local.iter().copied()).collect(), &args.grants.local);
     let hold = hold_hosts(applied.hold, &args.grants.hold)?;
     let screen = screen_for(&args.grants, profile.display)?;
+    let strict = strict_seccomp_for(&args.grants, applied.strict_seccomp, profile.strict_seccomp);
     args.grants.ro.extend(profile.ro.iter().cloned());
     let net = args.net.unwrap_or(profile.net);
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
@@ -425,6 +435,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             receipt_key: applied.receipt_key,
             receipt_pcrs: applied.receipt_pcrs,
             display: screen,
+            strict_seccomp: strict,
         },
     )
 }
@@ -440,6 +451,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     let local = local_ports(applied.local, &args.grants.local);
     let hold = hold_hosts(applied.hold, &args.grants.hold)?;
     let screen = screen_for(&args.grants, None)?;
+    let strict = strict_seccomp_for(&args.grants, applied.strict_seccomp, false);
     let mut secrets = parse_secrets(&args.grants.secret, &commands)?;
     let ask = args.grants.ask;
     let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask || !args.grants.hold.is_empty();
@@ -493,6 +505,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             receipt_key: applied.receipt_key,
             receipt_pcrs: applied.receipt_pcrs,
             display: screen,
+            strict_seccomp: strict,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {

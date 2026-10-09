@@ -5,5 +5,5 @@
 #   swtpm, tpm2-tools  receipts signed by a TPM ([journal] key = "tpm"), against a software TPM
 FROM rust:1.94-bookworm
 RUN apt-get update -qq \
- && apt-get install -y -qq --no-install-recommends xvfb x11-utils xdotool xauth dbus dbus-daemon dbus-bin systemd swtpm swtpm-tools tpm2-tools libtss2-tcti-swtpm0 \
+ && apt-get install -y -qq --no-install-recommends xvfb x11-utils xdotool xauth dbus dbus-daemon dbus-bin systemd swtpm swtpm-tools tpm2-tools libtss2-tcti-swtpm0 strace \
  && rm -rf /var/lib/apt/lists/*

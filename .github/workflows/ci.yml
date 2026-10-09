@@ -51,6 +51,11 @@ jobs:
       - name: End-to-end tests
         run: REQUIRE_LANDLOCK=1 bash tests/e2e.sh
 
+      - name: End-to-end tests again, every task under the strict syscall filter
+        # (the strict list is generated per architecture; this one can't be tried on an arm laptop)
+        if: matrix.runner == 'ubuntu-24.04'
+        run: AGENTOS_SECCOMP=strict REQUIRE_LANDLOCK=1 bash tests/e2e.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: agent-${{ matrix.runner }}

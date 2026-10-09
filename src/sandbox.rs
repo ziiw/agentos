@@ -139,6 +139,9 @@ pub struct Spec {
     /// The task has a virtual screen: its socket is the run mount `x11.sock`,
     /// found as display :0 (`/tmp/.X11-unix/X0`).
     pub display: bool,
+    /// Allow only the syscalls of a strict list (Docker's default profile), on top of
+    /// refusing the dangerous ones.
+    pub strict_seccomp: bool,
     /// Host files or directories exposed as /run/agentos/<name>: the task
     /// CA (read-only), the git outbox (writable), …
     pub run_mounts: Vec<RunMount>,
@@ -548,8 +551,8 @@ fn sandbox_init(spec: &Spec, warnings: Vec<String>, report_tx: OwnedFd, stdout: 
     };
     report.cwd = cwd.display().to_string();
     report.landlock = apply_landlock(spec);
-    report.seccomp = match apply_seccomp() {
-        Ok(()) => "enforced".into(),
+    report.seccomp = match apply_seccomp(spec.strict_seccomp) {
+        Ok(()) => if spec.strict_seccomp { "enforced (strict)" } else { "enforced" }.into(),
         Err(e) => {
             report.warnings.push(format!("seccomp filter not applied: {e:#}"));
             format!("error: {e:#}")
@@ -849,7 +852,7 @@ fn blank_out(target: &Path) -> Result<()> {
 /// Syscalls an agent has no business making: kernel interfaces with a long
 /// record of exploits (bpf, io_uring, keyrings, userfaultfd, perf) and ways
 /// to rearrange its own sandbox (new namespaces, mounts, modules).
-const DENIED_SYSCALLS: &[libc::c_long] = &[
+pub(crate) const DENIED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_add_key,
     libc::SYS_request_key,
     libc::SYS_keyctl,
@@ -890,7 +893,30 @@ const NAMESPACE_FLAGS: &[u64] = &[0x0002_0000, 0x0200_0000, 0x0400_0000, 0x0800_
 const TIOCSTI: u64 = 0x5412;
 const TIOCLINUX: u64 = 0x541C;
 
-fn apply_seccomp() -> Result<()> {
+/// Address families `socket(2)` may be asked for under the strict list: Docker's.
+const STRICT_SOCKET_FAMILIES: &[u64] = &[0, 1, 2, 7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 21, 22, 24, 26, 27, 28, 29, 30, 31, 32, 33, 35, 36, 39, 41, 42, 43, 44, 45];
+/// `personality(2)` values the strict list allows: Linux's own, and a query.
+const STRICT_PERSONALITIES: &[u64] = &[0, 8, 0x20000, 0x20008, 0xffff_ffff];
+/// clone(2) namespace flags, as one mask (NEWNS … NEWCGROUP).
+const STRICT_CLONE_MASK: u64 = 0x7e02_0000;
+
+/// The strict list as a filter: what is not on it is refused with EPERM.
+fn strict_filter(arch: seccompiler::TargetArch) -> Result<seccompiler::BpfProgram> {
+    use seccompiler::{SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule};
+    use std::collections::BTreeMap;
+    let eq = |value: u64| -> Result<SeccompRule> { Ok(SeccompRule::new(vec![SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, value)?])?) };
+    let mut allow: BTreeMap<i64, Vec<SeccompRule>> = crate::seccomp_strict::STRICT.iter().map(|&(_, number)| (number, Vec::new())).collect();
+    allow.insert(libc::SYS_socket as i64, STRICT_SOCKET_FAMILIES.iter().map(|&f| eq(f)).collect::<Result<_>>()?);
+    allow.insert(libc::SYS_personality as i64, STRICT_PERSONALITIES.iter().map(|&p| eq(p)).collect::<Result<_>>()?);
+    // clone: threads and processes, but no new namespaces (clone3 is answered ENOSYS below).
+    allow.insert(
+        libc::SYS_clone as i64,
+        vec![SeccompRule::new(vec![SeccompCondition::new(0, SeccompCmpArgLen::Qword, SeccompCmpOp::MaskedEq(STRICT_CLONE_MASK), 0)?])?],
+    );
+    Ok(SeccompFilter::new(allow, SeccompAction::Errno(libc::EPERM as u32), SeccompAction::Allow, arch)?.try_into()?)
+}
+
+fn apply_seccomp(strict: bool) -> Result<()> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, TargetArch};
     use std::collections::BTreeMap;
 
@@ -920,6 +946,12 @@ fn apply_seccomp() -> Result<()> {
     )?
     .try_into()?;
     prctl::set_no_new_privs()?;
+    // The strict list goes first: filters answer in the reverse of the order they were
+    // installed, and of two refusals the later-installed one is heard, so clone3's
+    // ENOSYS (which makes libc fall back to clone) is not drowned out by an EPERM.
+    if strict {
+        seccompiler::apply_filter(&strict_filter(arch)?)?;
+    }
     seccompiler::apply_filter(&clone3)?;
     seccompiler::apply_filter(&deny)?;
     Ok(())
@@ -1091,4 +1123,59 @@ fn send_failure_with(tx: &OwnedFd, mut report: Report, err: anyhow::Error) -> i3
     report.error = Some(format!("{err:#}"));
     send_report(tx, &report);
     125
+}
+
+#[cfg(test)]
+mod strict_tests {
+    use super::*;
+    use crate::seccomp_strict::STRICT;
+
+    fn listed(name: &str) -> bool {
+        STRICT.iter().any(|(n, _)| *n == name)
+    }
+
+    #[test]
+    fn the_strict_list_has_what_every_program_needs() {
+        for needed in [
+            "read", "write", "openat", "close", "mmap", "munmap", "mprotect", "brk", "execve", "exit_group", "futex", "clock_gettime", "getrandom", "rt_sigaction",
+            "rt_sigprocmask", "prctl", "ioctl", "fcntl", "pipe2", "dup3", "wait4", "kill", "connect", "sendto", "recvfrom", "epoll_pwait", "newfstatat", "statx",
+            "getdents64", "rseq", "set_tid_address", "sched_getaffinity", "seccomp", "landlock_create_ruleset", "memfd_create", "prlimit64", "ptrace", "renameat",
+            "renameat2", "fchmodat", "utimensat", "unlinkat", "mkdirat", "symlinkat", "linkat", "readlinkat", "faccessat2", "copy_file_range", "sendfile", "socketpair",
+        ] {
+            assert!(listed(needed), "{needed} should be on the strict list");
+        }
+        assert!(STRICT.len() > 200, "{} syscalls", STRICT.len());
+    }
+
+    #[test]
+    fn the_strict_list_is_a_subset_of_what_the_denylist_leaves() {
+        for denied in DENIED_SYSCALLS {
+            assert!(!STRICT.iter().any(|&(_, num)| num == *denied as i64), "syscall {denied} is denied, so it can't be on the strict list");
+        }
+        // Things that rearrange the sandbox or reach into the kernel stay off, whatever the denylist says.
+        for off in ["kcmp", "clone3", "chroot", "sethostname", "syslog", "quotactl", "fanotify_init", "lookup_dcookie", "mount", "setns", "bpf"] {
+            assert!(!listed(off), "{off} should not be on the strict list");
+        }
+        // The calls with a condition are written by hand, not listed outright.
+        for conditional in ["socket", "personality", "clone"] {
+            assert!(!listed(conditional), "{conditional} gets a rule in strict_filter");
+        }
+        // A name once (two names may share a number: aliases).
+        let mut names: Vec<&str> = STRICT.iter().map(|&(n, _)| n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), STRICT.len());
+        // And the numbers are this machine's: a few we can check against libc.
+        for (name, libc_number) in [("read", libc::SYS_read), ("openat", libc::SYS_openat), ("execve", libc::SYS_execve), ("futex", libc::SYS_futex), ("exit_group", libc::SYS_exit_group)] {
+            assert_eq!(STRICT.iter().find(|(n, _)| *n == name).map(|p| p.1), Some(libc_number as i64), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_strict_filter_builds_for_this_machine() {
+        use seccompiler::TargetArch;
+        let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
+        let program = strict_filter(arch).unwrap();
+        assert!(program.len() > 100 && program.len() < 4096 * 4, "{} instructions", program.len());
+    }
 }

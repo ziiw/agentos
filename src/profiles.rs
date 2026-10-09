@@ -48,6 +48,8 @@ pub struct Profile {
     pub ro: Vec<PathBuf>,
     /// A screen of its own, for graphical programs: its size.
     pub display: Option<(u32, u32)>,
+    /// Only the syscalls of a strict list (see `seccomp = "strict"`).
+    pub strict_seccomp: bool,
 }
 
 /// `task: None` opens an interactive session. Agents other than the
@@ -154,6 +156,9 @@ pub struct AgentFile {
     /// Its size, WIDTHxHEIGHT (default 1280x800); implies `display`.
     #[serde(default)]
     pub display_size: Option<String>,
+    /// "strict": it may make only the syscalls Docker's default profile allows (default: all but a list of dangerous ones).
+    #[serde(default)]
+    pub seccomp: Option<String>,
     /// Hosts it reaches for that stay closed on purpose, and why (one line):
     /// explained once in its output, journaled, and not counted as a problem.
     #[serde(default)]
@@ -253,6 +258,11 @@ fn from_file(name: &str, file: &Path, task: Option<&str>, interactive: bool, hom
             .then(|| crate::display::parse_size(def.display_size.as_deref().unwrap_or(crate::display::DEFAULT_SIZE)))
             .transpose()
             .with_context(|| format!("{}: display_size", file.display()))?,
+        strict_seccomp: match def.seccomp.as_deref() {
+            None | Some("default") => false,
+            Some("strict") => true,
+            Some(other) => bail!("{}: seccomp is \"default\" or \"strict\", not {other:?}", file.display()),
+        },
     })
 }
 
@@ -339,6 +349,7 @@ fn claude(task: Option<&str>, interactive: bool, home: &Path, mcp: &[String]) ->
         local: Vec::new(),
         ro: Vec::new(),
         display: None,
+        strict_seccomp: false,
     })
 }
 
