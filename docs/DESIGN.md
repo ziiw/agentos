@@ -93,7 +93,7 @@ supervisor (host)       validates grants, writes the journal, survives Ctrl-C
 |---|---|---|
 | **0. Transactions** ✅ | Sandbox, overlay transactions, diff/commit/rollback, journal, doctor | An agent's risky change, reviewed and half rolled back |
 | **1. The layer** ◐ | `agentd` + the items below, shipped as .deb/.rpm "agent layer for Linux" (M30) ✅; next: a signed apt/dnf repository | Outside developers use it daily |
-| **2. The distro** ◐ | bootc image with agentos and agentd built in (M11) ✅; disks for clouds and VMs, with cloud-init (M31) ✅; next: microVM tier, a published image to follow with `bootc upgrade` (pushing it to a registry is the owner's call, so CI doesn't) | Teams run agent fleets on it |
+| **2. The distro** ◐ | bootc image with agentos and agentd built in (M11) ✅; disks for clouds and VMs, with cloud-init (M31) ✅; next: the microVM tier (designed [below](#the-microvm-tier-design)), a published image to follow with `bootc upgrade` (pushing it to a registry is the owner's call, so CI doesn't) | Teams run agent fleets on it |
 | **3. Desktop** ◐ | Wayland session with a separate display per agent (watch, take over); local model service (agents reach the model server on your machine, M32 ✅) | Early adopters use it as their daily machine |
 | **4. Ecosystem** ◐ | Agent packages that declare the permissions they need (M33 ✅), a registry (M37 ✅, signed indexes M39 ✅; next: publishing, key rotation), remote attestation: signed journal heads and a witness (M35 ✅; next: a TPM-held key, verifying a whole machine's state) | Other developers build on it |
 
