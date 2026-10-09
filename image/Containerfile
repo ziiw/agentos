@@ -9,7 +9,8 @@
 # Turn it into a bootable disk, or move an existing bootc machine onto it:
 # see image/README.md.
 
-FROM docker.io/library/rust:1.94-bookworm AS build
+# (Amazon's public mirror of the official image: Docker Hub refuses anonymous pulls from busy CI runners)
+FROM public.ecr.aws/docker/library/rust:1.94-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src

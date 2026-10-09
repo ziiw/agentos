@@ -100,7 +100,8 @@ jobs:
 
       - name: Install the .rpm on Fedora
         run: |
-          docker run --rm -v "$PWD/dist:/dist:ro" fedora:42 sh -c '
+          # (Fedora's own registry: Docker Hub refuses anonymous pulls from busy runners)
+          docker run --rm -v "$PWD/dist:/dist:ro" registry.fedoraproject.org/fedora:42 sh -c '
             dnf install -y /dist/*.rpm >/dev/null
             rpm -qi agentos | head -4
             agent --version
