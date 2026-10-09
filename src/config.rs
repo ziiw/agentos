@@ -103,13 +103,21 @@ struct ConfigFile {
     hook: BTreeMap<String, crate::schedule::Hook>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Keys {
+    One(String),
+    Many(Vec<String>),
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistrySection {
     #[serde(default)]
     url: Option<String>,
+    /// One key, or a list while a publisher changes keys.
     #[serde(default)]
-    key: Option<String>,
+    key: Option<Keys>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -219,8 +227,8 @@ pub struct Settings {
     pub witness: Option<String>,
     /// The index `agent install NAME` and `agent search` read.
     pub registry: Option<String>,
-    /// The publisher's key the index must be signed by, if you gave one.
-    pub registry_key: Option<String>,
+    /// The publisher's keys, one of which the index must be signed by (none: not checked).
+    pub registry_keys: Vec<String>,
     /// Tasks agentd starts on a timer.
     pub schedules: Vec<crate::schedule::Schedule>,
     /// Tasks an event starts.
@@ -381,9 +389,22 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         crate::registry::valid_url(url).map_err(|e| anyhow::anyhow!("{shown}: [registry] url: {e}"))?;
         s.registry = Some(url.clone());
     }
-    if let Some(key) = &file.registry.key {
-        crate::registry::valid_key(key).map_err(|e| anyhow::anyhow!("{shown}: [registry] key: {e}"))?;
-        s.registry_key = Some(key.to_ascii_lowercase());
+    if let Some(keys) = &file.registry.key {
+        let keys = match keys {
+            Keys::One(key) => std::slice::from_ref(key),
+            Keys::Many(keys) => keys.as_slice(),
+        };
+        if keys.is_empty() {
+            bail!("{shown}: [registry] key is empty, which would mean nobody's signature is needed: give the key, or take the line out");
+        }
+        s.registry_keys.clear();
+        for key in keys {
+            crate::registry::valid_key(key).map_err(|e| anyhow::anyhow!("{shown}: [registry] key: {e}"))?;
+            let key = key.to_ascii_lowercase();
+            if !s.registry_keys.contains(&key) {
+                s.registry_keys.push(key);
+            }
+        }
     }
     if let Some(url) = &file.journal.witness {
         crate::attest::valid_witness(url).map_err(|e| anyhow::anyhow!("{shown}: [journal] witness: {e}"))?;
@@ -672,6 +693,26 @@ mod tests {
             let parsed = toml::from_str::<ConfigFile>(bad);
             let applied = parsed.map_err(anyhow::Error::from).and_then(|f| apply(&mut Settings::default(), f, Path::new("c"), None, &e.home));
             assert!(applied.is_err(), "should refuse: {bad}");
+        }
+    }
+
+    #[test]
+    fn a_registry_trusts_one_key_or_several_while_a_publisher_changes_keys() {
+        let e = env();
+        let (a, b) = ("a".repeat(64), "B".repeat(64));
+        let read = |toml: &str| {
+            let file: ConfigFile = toml::from_str(toml).unwrap();
+            let mut s = Settings::default();
+            apply(&mut s, file, Path::new("config.toml"), None, &e.home).map(|_| s.registry_keys)
+        };
+        assert_eq!(read("").unwrap(), Vec::<String>::new(), "no key: the index isn't checked");
+        assert_eq!(read(&format!("[registry]\nkey = \"{a}\"\n")).unwrap(), [a.clone()]);
+        assert_eq!(read(&format!("[registry]\nkey = [\"{a}\", \"{b}\"]\n")).unwrap(), [a.clone(), b.to_ascii_lowercase()], "in the order given, lowercased");
+        assert_eq!(read(&format!("[registry]\nkey = [\"{a}\", \"{a}\"]\n")).unwrap(), [a.clone()], "once");
+        // An empty list would look like protection and be none.
+        assert!(read("[registry]\nkey = []\n").unwrap_err().to_string().contains("nobody's signature is needed"));
+        for bad in [format!("[registry]\nkey = [\"{a}\", \"abc\"]\n"), "[registry]\nkey = \"abc\"\n".to_string()] {
+            assert!(read(&bad).unwrap_err().to_string().contains("expected an Ed25519 public key"), "{bad}");
         }
     }
 }

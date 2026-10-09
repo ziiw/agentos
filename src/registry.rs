@@ -19,6 +19,9 @@
 //! The index is as trustworthy as the host it's fetched from, unless you also
 //! give the publisher's key: `key = "…"` (an Ed25519 public key, hex) makes
 //! agentos fetch `index.json.sig` too and refuse an index that key didn't sign.
+//! A publisher changing keys signs with both for a while (`index.json.sig` has
+//! a signature a line), and readers list both (`key = ["old", "new"]`) until
+//! they've moved: any one of your keys having signed it is enough.
 //! The hash makes sure the tarball is the one that index named.
 
 use crate::util::hex;
@@ -39,6 +42,9 @@ const MAX_TARBALL: u64 = 32 * 1024 * 1024;
 #[derive(Debug, Deserialize)]
 pub struct Index {
     pub packages: BTreeMap<String, Entry>,
+    /// Which of your keys vouched for it (its short name), when you gave keys.
+    #[serde(skip)]
+    pub signed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,15 +84,20 @@ fn get(url: &str, limit: u64) -> Result<Vec<u8>> {
     response.body_mut().with_config().limit(limit).read_to_vec().with_context(|| format!("read {url} (at most {} MB)", limit / 1024 / 1024))
 }
 
-/// The index at `url`. With `key` (the publisher's public key, hex) the
-/// index must carry that key's signature, at `{url}.sig`.
-pub fn index(url: &str, key: Option<&str>) -> Result<Index> {
+/// The index at `url`. With `keys` (the publisher's public keys, hex) the
+/// index must carry the signature of one of them, at `{url}.sig`.
+pub fn index(url: &str, keys: &[String]) -> Result<Index> {
     let raw = get(url, MAX_INDEX)?;
-    if let Some(key) = key {
-        let sig = get(&format!("{url}.sig"), 1024).with_context(|| format!("{url} must be signed by the key in your config, and its signature ({url}.sig) couldn't be fetched"))?;
-        verify(&raw, String::from_utf8_lossy(&sig).trim(), key).map_err(|e| anyhow::anyhow!("{url}: {e}: nothing was read from it"))?;
+    let mut signed_by = None;
+    if !keys.is_empty() {
+        let sig = get(&format!("{url}.sig"), 4096).with_context(|| {
+            format!("{url} must be signed by {} in your config, and its signature ({url}.sig) couldn't be fetched", if keys.len() == 1 { "the key" } else { "one of the keys" })
+        })?;
+        signed_by = Some(verify_any(&raw, &String::from_utf8_lossy(&sig), keys).map_err(|e| anyhow::anyhow!("{url}: {e}: nothing was read from it"))?);
     }
-    serde_json::from_slice(&raw).with_context(|| format!("{url}: not a registry index"))
+    let mut index: Index = serde_json::from_slice(&raw).with_context(|| format!("{url}: not a registry index"))?;
+    index.signed_by = signed_by;
+    Ok(index)
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -168,6 +179,18 @@ pub fn keygen(path: &Path) -> Result<String> {
     Ok(hex(pair.public_key().as_ref()))
 }
 
+/// A short name for a publisher's key, to compare and to say who signed.
+pub fn key_id(public_hex: &str) -> String {
+    crate::attest::key_id(public_hex)
+}
+
+/// The public key (hex) of a key file `keygen` made.
+pub fn public_key(path: &Path) -> Result<String> {
+    let pkcs8 = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let pair = Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| anyhow::anyhow!("{} isn't a key made by `agent registry keygen`", path.display()))?;
+    Ok(hex(pair.public_key().as_ref()))
+}
+
 /// The signature (hex) of `index` by the key in `path`.
 pub fn sign(index: &[u8], path: &Path) -> Result<String> {
     let pkcs8 = fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -179,6 +202,21 @@ pub fn sign(index: &[u8], path: &Path) -> Result<String> {
 pub fn verify(index: &[u8], signature: &str, key: &str) -> Result<(), String> {
     valid_key(key)?;
     UnparsedPublicKey::new(&ED25519, unhex(key)).verify(index, &unhex(signature)).map_err(|_| "its signature isn't the key's".to_string())
+}
+
+/// Whether one of the signatures in `signatures` (a line each) is one of
+/// `keys`' over `index`; if so, the short name of the key that made it.
+pub fn verify_any(index: &[u8], signatures: &str, keys: &[String]) -> Result<String, String> {
+    for key in keys {
+        valid_key(key)?;
+    }
+    let lines: Vec<&str> = signatures.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    for key in keys {
+        if lines.iter().any(|sig| verify(index, sig, key).is_ok()) {
+            return Ok(key_id(key));
+        }
+    }
+    Err(if keys.len() == 1 { "its signature isn't the key's".to_string() } else { "none of the keys in your config signed it".to_string() })
 }
 
 /// `entry.url` as an address: relative ones are resolved against the index.
@@ -279,6 +317,32 @@ mod tests {
         assert!(verify(index, &signature, &other).is_err(), "another publisher's key");
         assert!(verify(index, "", &public).is_err() && verify(index, &signature, "abc").is_err());
     }
+
+    #[test]
+    fn a_publisher_can_change_keys_without_stranding_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old_file, new_file, other_file) = (dir.path().join("old.key"), dir.path().join("new.key"), dir.path().join("other.key"));
+        let (old, new, other) = (keygen(&old_file).unwrap(), keygen(&new_file).unwrap(), keygen(&other_file).unwrap());
+        assert_eq!(public_key(&old_file).unwrap(), old);
+        let index = br#"{"packages":{}}"#;
+        let (by_old, by_new) = (sign(index, &old_file).unwrap(), sign(index, &new_file).unwrap());
+        // While both sign, a reader with either key (or both) is satisfied.
+        let both = format!("{by_old}\n{by_new}\n");
+        assert_eq!(verify_any(index, &both, &[old.clone()]), Ok(key_id(&old)));
+        assert_eq!(verify_any(index, &both, &[new.clone()]), Ok(key_id(&new)));
+        assert_eq!(verify_any(index, &both, &[other.clone(), new.clone(), old.clone()]), Ok(key_id(&new)), "the first of your keys that signed it");
+        // Once the old key is dropped from the signatures, a reader who hasn't moved is told.
+        assert_eq!(verify_any(index, &format!("{by_new}\n"), &[new.clone()]), Ok(key_id(&new)));
+        assert_eq!(verify_any(index, &format!("{by_new}\n"), &[old.clone()]).unwrap_err(), "its signature isn't the key's");
+        assert!(verify_any(index, &both, &[other.clone(), "abc".to_string()]).is_err(), "a key that isn't one is a mistake, not a pass");
+        assert!(verify_any(index, &both, &[other.clone(), new.clone().replace(&new[..2], "00")]).is_err());
+        assert_eq!(verify_any(index, &both, &[other.clone()]).unwrap_err(), "its signature isn't the key's");
+        assert!(verify_any(index, &both, &[other.clone(), key_id(&other)]).unwrap_err().contains("expected an Ed25519 public key"));
+        let two_others = [other.clone(), keygen(&dir.path().join("third.key")).unwrap()];
+        assert_eq!(verify_any(index, &both, &two_others).unwrap_err(), "none of the keys in your config signed it");
+        // Blank lines and stray spaces in the signature file don't matter; garbage lines don't help.
+        assert_eq!(verify_any(index, &format!("\n  nonsense\n {by_old}  \n\n"), &[old.clone()]), Ok(key_id(&old)));
+        assert!(verify_any(index, "", &[old]).is_err());    }
 
     #[test]
     fn indexes_parse() {

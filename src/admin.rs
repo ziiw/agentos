@@ -506,7 +506,7 @@ fn fetch_from_registry(store: &Store, name: &str) -> Result<(Fetched, String, ag
     let url = settings
         .registry
         .with_context(|| format!("{name} isn't a folder here, and you have no registry: add [registry] url = \"https://…/index.json\" to your config"))?;
-    let index = agentos::registry::index(&url, settings.registry_key.as_deref())?;
+    let index = agentos::registry::index(&url, &settings.registry_keys)?;
     let entry = index.packages.get(name).cloned().with_context(|| format!("{name} isn't a folder here or in your registry ({url}); `agent search` lists what is"))?;
     let tmp = agentos::packages::packages_root(&home).join(format!(".fetch-{}", util::random_hex(6)?));
     fs::create_dir_all(&tmp)?;
@@ -520,7 +520,7 @@ pub(crate) fn cmd_search(store: &Store, text: Option<&str>) -> Result<i32> {
     let (cwd, home, out) = (std::env::current_dir()?, home_dir()?, Paint::stdout());
     let settings = config::load(store.root(), &cwd, &home)?;
     let url = settings.registry.context("you have no registry: add [registry] url = \"https://…/index.json\" to your config")?;
-    let index = agentos::registry::index(&url, settings.registry_key.as_deref())?;
+    let index = agentos::registry::index(&url, &settings.registry_keys)?;
     let wanted = text.map(str::to_ascii_lowercase);
     let mut shown = 0;
     for (name, e) in &index.packages {
@@ -531,6 +531,9 @@ pub(crate) fn cmd_search(store: &Store, text: Option<&str>) -> Result<i32> {
     }
     if shown == 0 {
         println!("nothing in {url}{}", text.map(|t| format!(" matches {t:?}")).unwrap_or_default());
+    }
+    if let Some(key) = &index.signed_by {
+        println!("{}", out.dim(format!("the index is signed by key {key}")));
     }
     Ok(0)
 }
@@ -543,6 +546,7 @@ pub(crate) fn cmd_registry(command: RegistryCommand) -> Result<i32> {
             let public = agentos::registry::keygen(&file)?;
             println!("{} made {} (keep it private)", out.green("✓"), display_path(&file));
             println!("  public key  {public}");
+            println!("  key id      {}", agentos::registry::key_id(&public));
             println!("  {}", out.dim("readers put it in their config: [registry] key = \"…\"; you sign each version of the index with `agent registry sign`"));
         }
         RegistryCommand::Pack { dir, output } => {
@@ -554,10 +558,20 @@ pub(crate) fn cmd_registry(command: RegistryCommand) -> Result<i32> {
             println!("  {}", out.dim("next: agent registry sign the index, then put the folder on a web server"));
         }
         RegistryCommand::Sign { index, key } => {
-            let signature = agentos::registry::sign(&fs::read(&index).with_context(|| format!("read {}", index.display()))?, &key)?;
+            let raw = fs::read(&index).with_context(|| format!("read {}", index.display()))?;
+            let mut lines = String::new();
+            for file in &key {
+                lines += &format!("{}\n", agentos::registry::sign(&raw, file)?);
+            }
             let sig_file = PathBuf::from(format!("{}.sig", index.display()));
-            fs::write(&sig_file, format!("{signature}\n"))?;
+            fs::write(&sig_file, lines)?;
             println!("{} signed {} → {}", out.green("✓"), index.display(), sig_file.display());
+            for file in &key {
+                println!("  key {}  {}", agentos::registry::key_id(&agentos::registry::public_key(file)?), out.dim(display_path(file)));
+            }
+            if key.len() > 1 {
+                println!("  {}", out.dim("readers with any one of these keys accept it: drop the old key from the signing once they've moved"));
+            }
             println!("  {}", out.dim("publish the .sig next to the index, at the same address plus .sig"));
         }
     }

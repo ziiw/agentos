@@ -1334,6 +1334,29 @@ JSON
   check "keygen never overwrites a key" bash -c '! "$@" 2>/dev/null' _ "$AGENT" registry keygen "$WORK/publisher.key"
   printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = "abc"\n' "$RPORT" > "$WORK/regcfg/badkey.toml"
   check "a key that isn't a key is a config error" grep -q 'expected an Ed25519 public key' <<<"$(AGENTOS_CONFIG="$WORK/regcfg/badkey.toml" "$AGENT" search 2>&1)"
+  # Changing keys: the publisher signs with the old and the new one, and readers move when they like.
+  out="$("$AGENT" registry keygen "$WORK/new.key")"
+  NEW="$(sed -n 's/^  public key  \([0-9a-f]*\)$/\1/p' <<<"$out")"
+  NEWID="$(sed -n 's/^  key id      \([0-9a-f]*\)$/\1/p' <<<"$out")"
+  check "keygen names a key by a short id" test "${#NEWID}" -eq 16
+  out="$("$AGENT" registry sign "$REG/index.json" --key "$WORK/publisher.key" --key "$WORK/new.key")"
+  check "a publisher can sign with two keys at once" test "$(wc -l < "$REG/index.json.sig")" -eq 2
+  check "...and is told which" grep -q "key $NEWID" <<<"$out"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = "%s"\n' "$RPORT" "$NEW" > "$WORK/regcfg/new.toml"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = ["%s", "%s"]\n' "$RPORT" "$OTHER" "$NEW" > "$WORK/regcfg/list.toml"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = []\n' "$RPORT" > "$WORK/regcfg/empty.toml"
+  rn() { AGENTOS_CONFIG="$WORK/regcfg/$1.toml" "$AGENT" search 2>&1; }
+  check "a reader with the old key still accepts it" grep -q 'e2e-reg' <<<"$(rs search 2>&1)"
+  check "...and one who has moved to the new key" grep -q 'e2e-reg' <<<"$(rn new)"
+  check "...and search says which key signed it" grep -q "the index is signed by key $NEWID" <<<"$(rn new)"
+  check "a list of keys accepts any one of them" grep -q "signed by key $NEWID" <<<"$(rn list)"
+  "$AGENT" registry sign "$REG/index.json" --key "$WORK/new.key" >/dev/null
+  check "once the old key stops signing, a reader who hasn't moved is refused" grep -q "its signature isn't the key's: nothing was read" <<<"$(rs search 2>&1)"
+  check "...while one who lists both reads it" grep -q "signed by key $NEWID" <<<"$(rn list)"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = ["%s", "%s"]\n' "$RPORT" "$OTHER" "$PUB" > "$WORK/regcfg/neither.toml"
+  check "a list without the signer's key refuses it" grep -q "none of the keys in your config signed it" <<<"$(rn neither)"
+  check "an empty list of keys is a config error, not no protection" grep -q "nobody's signature is needed" <<<"$(rn empty)"
+  "$AGENT" registry sign "$REG/index.json" --key "$WORK/publisher.key" >/dev/null
   # The publisher's side: pack a package, serve the folder, install it by name.
   cp -r "$HERE/../examples/packages/echo-agent" "$WORK/pack-src"
   PUBDIR="$WORK/published"

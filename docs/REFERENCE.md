@@ -777,6 +777,20 @@ agent registry sign site/index.json --key publisher.key     # writes site/index.
 
 `pack` reviews the package like `install` does and makes the same tarball for the same files (sorted, no dates or owners), so you can check what you publish; the index entry carries the tarball's hash and the package's digest. Putting `site/` on a web server is your step; agentos only makes the files.
 
+**Changing keys.** `key` can be a list, and any one of them having signed the index is enough. A publisher moving to a new key signs with both for a while, and readers add the new one to their list when they next look at their config:
+
+```bash
+agent registry keygen new.key                                   # prints the new public key and its short id
+agent registry sign site/index.json --key old.key --key new.key # index.json.sig gets a signature a line
+```
+
+```toml
+[registry]
+key = ["9a1f…the old one…", "c04e…the new one…"]     # until the publisher stops signing with the old
+```
+
+`agent search` says which key signed what it read. When the publisher drops the old key from the signing, a reader still on the old key alone is refused (its signature isn't the key's), and moves. Only you change the keys you trust: an index can't announce a new key, because a stolen old key would then be enough to take every reader over. An empty list is a config error, since it would look like protection and be none.
+
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 
 ## Limits (honest list)

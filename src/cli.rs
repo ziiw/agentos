@@ -272,9 +272,10 @@ pub(crate) enum RegistryCommand {
     /// Sign an index.json: writes index.json.sig next to it
     Sign {
         index: PathBuf,
-        /// The key `agent registry keygen` made
-        #[arg(long, value_name = "FILE")]
-        key: PathBuf,
+        /// The key `agent registry keygen` made; give it twice to sign with the
+        /// old key and the new one while readers move from one to the other
+        #[arg(long, value_name = "FILE", required = true)]
+        key: Vec<PathBuf>,
     },
 }
 
