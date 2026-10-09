@@ -323,6 +323,69 @@ else
   skip "the local server tests need python3"
 fi
 
+section "a screen of its own (--display)"
+reset_proj
+cd "$PROJ"
+if command -v Xvfb >/dev/null && command -v xmessage >/dev/null && command -v xwininfo >/dev/null && command -v python3 >/dev/null; then
+  # Reads a PNG made by `agent screen`: prints "WIDTH HEIGHT NONZERO-BYTES".
+  cat > "$WORK/png-info.py" <<'PY'
+import struct, sys, zlib
+d = open(sys.argv[1], "rb").read() if sys.argv[1] != "-" else sys.stdin.buffer.read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+i, idat, w, h = 8, b"", 0, 0
+while i < len(d):
+    n = struct.unpack(">I", d[i:i + 4])[0]
+    kind, body = d[i + 4:i + 8], d[i + 8:i + 8 + n]
+    assert zlib.crc32(d[i + 4:i + 8 + n]) == struct.unpack(">I", d[i + 8 + n:i + 12 + n])[0], "bad checksum"
+    if kind == b"IHDR": w, h = struct.unpack(">II", body[:8])
+    if kind == b"IDAT": idat += body
+    i += 12 + n
+raw = zlib.decompress(idat)
+assert len(raw) == h * (1 + 3 * w), "wrong amount of pixels"
+print(w, h, sum(1 for b in raw if b))
+PY
+  DRAW='echo "display=$DISPLAY auth=$XAUTHORITY"; xdpyinfo | grep dimensions; ls /tmp/.X11-unix; (xmessage -geometry +10+10 "hello from the agent" &); sleep 2; echo "windows=$(xwininfo -root -children | grep -c xmessage)"'
+  out="$("$AGENT" run --display -- sh -c "$DRAW" 2>&1)"
+  events="$(latest_task_dir)/events.jsonl"
+  TASK="$(basename "$(latest_task_dir)")"
+  check "--display: the agent has a screen of its own to draw on" grep -q 'display=:0 auth=/run/agentos/xauth' <<<"$out"
+  check "...of the default size" grep -q 'dimensions: *1280x800 pixels' <<<"$out"
+  check "...which it can draw on" grep -q '^windows=[1-9]' <<<"$out"
+  check "...the only display it can see" test "$(grep -c '^X' <<<"$out")" -eq 1
+  check "the banner and journal say so" grep -q 'a screen of its own: 1280x800' <<<"$out"
+  check "...and journal that it ended with a picture" grep -q '"kind":"display.ended".*"screenshot":true' "$events"
+  check "the screen ends with the task" bash -c '! pgrep -x Xvfb >/dev/null'
+  "$AGENT" screen -o "$WORK/shot.png" >/dev/null 2>&1
+  info="$(python3 "$WORK/png-info.py" "$WORK/shot.png" 2>&1)"
+  check "agent screen saves the last picture as a PNG of the right size" grep -Eq '^1280 800 ' <<<"$info"
+  check "...with what the agent drew in it" test "$(cut -d' ' -f3 <<<"$info")" -gt 10000
+  check "agent screen -o - writes it to a pipe" grep -Eq '^1280 800 ' <<<"$("$AGENT" screen "$TASK" -o - | python3 "$WORK/png-info.py" - 2>&1)"
+  if command -v script >/dev/null; then
+    check "...and not to a terminal" grep -q 'not for your terminal' <<<"$(script -qec "$AGENT screen -o -" /dev/null 2>&1)"
+  fi
+  out="$("$AGENT" run --display-size 800x600 -- sh -c 'xdpyinfo | grep dimensions' 2>&1)"
+  check "--display-size sets it (and implies --display)" grep -q 'dimensions: *800x600' <<<"$out"
+  check "a bad size is refused" grep -q 'a screen is between' <<<"$("$AGENT" run --display-size 10x10 -- true 2>&1)"
+  "$AGENT" run -- true >/dev/null 2>&1
+  check "a task without a screen says so" grep -q 'has no screen' <<<"$("$AGENT" screen 2>&1)"
+  AGENT_BIN="$(command -v "$AGENT")"
+  check "without Xvfb, --display says what to install" grep -q 'needs Xvfb' <<<"$(PATH=/nonexistent "$AGENT_BIN" run --display -- true 2>&1)"
+  # While it runs, too.
+  id="$("$AGENT" run --bg --display -- sh -c '(xmessage -geometry +10+10 "still here" &); sleep 12' 2>/dev/null | tail -1)"
+  nonzero=0
+  for _ in $(seq 40); do
+    "$AGENT" screen "$id" -o "$WORK/live.png" >/dev/null 2>&1 && nonzero="$(python3 "$WORK/png-info.py" "$WORK/live.png" 2>/dev/null | cut -d' ' -f3)"
+    [ "${nonzero:-0}" -gt 10000 ] && break
+    sleep 0.25
+  done
+  check "agent screen shows a running task's screen as it is" test "${nonzero:-0}" -gt 10000
+  "$AGENT" stop "$id" >/dev/null 2>&1; "$AGENT" wait "$id" >/dev/null 2>&1
+  check "...and stopping the task ends its screen too" bash -c '! pgrep -x Xvfb >/dev/null'
+  "$AGENT" rollback >/dev/null 2>&1
+else
+  skip "screens need Xvfb, xmessage and xwininfo (Debian, Ubuntu: apt install xvfb x11-utils)"
+fi
+
 section "a corporate proxy (upstream)"
 reset_proj
 cd "$PROJ"

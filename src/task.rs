@@ -8,6 +8,9 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
     if plan.net == Net::Host && !plan.local.is_empty() {
         bail!("--local is for sandboxes with a network of their own; --net host already shares yours");
     }
+    if plan.display.is_some() && display::xvfb().is_none() {
+        bail!("--display needs Xvfb, which isn't installed (Debian, Ubuntu: apt install xvfb; Fedora: dnf install xorg-x11-server-Xvfb)");
+    }
     if plan.net == Net::Host && !plan.hold.is_empty() {
         bail!("--hold is enforced in the egress proxy, which --net host bypasses");
     }
@@ -255,6 +258,21 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
     // Yours: `agent revoke` and agentd reach the running task here.
     let owner_socket = task.dir.join(control::OWNER_SOCKET);
     let mut owner_listener = Some(control::bind(&owner_socket)?);
+    // A screen of its own, if asked for: its socket and cookie are all the sandbox gets of it.
+    let mut screen = match plan.display {
+        Some(size) => {
+            let d = display::Display::start(&task.dir, size)?;
+            run_mounts.push(RunMount { src: d.socket.clone(), name: "x11.sock".into(), writable: true });
+            run_mounts.push(RunMount { src: d.xauth.clone(), name: "xauth".into(), writable: false });
+            env.retain(|(k, _)| k != "DISPLAY" && k != "XAUTHORITY");
+            env.push(("DISPLAY".into(), ":0".into()));
+            env.push(("XAUTHORITY".into(), "/run/agentos/xauth".into()));
+            eprintln!("  {}", err.dim(format!("a screen of its own: {}x{} (agent screen shows it)", size.0, size.1)));
+            journal.append("task.display", json!({ "width": size.0, "height": size.1, "display": d.number }))?;
+            Some(d)
+        }
+        None => None,
+    };
     run_mounts.push(RunMount { src: control_socket.clone(), name: "control.sock".into(), writable: true });
     run_mounts.push(RunMount { src: std::env::current_exe()?, name: "agent".into(), writable: false });
     // The proxy's socket must exist before the sandbox mounts it, but its
@@ -348,6 +366,7 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         isolate_net: task.meta.net != Net::Host,
         proxy: proxy_socket.clone(),
         locals: plan.local.clone(),
+        display: screen.is_some(),
         run_mounts,
         hostname: format!("agent-{}", task.id()),
         home,
@@ -398,6 +417,9 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
             let gate = gate(asker.clone(), rules.clone(), taint.clone(), given.clone(), journal.clone(), expected_denials.clone(), err);
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
             proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, Some(gate), upstream.clone(), sink));
+        }
+        if let Some(d) = screen.as_mut() {
+            d.watch();
         }
         for (port, listener, _) in local_listeners.drain(..) {
             local_handles.push(proxy::serve_local(listener, port, local_sink(journal.clone(), err)));
@@ -482,6 +504,11 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
     }
     for handle in &local_handles {
         handle.drain(Duration::from_secs(2));
+    }
+    // The last picture of its screen stays with the task.
+    if let Some(d) = screen {
+        let kept = d.finish().is_some();
+        journal.append("display.ended", json!({ "screenshot": kept }))?;
     }
     for &port in &plan.local {
         let _ = fs::remove_file(task.dir.join(format!("local-{port}.sock")));

@@ -136,6 +136,9 @@ pub struct Spec {
     /// the same port on its own loopback (run mounts `local-PORT.sock` carry
     /// them out; see `proxy::serve_local`).
     pub locals: Vec<u16>,
+    /// The task has a virtual screen: its socket is the run mount `x11.sock`,
+    /// found as display :0 (`/tmp/.X11-unix/X0`).
+    pub display: bool,
     /// Host files or directories exposed as /run/agentos/<name>: the task
     /// CA (read-only), the git outbox (writable), …
     pub run_mounts: Vec<RunMount>,
@@ -661,6 +664,11 @@ fn build_root(spec: &Spec, report: &mut Report) -> Result<()> {
 
     // Scratch space: private, empty and thrown away with the sandbox.
     tmpfs(&dir("/tmp")?, "1777")?;
+    if spec.display {
+        let x11 = dir("/tmp/.X11-unix")?;
+        fs::set_permissions(&x11, fs::Permissions::from_mode(0o1777))?;
+        symlink("/run/agentos/x11.sock", x11.join("X0"))?;
+    }
     tmpfs(&dir("/run")?, "0755")?;
     tmpfs(&dir("/var")?, "0755")?;
     let var_tmp = dir("/var/tmp")?;

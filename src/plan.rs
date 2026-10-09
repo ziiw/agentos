@@ -68,6 +68,8 @@ pub(crate) struct Plan {
     pub(crate) hold: Vec<String>,
     /// Where the task's signed receipt is posted when it ends.
     pub(crate) witness: Option<String>,
+    /// A virtual screen of its own, and its size.
+    pub(crate) display: Option<(u32, u32)>,
 }
 
 /// What the config files add to a task beyond its grants.
@@ -110,6 +112,14 @@ pub(crate) fn upstream_proxy(configured: Option<&str>, no_proxy: &[String]) -> R
         Some(url) => Some(proxy::Upstream::parse(url, &[]).context("[network] proxy")?.bypassing(no_proxy)),
         None => proxy::Upstream::from_env()?.map(|u| u.bypassing(no_proxy)),
     })
+}
+
+/// The task's screen, if it has one: --display or --display-size, or its agent's own.
+pub(crate) fn screen_for(grants: &GrantArgs, agent_wants: Option<(u32, u32)>) -> Result<Option<(u32, u32)>> {
+    if grants.display || grants.display_size.is_some() {
+        return Ok(Some(display::parse_size(grants.display_size.as_deref().unwrap_or(display::DEFAULT_SIZE)).context("--display-size")?));
+    }
+    Ok(agent_wants)
 }
 
 /// The hosts whose writes a task holds: your config's and --hold's, once each.
@@ -312,6 +322,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     // What the agent's own definition asks for: servers on your machine, files to read.
     let local = local_ports(applied.local.into_iter().chain(profile.local.iter().copied()).collect(), &args.grants.local);
     let hold = hold_hosts(applied.hold, &args.grants.hold)?;
+    let screen = screen_for(&args.grants, profile.display)?;
     args.grants.ro.extend(profile.ro.iter().cloned());
     let net = args.net.unwrap_or(profile.net);
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
@@ -377,6 +388,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             local,
             hold,
             witness: applied.witness,
+            display: screen,
         },
     )
 }
@@ -391,6 +403,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
     let local = local_ports(applied.local, &args.grants.local);
     let hold = hold_hosts(applied.hold, &args.grants.hold)?;
+    let screen = screen_for(&args.grants, None)?;
     let mut secrets = parse_secrets(&args.grants.secret, &commands)?;
     let ask = args.grants.ask;
     let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask || !args.grants.hold.is_empty();
@@ -441,6 +454,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             local,
             hold,
             witness: applied.witness,
+            display: screen,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {

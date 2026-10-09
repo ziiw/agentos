@@ -130,6 +130,14 @@ pub(crate) enum Command {
     },
     /// List the agents you can use with `agent do --agent NAME`
     Agents,
+    /// Save a picture of a task's screen (it needs --display)
+    Screen {
+        /// Task id or prefix (default: the latest task)
+        task: Option<String>,
+        /// Where to write the PNG (default: screen-ID.png here; `-` for standard output)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
     /// Sign where a task's journal stands (a receipt), or check a receipt
     Attest {
         /// Task id or prefix (default: the latest task)
@@ -310,6 +318,13 @@ pub(crate) struct GrantArgs {
     /// credential --secret would add, when you commit. Exact host names.
     #[arg(long, value_name = "HOST")]
     pub(crate) hold: Vec<String>,
+    /// Give the task a screen of its own: a private virtual display (Xvfb)
+    /// the agent's graphical programs draw on. `agent screen` shows it.
+    #[arg(long)]
+    pub(crate) display: bool,
+    /// The screen's size, WIDTHxHEIGHT (default 1280x800); implies --display
+    #[arg(long, value_name = "WxH")]
+    pub(crate) display_size: Option<String>,
     /// Let the agent reach a server on this machine's loopback, at the same
     /// port on its own (--local 11434 for a local model server like Ollama).
     /// Only that port; the rest of your loopback stays out of reach.

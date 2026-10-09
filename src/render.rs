@@ -591,6 +591,10 @@ fn describe(p: Paint, e: &Event) -> String {
             };
             format!("signed receipt · key {} · head {} ({} events){witness}", s(&d["key"]), s(&d["head"]).chars().take(12).collect::<String>(), d["events"])
         }
+        "task.display" => format!("a screen of its own: {}x{} (:{} here)", d["width"], d["height"], d["display"]),
+        "display.ended" => {
+            if d["screenshot"].as_bool() == Some(true) { "its last screen is kept (agent screen)".to_string() } else { "no last screen was kept".to_string() }
+        }
         "net.upstream" => format!("through your proxy {}", s(&d["proxy"])),
         "task.local" => {
             let ports: Vec<String> = d["ports"].as_array().into_iter().flatten().map(|p| format!("127.0.0.1:{p}")).collect();

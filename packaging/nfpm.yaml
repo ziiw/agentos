@@ -51,6 +51,8 @@ overrides:
       - git
       - curl
       - util-linux
+    suggests:
+      - xvfb
   rpm:
     depends:
       - glibc >= @GLIBC_MIN@
@@ -59,3 +61,5 @@ overrides:
       - git-core
       - curl
       - util-linux
+    suggests:
+      - xorg-x11-server-Xvfb

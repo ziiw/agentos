@@ -3,6 +3,7 @@ use agentos::attest;
 use agentos::broker::{self, Broker, Secret};
 use agentos::changes::{self, Summary};
 use agentos::config;
+use agentos::display;
 use agentos::control::{self, Call, PathRules, PathVerdict, Reply};
 use agentos::doctor::{self, Level};
 use agentos::gateway::{self, Budget, Endpoint, Ledger, Meter, Periodic, Price, Spend};
@@ -99,6 +100,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Doctor => cmd_doctor(&store),
         Command::Trust { path } => cmd_trust(&store, path),
         Command::Agents => cmd_agents(&store),
+        Command::Screen { task, output } => cmd_screen(&store, task.as_deref(), output),
         Command::Attest { task, verify, journal, trust, public } => cmd_attest(&store, task.as_deref(), verify, journal, trust, public),
         Command::Install { dir, yes, digest } => cmd_install(&store, dir, yes, digest),
         Command::Search { text } => cmd_search(&store, text.as_deref()),

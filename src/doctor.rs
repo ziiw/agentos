@@ -37,7 +37,7 @@ pub fn run(store_root: &Path) -> Vec<Check> {
         sandbox(store_root)
     };
     let userns = userns_policy(sandbox.level == Level::Ok);
-    vec![kernel(), user(), userns, store, sandbox, landlock(), seccomp(), limits()]
+    vec![kernel(), user(), userns, store, sandbox, landlock(), seccomp(), limits(), display()]
 }
 
 fn kernel() -> Check {
@@ -145,6 +145,13 @@ fn limits() -> Check {
         check("limits", Level::Ok, "--memory/--cpus/--pids through systemd user scopes")
     } else {
         check("limits", Level::Warn, "no systemd user session: --memory/--cpus/--pids can't be enforced here")
+    }
+}
+
+fn display() -> Check {
+    match crate::display::xvfb() {
+        Some(path) => check("display", Level::Ok, format!("--display: Xvfb at {}", path.display())),
+        None => check("display", Level::Ok, "--display needs Xvfb (apt install xvfb, dnf install xorg-x11-server-Xvfb); nothing else does"),
     }
 }
 

@@ -99,6 +99,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent doctor` | Check this machine |
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
 | `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
+| `agent screen [TASK] [-o FILE]` | Save a PNG of a task's screen (a task started with `--display`), now or as it ended |
 | `agent attest [TASK]` / `--verify FILE [--journal FILE] [--trust KEY]` / `--public` | Sign a task's journal head (a receipt), check a receipt, show this machine's receipt key |
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent install DIR\|NAME [--yes] [--digest HEX]` / `uninstall NAME` / `packages` / `search [TEXT]` | Agent packages: install one (from a folder, or by name from your registry) after reading what it asks for, remove it, list them and whether they're intact, search your registry |
@@ -110,7 +111,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent spend` | What agents spent today, this week and this month, against your budgets |
 | `agent raise AMOUNT [--task ID \| --today \| --this-week \| --this-month [--project]]` | Raise a budget that's used up: a running task's, or one across tasks until it resets |
 
-`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--hold HOST`, `--local PORT`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
+`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--hold HOST`, `--local PORT`, `--display`/`--display-size WxH`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
 
 ## What the agent sees
 
@@ -178,6 +179,19 @@ agent do --local 11434 --agent aider "…"       # or: [network] local = [11434]
 ```
 
 Only that port: the rest of your loopback (databases, dev servers, anything else) stays out of reach, and a project's `.agentos.toml` can't hand out your services. Each connection is journaled (`✓ 127.0.0.1:11434 (your machine) · ↑2.1 kB ↓48 kB`), and a server that isn't running is explained once. Everything the server's own API lets a client do, the agent can do (Ollama's can pull and delete models, say), and calls to it aren't metered or counted against budgets: local models cost no dollars.
+
+## A screen of its own
+
+For an agent that drives a graphical program (a browser, a desktop app), give the task a virtual screen:
+
+```bash
+agent do --display "open the settings page and screenshot it"     # or --display-size 1920x1080
+agent screen                                                       # a PNG of what's on it now, or as the task left it
+```
+
+The task gets a private X display. Xvfb (`apt install xvfb`, `dnf install xorg-x11-server-Xvfb`) runs outside the sandbox, started by agentos; the sandbox gets that one socket and a cookie, as `DISPLAY=:0`, and sees no other display of your machine. The server listens on neither the network nor an abstract socket, and shared memory isn't offered to clients (the sandbox has its own IPC namespace; they fall back to the plain protocol). The screen's framebuffer is a file in the task, so `agent screen` shows what's on it without going through the agent, while it runs, and the latest picture that had anything on it is kept when the task ends. `agent screen -o -` writes the PNG to a pipe. An agent file or a package can ask for a screen with `display = true` (and `display_size`).
+
+Browsers and other programs that build their own sandbox out of namespaces can't inside agentos's (new namespaces are denied): run them with their sandbox off, the way you would in a container. Wayland-only programs and GPU access aren't covered.
 
 ## Git pushes wait in an outbox
 
@@ -591,6 +605,7 @@ interactive = ["codex"]                    # agent do --agent codex, with no tas
 allow = ["api.openai.com"]                 # hosts it needs
 local = [11434]                            # ports on your loopback it uses (--local)
 ro = ["~/.gitconfig"]                      # files and folders it reads, read-only
+display = true                             # a virtual screen of its own (display_size = "1920x1080")
 
 [secrets]                                  # brokered: the agent only sees placeholders
 OPENAI_API_KEY = "api.openai.com"          # (the value: your environment, or [secret_commands])
@@ -704,6 +719,7 @@ src/changes.rs   reading/committing/rolling back overlay transactions
 src/journal.rs   hash-chained event log
 src/attest.rs    receipts: the journal head, signed; the witness
 src/users.rs     people besides you for agentd's console: tokens and roles
+src/display.rs   a task's virtual screen: Xvfb, its cookie, screenshots (XWD to PNG)
 src/store.rs     on-disk task store
 src/doctor.rs    environment checks
 src/profiles.rs  agent profiles (Claude Code) and their output

@@ -554,3 +554,32 @@ pub(crate) fn cmd_registry(command: RegistryCommand) -> Result<i32> {
     }
     Ok(0)
 }
+
+/// `agent screen`: what a task's screen shows now (or showed last), as a PNG.
+pub(crate) fn cmd_screen(store: &Store, selector: Option<&str>, output: Option<PathBuf>) -> Result<i32> {
+    let task = store.resolve(selector)?;
+    let live = task.dir.join("fb/Xvfb_screen0");
+    let kept = task.dir.join(display::FINAL);
+    let png = if task.is_live() && live.is_file() {
+        display::screenshot_file(&live, None)?
+    } else if kept.is_file() {
+        fs::read(&kept)?
+    } else {
+        bail!("task {} has no screen: start it with --display (and the program has to draw something)", task.id());
+    };
+    let out = Paint::stdout();
+    match output {
+        Some(p) if p == Path::new("-") => {
+            if std::io::stdout().is_terminal() {
+                bail!("a PNG is not for your terminal: use -o FILE, or pipe it");
+            }
+            std::io::Write::write_all(&mut std::io::stdout(), &png)?;
+        }
+        other => {
+            let path = other.unwrap_or_else(|| PathBuf::from(format!("screen-{}.png", task.id())));
+            fs::write(&path, &png).with_context(|| format!("write {}", path.display()))?;
+            println!("{} {} ({})", out.green("✓"), display_path(&path), if task.is_live() { "now" } else { "as the task left it" });
+        }
+    }
+    Ok(0)
+}
