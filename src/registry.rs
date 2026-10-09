@@ -335,7 +335,10 @@ mod tests {
         assert_eq!(verify_any(index, &format!("{by_new}\n"), &[new.clone()]), Ok(key_id(&new)));
         assert_eq!(verify_any(index, &format!("{by_new}\n"), &[old.clone()]).unwrap_err(), "its signature isn't the key's");
         assert!(verify_any(index, &both, &[other.clone(), "abc".to_string()]).is_err(), "a key that isn't one is a mistake, not a pass");
-        assert!(verify_any(index, &both, &[other.clone(), new.clone().replace(&new[..2], "00")]).is_err());
+        // (a key with one hex digit changed: not the new key, whatever the new key happens to start with)
+        let last = if new.ends_with('0') { '1' } else { '0' };
+        let mangled = format!("{}{last}", &new[..63]);
+        assert!(verify_any(index, &both, &[other.clone(), mangled]).is_err());
         assert_eq!(verify_any(index, &both, &[other.clone()]).unwrap_err(), "its signature isn't the key's");
         assert!(verify_any(index, &both, &[other.clone(), key_id(&other)]).unwrap_err().contains("expected an Ed25519 public key"));
         let two_others = [other.clone(), keygen(&dir.path().join("third.key")).unwrap()];
