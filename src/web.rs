@@ -69,6 +69,16 @@ pub fn serve(store: &Store, listen: &str, notify: Option<String>) -> Result<i32>
         }
     }
 
+    // Files that arrive in a watched folder ([watch.*] in your config).
+    {
+        let root = store.root().to_path_buf();
+        thread::spawn(move || watcher(root));
+        let home = crate::home_dir()?;
+        for w in config::load(store.root(), &home, &home).map(|c| c.watches).unwrap_or_default() {
+            println!("  {}", out.dim(format!("watching {} for {}", util::display_path(Path::new(&w.path)), w.name)));
+        }
+    }
+
     for mut request in server.incoming_requests() {
         let (root, token) = (store.root().to_path_buf(), token.clone());
         thread::spawn(move || {
@@ -604,6 +614,118 @@ fn hook(parts: &Parts, name: &str, root: &PathBuf) -> Reply {
             Reply::Json(202, v)
         }
         Err(e) => Reply::Json(400, json!({ "error": format!("{e:#}") })),
+    }
+}
+
+/// Only one thing at a time changes what agentd remembers of its watches.
+static WATCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Watches the folders of `[watch.*]` and starts a task for what arrives: it
+/// waits for the folder to be quiet, and for the last task to be done and the
+/// interval to have passed, then hands over everything that came meanwhile.
+/// Reads your config every few seconds, so editing a watch needs no restart.
+fn watcher(root: PathBuf) {
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
+    use std::collections::HashMap;
+    use std::os::fd::AsFd;
+    let mask = AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CREATE;
+    let mut watching: Vec<(String, PathBuf)> = Vec::new();
+    let mut inotify: Option<Inotify> = None;
+    let mut by_descriptor: HashMap<WatchDescriptor, String> = HashMap::new();
+    let mut batches: HashMap<String, agentos::watch::Batch> = HashMap::new();
+    let mut last_config = std::time::Instant::now() - Duration::from_secs(60);
+    let mut settings: Option<config::Settings> = None;
+    loop {
+        let (Ok(store), Ok(home)) = (Store::open_at(&root), crate::home_dir()) else {
+            thread::sleep(Duration::from_secs(5));
+            continue;
+        };
+        if last_config.elapsed() >= Duration::from_secs(5) {
+            last_config = std::time::Instant::now();
+            settings = config::load(&root, &home, &home).ok();
+            let wanted: Vec<(String, PathBuf)> = settings
+                .iter()
+                .flat_map(|s| s.watches.iter())
+                .filter_map(|w| fs::canonicalize(expand(&home, &w.path)).ok().map(|p| (w.name.clone(), p)))
+                .collect();
+            if wanted != watching {
+                by_descriptor.clear();
+                inotify = None;
+                if !wanted.is_empty() {
+                    if let Ok(i) = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC) {
+                        for (name, path) in &wanted {
+                            if let Ok(wd) = i.add_watch(path, mask) {
+                                by_descriptor.insert(wd, name.clone());
+                            }
+                        }
+                        inotify = Some(i);
+                    }
+                }
+                watching = wanted;
+                batches.retain(|name, _| watching.iter().any(|(n, _)| n == name));
+            }
+        }
+        let Some(i) = inotify.as_ref() else {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        // Wait for something to happen in a watched folder, but not for long: batches settle with time.
+        let mut fds = [nix::poll::PollFd::new(i.as_fd(), nix::poll::PollFlags::POLLIN)];
+        let _ = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(500u16));
+        let now = agentos::watch::clock();
+        while let Ok(events) = i.read_events() {
+            if events.is_empty() {
+                break;
+            }
+            for e in events {
+                let Some(name) = by_descriptor.get(&e.wd) else { continue };
+                let Some(w) = settings.iter().flat_map(|s| s.watches.iter()).find(|w| w.name == *name) else { continue };
+                if e.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
+                    batches.entry(name.clone()).or_default().add("(more changes than can be listed)", now);
+                    continue;
+                }
+                let file = e.name.as_ref().and_then(|n| n.to_str()).unwrap_or("");
+                if !w.ignores(file) {
+                    batches.entry(name.clone()).or_default().add(file, now);
+                }
+            }
+        }
+        let _one_at_a_time = WATCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut states = agentos::watch::load(&root);
+        let mut changed = false;
+        for w in settings.iter().flat_map(|s| s.watches.iter()) {
+            let (Ok(settle), Ok(every)) = (w.settle(), w.min_interval()) else { continue };
+            let Some(batch) = batches.get_mut(&w.name) else { continue };
+            if !batch.settled(now, settle) {
+                continue;
+            }
+            let state = states.entry(w.name.clone()).or_default();
+            let still_going = state.last_task.as_deref().is_some_and(|id| store.resolve(Some(id)).is_ok_and(|t| t.is_live()));
+            if still_going || now < state.last_fire_ms + every.as_millis() as u64 {
+                // It waits its turn, with whatever else arrives.
+                continue;
+            }
+            let (names, more) = batch.take();
+            let started = fs::canonicalize(expand(&home, &w.path)).map_err(anyhow::Error::from).and_then(|project| {
+                let body = json!({ "project": project, "task": w.task_for(&names, more), "agent": w.agent, "budget": w.budget, "timeout": w.timeout });
+                start(&store, &body.to_string(), &format!("agentd watch {}", w.name), Some(&format!("watch {}", w.name)))
+            });
+            state.last_fire_ms = now;
+            match started {
+                Ok(v) => {
+                    state.last_task = v["id"].as_str().map(str::to_string);
+                    state.fired += 1;
+                    state.last_files = (names.len() + more) as u64;
+                    state.files += state.last_files;
+                    state.last_error = None;
+                }
+                Err(e) => state.last_error = Some(format!("{e:#}")),
+            }
+            changed = true;
+        }
+        if changed {
+            let _ = agentos::watch::save(&root, &states);
+        }
     }
 }
 

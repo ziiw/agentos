@@ -136,6 +136,9 @@ pub(crate) enum Command {
     /// The hooks that start a task when an event is sent to agentd ([hook.NAME]
     /// in your config)
     Hooks,
+    /// The folders agentd watches, so a file arriving starts a task ([watch.NAME]
+    /// in your config)
+    Watches,
     /// Save a picture of a task's screen (it needs --display)
     Screen {
         /// Task id or prefix (default: the latest task)

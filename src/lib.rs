@@ -35,3 +35,4 @@ pub mod taint;
 pub mod users;
 pub mod util;
 pub mod vault;
+pub mod watch;

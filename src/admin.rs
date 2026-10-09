@@ -606,6 +606,38 @@ pub(crate) fn cmd_registry(command: RegistryCommand) -> Result<i32> {
     Ok(0)
 }
 
+/// `agent watches`: the folders agentd watches, and what each has started.
+pub(crate) fn cmd_watches(store: &Store) -> Result<i32> {
+    let (home, out) = (home_dir()?, Paint::stdout());
+    let settings = config::load(store.root(), &std::env::current_dir()?, &home)?;
+    if settings.watches.is_empty() {
+        println!("no watches: add [watch.NAME] with a path and a task to your config, and keep `agent serve` running");
+        return Ok(0);
+    }
+    let states = agentos::watch::load(store.root());
+    for w in &settings.watches {
+        let state = states.get(&w.name).cloned().unwrap_or_default();
+        println!("{:<16} {}", w.name, util::display_path(Path::new(&w.path)));
+        println!(
+            "    {} · {}, {} · {}",
+            out.dim(format!("quiet for {}, then at most one task per {}", humantime::format_duration(w.settle()?), humantime::format_duration(w.min_interval()?))),
+            plural(state.fired as usize, "run"),
+            plural(state.files as usize, "file"),
+            match &state.last_task {
+                Some(id) => format!("last: task {id}, {} ({})", util::ago(state.last_fire_ms), plural(state.last_files as usize, "file")),
+                None => "nothing yet".to_string(),
+            }
+        );
+        if let Some(e) = &state.last_error {
+            println!("    {}", out.yellow(format!("last problem: {e}")));
+        }
+    }
+    if approvals::agentd(store.root()).is_none() {
+        println!("{}", out.dim("agentd isn't running, so nothing is watched: agent serve"));
+    }
+    Ok(0)
+}
+
 /// `agent screen`: what a task's screen shows now (or showed last), as a PNG.
 pub(crate) fn cmd_screen(store: &Store, selector: Option<&str>, output: Option<PathBuf>) -> Result<i32> {
     let task = store.resolve(selector)?;

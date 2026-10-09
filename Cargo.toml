@@ -23,7 +23,7 @@ landlock = "0.4"
 libc = "0.2"
 # Deflate for the PNG pictures of a task's screen (pure Rust).
 miniz_oxide = "0.8"
-nix = { version = "0.30", features = ["feature", "fs", "hostname", "mount", "poll", "process", "sched", "signal", "user"] }
+nix = { version = "0.30", features = ["feature", "fs", "hostname", "inotify", "mount", "poll", "process", "sched", "signal", "user"] }
 rcgen = "0.13"
 # Ed25519 for signed receipts (already here as rustls's crypto).
 ring = "0.17"

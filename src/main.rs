@@ -106,6 +106,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Agents => cmd_agents(&store),
         Command::Schedules => cmd_schedules(&store),
         Command::Hooks => cmd_hooks(&store),
+        Command::Watches => cmd_watches(&store),
         Command::Screen { task, output } => cmd_screen(&store, task.as_deref(), output),
         Command::Attest { task, verify, journal, trust, public } => cmd_attest(&store, task.as_deref(), verify, journal, trust, public),
         Command::Install { dir, yes, digest } => cmd_install(&store, dir, yes, digest),

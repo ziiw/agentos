@@ -2306,6 +2306,72 @@ printf '[hook.bad]\nproject = "%s"\ntask = "x"\ntoken = "not a variable name"\n'
 check "a token has to name a variable" grep -q 'token:' <<<"$(AGENTOS_CONFIG="$WORK/hooks/bad.toml" "$AGENT" hooks 2>&1)"
 export AGENTOS_HOME="$SAVED_HOME"
 
+section "files wake an agent (watches in agentd)"
+reset_proj
+cd "$PROJ"
+SAVED_HOME="$AGENTOS_HOME"
+export AGENTOS_HOME="$WORK/store-watch"
+WATCHED="$WORK/watched"
+mkdir -p "$AGENTOS_HOME" "$WORK/watch/agents" "$WATCHED"
+cat > "$WORK/watch/agents/sched-agent.toml" <<'TOML'
+run = ["sh", "-c", "printf 'task-was: %s\n' \"$1\"; sleep 6", "sh", "{task}"]
+TOML
+cat > "$WORK/watch/config.toml" <<TOML
+[console]
+projects = ["$WATCHED"]
+
+[watch.drop]
+path = "$WATCHED"
+task = "Files arrived: {event}"
+agent = "sched-agent"
+budget = "1usd"
+settle = "1s"
+min_interval = "2s"
+ignore = ["*.bak"]
+TOML
+wch() { AGENTOS_MIN_SCHEDULE=1s AGENTOS_CONFIG="$WORK/watch/config.toml" "$AGENT" "$@"; }
+tasks_n() { ls -d "$AGENTOS_HOME"/tasks/*/ 2>/dev/null | wc -l; }
+check "agent watches lists it, and says agentd isn't running yet" bash -c 'out="$(AGENTOS_MIN_SCHEDULE=1s AGENTOS_CONFIG="$1" "$2" watches 2>&1)"; grep -q "drop " <<<"$out" && grep -q "quiet for 1s, then at most one task per 2s" <<<"$out" && grep -q "nothing is watched" <<<"$out"' _ "$WORK/watch/config.toml" "$AGENT"
+start_agentd AGENTOS_CONFIG="$WORK/watch/config.toml" AGENTOS_MIN_SCHEDULE=1s
+sleep 1
+touch "$WATCHED/.hidden" "$WATCHED/movie.mp4.part" "$WATCHED/old.bak"
+sleep 4
+check "dotfiles, half-made files and what you ignore wake nothing" test "$(tasks_n)" -eq 0
+echo hello > "$WATCHED/report.pdf"
+echo there > "$WATCHED/photo.jpg"
+for _ in $(seq 60); do [ "$(tasks_n)" -ge 1 ] && break; sleep 0.5; done
+check "files arriving start a task" test "$(tasks_n)" -ge 1
+FIRST="$(ls -td "$AGENTOS_HOME"/tasks/*/ | head -1)"
+for _ in $(seq 60); do grep -q task-was "${FIRST}output.log" 2>/dev/null && break; sleep 0.5; done
+check "...one, with the names of both in it" bash -c 'grep -q "^task-was: Files arrived: photo.jpg$" "$1" && grep -q "^report.pdf$" "$1"' _ "${FIRST}output.log"
+check "...and not the names it was told to leave alone" bash -c '! grep -Eq "hidden|\.part|old\.bak" "$1"' _ "${FIRST}output.log"
+check "the journal says which watch" grep -q '"started_by":"agentd watch drop"' "${FIRST}events.jsonl"
+check "a file's name is someone else's words: the task started tainted" grep -q '"kind":"taint.marked".*"source":"event"' "${FIRST}events.jsonl"
+# While that runs (6 seconds), more arrives: it waits for its turn.
+printf 'x' > "$WATCHED/$(printf 'a\033[2Jb.txt')"
+echo late > "$WATCHED/later.txt"
+sleep 3
+check "files arriving while the last task runs don't start another" test "$(tasks_n)" -eq 1
+for _ in $(seq 80); do [ "$(tasks_n)" -ge 2 ] && break; sleep 0.5; done
+check "...they go together when it's done" test "$(tasks_n)" -eq 2
+SECOND="$(ls -td "$AGENTOS_HOME"/tasks/*/ | head -1)"
+for _ in $(seq 60); do grep -q task-was "${SECOND}output.log" 2>/dev/null && break; sleep 0.5; done
+check "...with later.txt in it" grep -q 'later.txt' "${SECOND}output.log"
+check "...and no terminal escapes from a file's name" bash -c '! grep -q "$(printf "\033")" "$1"' _ "${SECOND}output.log"
+for _ in $(seq 40); do wch watches 2>&1 | grep -q '2 runs' && break; sleep 0.25; done
+check "agent watches counts them" grep -Eq '2 runs, 4 files · last: task [0-9a-f]{8}, .* \(2 files\)' <<<"$(wch watches 2>&1)"
+check "(and says agentd is watching)" bash -c '! grep -q "nothing is watched" <<<"$1"' _ "$(wch watches 2>&1)"
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+printf '[watch.sneaky]\npath = "%s"\ntask = "x"\n' "$PROJ" > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project can't have agentd watch for it" test $? -eq 2
+rm -f .agentos.toml
+printf '[watch.bad]\npath = "relative/dir"\ntask = "x"\n' > "$WORK/watch/bad.toml"
+check "a path has to be a folder you name" grep -q 'an absolute folder' <<<"$(AGENTOS_CONFIG="$WORK/watch/bad.toml" "$AGENT" watches 2>&1)"
+printf '[watch.bad]\npath = "%s"\ntask = "x"\nsettle = "0s"\n' "$WATCHED" > "$WORK/watch/bad.toml"
+check "...and a folder that is still being copied into must be left to settle" grep -q 'at least 1s' <<<"$(AGENTOS_CONFIG="$WORK/watch/bad.toml" "$AGENT" watches 2>&1)"
+export AGENTOS_HOME="$SAVED_HOME"
+
 section "budgets (the model gateway)"
 # A stand-in model API: httpbin's /base64/… answers with whatever body the
 # URL carries, so the "provider" reports exactly the usage we choose.

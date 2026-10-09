@@ -104,7 +104,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent install DIR\|NAME [--yes] [--digest HEX]` / `uninstall NAME` / `packages` / `search [TEXT]` | Agent packages: install one (from a folder, or by name from your registry) after reading what it asks for, remove it, list them and whether they're intact, search your registry |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
-| `agent schedules` / `agent hooks` | The tasks agentd starts on a timer, and when each runs next; the hooks that start one when an event arrives |
+| `agent schedules` / `agent hooks` / `agent watches` | The tasks agentd starts on a timer, and when each runs next; the hooks that start one when an event arrives; the folders it watches for new files |
 | `agent users [add NAME --role ROLE [--project DIR]… \| remove NAME]` | Who else may use agentd's console (viewer, approver, admin), with their own tokens, optionally limited to some projects |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 | `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
@@ -612,6 +612,24 @@ agent hooks                            # the hooks, their addresses and use
 
 The token (also accepted as `X-Agentos-Token` or `X-Gitlab-Token`, for senders that can only set a header) opens that hook and nothing else of agentd, and agentd's own token doesn't open hooks. The event's words go where `{event}` is (cleaned of control characters and cut to 8,000 characters), or after the task if you leave it out. **What came in is untrusted**, so the task starts *tainted* (`event`): it is asked before every tool call that isn't read-only, and your rules see `context.taint.contains("event")`. A hook never starts a second run while the last one is going, or sooner than `min_interval` (429 and 409 say so). Put agentd behind something private (Tailscale, a reverse proxy that checks the sender): anyone who can reach it and holds the token can start the task.
 
+**Files wake an agent too.** A watch starts a task when files arrive in a folder: downloads to sort, a drop folder for documents, exports to process.
+
+```toml
+[watch.downloads]                      # your config only
+path = "~/Downloads"                   # the folder watched (not what's below it) and where the task runs: one of agentd's projects
+task = "These just arrived: {event}. Sort them into ~/Documents."
+settle = "10s"                         # wait until nothing has changed for this long (default 5s, at least 1s)
+min_interval = "5m"                    # at most one task per this long (default 1m)
+ignore = ["*.bak", "draft-*"]          # more names to leave alone
+budget = "1usd"
+```
+
+```bash
+agent watches                          # the watches, what each has started, and how many files
+```
+
+When files are created, moved in or finished being written, agentd waits until the folder has been quiet for `settle`, then starts one task with the names that arrived (50 at most, then "…and N more"). Names that arrive while the last task is still going, or before `min_interval` is up, wait and go together. Dotfiles and half-made files (`*.part`, `*.crdownload`, `*.tmp`, `*~`, `*.swp`) never count. **A file's name is chosen by whoever put it there**, so the task starts tainted, like a hook's (names are stripped of control characters and cut to 200). The task sees the folder through its sandbox like any task: what it changes waits for your review, so it doesn't wake itself up. Watches are in your config only.
+
 Rules, budgets and your questions all apply as they do to any task. With nobody at a terminal, a task's questions go to the console or are refused: give a scheduled task rules (`policy.cedar`) for what it should be allowed to do, and `release` rules for what may leave without you. Schedules are in your config only: a project can't make agentd run anything.
 
 ## Configuration
@@ -660,6 +678,10 @@ task = "Summarize the open issues"
 project = "~/code/app"
 task = "CI failed. The event: {event}"
 token = "CI_HOOK_TOKEN"
+
+[watch.downloads]                     # your file only: files arriving in this folder start a task
+path = "~/Downloads"
+task = "These arrived: {event}. Sort them."
 
 [journal]                             # your file only: finished tasks' signed receipts go here
 witness = "https://witness.example/receipts"
@@ -854,6 +876,7 @@ src/attest.rs    receipts: the journal head, signed; the witness
 src/users.rs     people besides you for agentd's console: tokens and roles, and sign-in sessions
 src/oidc.rs      signing in with your identity provider (OpenID Connect): the flow, the ID token's checks, roles
 src/schedule.rs  tasks agentd starts on a timer, and what it remembers of them
+src/watch.rs     folders agentd watches: names that arrived, settling, what it remembers
 src/display.rs   a task's virtual screen: Xvfb, its cookie, screenshots (XWD to PNG)
 src/store.rs     on-disk task store
 src/doctor.rs    environment checks
