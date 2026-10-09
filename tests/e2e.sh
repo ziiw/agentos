@@ -270,6 +270,59 @@ else
   skip "the stand-in MCP server needs python3"
 fi
 
+section "a server on your machine (--local)"
+reset_proj
+cd "$PROJ"
+if command -v python3 >/dev/null; then
+  # Stand-in model servers on this machine's loopback: each prints its port and answers GETs.
+  cat > "$WORK/local-server.py" <<'PY'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = f"{sys.argv[1]} served {self.path}".encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+  start_local() {  # NAME → LOCAL_PID, LOCAL_PORT
+    python3 "$WORK/local-server.py" "$1" > "$WORK/local.port" &
+    LOCAL_PID=$!
+    for _ in $(seq 50); do [ -s "$WORK/local.port" ] && break; sleep 0.1; done
+    LOCAL_PORT="$(cat "$WORK/local.port")"
+    : > "$WORK/local.port"
+  }
+  start_local models;  MODELS=$LOCAL_PORT; MODELS_PID=$LOCAL_PID
+  start_local secrets; OTHER=$LOCAL_PORT;  OTHER_PID=$LOCAL_PID
+  GETM="curl -sS -m 10 http://127.0.0.1:$MODELS/v1/models"
+  out="$("$AGENT" run --local "$MODELS" -- $GETM 2>&1)"
+  check "--local PORT: the agent reaches a server on your loopback, at the same port" grep -q 'models served /v1/models' <<<"$out"
+  check "...which the banner says" grep -q "your machine's 127.0.0.1:$MODELS (--local)" <<<"$out"
+  check "...and the journal records" grep -Eq "\"kind\":\"net.local\".*\"bytes_in\":[1-9].*\"ok\":true,\"port\":$MODELS" "$(latest_task_dir)/events.jsonl"
+  check "...which agent log shows" grep -q "✓ 127.0.0.1:$MODELS (your machine) · ↑" <<<"$("$AGENT" log)"
+  check "other ports on your loopback stay out of reach" bash -c '! "$@" 2>/dev/null' _ "$AGENT" run --local "$MODELS" -- curl -sS -m 5 "http://127.0.0.1:$OTHER/"
+  check "without --local nothing of your loopback is reachable" bash -c '! "$@" 2>/dev/null' _ "$AGENT" run -- $GETM
+  check "the server is reachable with an allowlist too" grep -q 'models served' <<<"$("$AGENT" run --allow example.com --local "$MODELS" -- $GETM 2>&1)"
+  printf '[network]\nlocal = [%s]\n' "$MODELS" > "$WORK/local.toml"
+  check "[network] local in your config does the same" grep -q 'models served' <<<"$(AGENTOS_CONFIG="$WORK/local.toml" "$AGENT" run -- $GETM 2>&1)"
+  printf '[network]\nlocal = [%s]\n' "$OTHER" > .agentos.toml
+  "$AGENT" trust >/dev/null 2>&1
+  check "a project can't hand its agents your services" test $? -eq 2
+  rm -f .agentos.toml
+  check "--local with --net host is rejected" bash -c '"$@" 2>&1 | grep -q "already shares yours"' _ "$AGENT" run --net host --local "$MODELS" -- true
+  kill "$MODELS_PID" "$OTHER_PID" 2>/dev/null; wait "$MODELS_PID" "$OTHER_PID" 2>/dev/null
+  out="$("$AGENT" run --local "$MODELS" -- sh -c "$GETM; echo; $GETM" 2>&1)"
+  check "a server that isn't running is explained, once" test "$(grep -c "nothing is listening on 127.0.0.1:$MODELS on this machine" <<<"$out")" -eq 1
+  check "...and each try is journaled" grep -q '"kind":"net.local".*"ok":false' "$(latest_task_dir)/events.jsonl"
+else
+  skip "the local server tests need python3"
+fi
+
 section "a corporate proxy (upstream)"
 reset_proj
 cd "$PROJ"

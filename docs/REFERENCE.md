@@ -105,7 +105,7 @@ scripts/dev.sh shell
 | `agent spend` | What agents spent today, this week and this month, against your budgets |
 | `agent raise AMOUNT [--task ID \| --today \| --this-week \| --this-month [--project]]` | Raise a budget that's used up: a running task's, or one across tasks until it resets |
 
-`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
+`GRANTS` are `--rw DIR`, `--ro PATH`, `--hide PATH`, `-e NAME[=VAL]`, `--no-cwd`, `--allow HOST`, `--local PORT`, `--secret NAME=HOST[/HEADER]` and `--ask`/`--no-ask`. For `diff`, `commit`, `rollback` and `log`, `TASK` is an id prefix or `last`, and defaults to the latest task. To pass paths for the latest task, write `agent commit last src/`.
 
 ## What the agent sees
 
@@ -165,6 +165,14 @@ no_proxy = ["*.corp.example", "10.0.0.0/8"]               # reached directly
 ```
 
 The proxy is reached by agentos itself, outside the sandbox: the agent never sees its address or password, and it can't ask for another. Only your own config can set it, never a project's. Each connection records the hop (`via proxy.corp.example:3128`), and a proxy that says no (a login is needed, the host is blocked) is explained to the agent and in the journal. It must be a plain `http://` proxy (the tunnel to the host is TLS either way); SOCKS and `https://` proxies aren't supported, and one that isn't usable is an error, not a silent direct connection. A host name your machine can't resolve is left to the proxy to resolve; one it resolves only to private addresses is still refused.
+
+**A model server on your machine.** Local models (Ollama, llama.cpp, vLLM) listen on your loopback, which the sandbox can't see. Give an agent one port and it reaches that server at the same address it would use anywhere else, `127.0.0.1:PORT`, with no proxy settings:
+
+```bash
+agent do --local 11434 --agent aider "…"       # or: [network] local = [11434] in your config
+```
+
+Only that port: the rest of your loopback (databases, dev servers, anything else) stays out of reach, and a project's `.agentos.toml` can't hand out your services. Each connection is journaled (`✓ 127.0.0.1:11434 (your machine) · ↑2.1 kB ↓48 kB`), and a server that isn't running is explained once. Everything the server's own API lets a client do, the agent can do (Ollama's can pull and delete models, say), and calls to it aren't metered or counted against budgets: local models cost no dollars.
 
 ## Git pushes wait in an outbox
 
@@ -415,6 +423,7 @@ Two optional files, in TOML:
 [network]
 allow = ["@pypi", "api.github.com"]   # presets: @pypi @npm @crates @github @go
 proxy = "http://proxy.corp:3128"      # your file only: see Network (default: HTTPS_PROXY)
+local = [11434]                       # your file only: ports on your loopback agents may reach
 
 [files]
 hide = [".env"]

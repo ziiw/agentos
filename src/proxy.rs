@@ -374,6 +374,55 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))
 }
 
+/// One connection from the sandbox to a server on this machine's loopback.
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalEvent {
+    pub port: u16,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+    pub ms: u64,
+}
+
+pub type LocalSink = Arc<dyn Fn(LocalEvent) + Send + Sync>;
+
+/// Serves `port` on this machine's loopback to the sandbox, which reaches it
+/// at the same port on its own: every connection that arrives on `listener`
+/// is passed to 127.0.0.1:`port` (or `[::1]`) and reported to `sink`. Only
+/// that port: the rest of your loopback stays out of reach.
+pub fn serve_local(listener: UnixListener, port: u16, sink: LocalSink) -> Handle {
+    let active = Arc::new(AtomicUsize::new(0));
+    let counter = active.clone();
+    thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let (sink, counter) = (sink.clone(), counter.clone());
+            thread::spawn(move || {
+                sink(relay_local(client, port));
+                counter.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    Handle { active, open: Arc::default() }
+}
+
+fn relay_local(client: UnixStream, port: u16) -> LocalEvent {
+    let start = Instant::now();
+    let mut event = LocalEvent { port, ok: false, reason: None, bytes_out: 0, bytes_in: 0, ms: 0 };
+    let targets = [SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))];
+    match targets.iter().find_map(|a| TcpStream::connect_timeout(a, Duration::from_secs(5)).ok()) {
+        Some(server) => {
+            event.ok = true;
+            (event.bytes_out, event.bytes_in) = pump(client, server);
+        }
+        None => event.reason = Some(format!("nothing is listening on 127.0.0.1:{port} on this machine")),
+    }
+    event.ms = start.elapsed().as_millis() as u64;
+    event
+}
+
 /// An allowlist that grows while the task runs (hosts you approve when the
 /// agent asks).
 pub type LiveAllowlist = Arc<std::sync::RwLock<Allowlist>>;
@@ -811,5 +860,55 @@ mod tests {
         let allow: LiveAllowlist = Arc::new(std::sync::RwLock::new(list(&["evil"])));
         let event = handle(server, &allow, None, None, None, &Open::default()).unwrap();
         assert_eq!((event.host.as_str(), event.allowed, event.reason.as_deref()), ("", false, Some("malformed CONNECT target")));
+    }
+
+    #[test]
+    fn a_local_port_is_served_to_the_sandbox() {
+        // A "model server" on this machine's loopback: echoes four bytes.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut c in server.incoming().flatten() {
+                let mut buf = [0u8; 4];
+                if c.read_exact(&mut buf).is_ok() {
+                    let _ = c.write_all(&buf);
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("local.sock");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let handle = serve_local(bind(&socket).unwrap(), port, Arc::new(move |e| seen.lock().unwrap().push(e)));
+        let mut agent = UnixStream::connect(&socket).unwrap();
+        agent.write_all(b"ping").unwrap();
+        let mut back = [0u8; 4];
+        agent.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"ping");
+        drop(agent);
+        handle.drain(Duration::from_secs(2));
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].ok && events[0].port == port && (events[0].bytes_out, events[0].bytes_in) == (4, 4), "{:?}", events[0]);
+    }
+
+    #[test]
+    fn a_local_port_with_nothing_behind_it_is_explained() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("local.sock");
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let handle = serve_local(bind(&socket).unwrap(), port, Arc::new(move |e| seen.lock().unwrap().push(e)));
+        drop(UnixStream::connect(&socket).unwrap());
+        for _ in 0..100 {
+            if !events.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        handle.drain(Duration::from_secs(2));
+        let events = events.lock().unwrap();
+        assert!(!events[0].ok && events[0].reason.as_deref() == Some(&*format!("nothing is listening on 127.0.0.1:{port} on this machine")), "{:?}", events[0]);
     }
 }

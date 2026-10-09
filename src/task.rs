@@ -5,6 +5,9 @@ use crate::*;
 pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
     let home = home_dir()?;
     let cwd = std::env::current_dir()?;
+    if plan.net == Net::Host && !plan.local.is_empty() {
+        bail!("--local is for sandboxes with a network of their own; --net host already shares yours");
+    }
 
     let mut grants: Vec<Grant> = Vec::new();
     for (paths, access, flag) in [(&plan.grants.rw, Access::Rw, "--rw"), (&plan.grants.ro, Access::Ro, "--ro")] {
@@ -196,6 +199,11 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         eprintln!("  {}", err.dim(format!("through your proxy {}", u.describe())));
         journal.append("net.upstream", json!({ "proxy": u.describe() }))?;
     }
+    if !plan.local.is_empty() {
+        let ports: Vec<String> = plan.local.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+        eprintln!("  {}", err.dim(format!("your machine's {} (--local)", ports.join(", "))));
+        journal.append("task.local", json!({ "ports": plan.local }))?;
+    }
     if !periodic.is_empty() && task.meta.net == Net::Proxy {
         eprintln!("  {}", err.dim(format!("spend: {}", ledger.status(&periodic, util::now_ms()).join(" · "))));
     }
@@ -244,6 +252,15 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
     } else {
         (None, None)
     };
+    // Servers on your loopback this task was given (a local model server):
+    // a socket each, relayed to the real port once the sandbox is up.
+    let mut local_listeners = Vec::new();
+    for &port in &plan.local {
+        let path = task.dir.join(format!("local-{port}.sock"));
+        local_listeners.push((port, proxy::bind(&path)?, path.clone()));
+        run_mounts.push(RunMount { src: path, name: format!("local-{port}.sock"), writable: true });
+    }
+    let mut local_handles = Vec::new();
     let blocked = Arc::new(AtomicUsize::new(0));
     let expected_denials = plan.expected_denials;
     let ask = plan.ask;
@@ -297,6 +314,7 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         mask: vec![store.root().to_path_buf()],
         isolate_net: task.meta.net != Net::Host,
         proxy: proxy_socket.clone(),
+        locals: plan.local.clone(),
         run_mounts,
         hostname: format!("agent-{}", task.id()),
         home,
@@ -347,6 +365,9 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
             let gate = gate(asker.clone(), rules.clone(), taint.clone(), given.clone(), journal.clone(), expected_denials.clone(), err);
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
             proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, Some(gate), upstream.clone(), sink));
+        }
+        for (port, listener, _) in local_listeners.drain(..) {
+            local_handles.push(proxy::serve_local(listener, port, local_sink(journal.clone(), err)));
         }
         if let Some(listener) = owner_listener.take() {
             let owner = Owner {
@@ -425,6 +446,12 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
     };
     if let Some(handle) = proxy_handle {
         handle.drain(Duration::from_secs(2));
+    }
+    for handle in &local_handles {
+        handle.drain(Duration::from_secs(2));
+    }
+    for &port in &plan.local {
+        let _ = fs::remove_file(task.dir.join(format!("local-{port}.sock")));
     }
     if let Some(path) = &proxy_socket {
         let _ = fs::remove_file(path);
@@ -614,6 +641,20 @@ pub(crate) fn net_sink(journal: Journal, blocked: Arc<AtomicUsize>, expected: Ve
             say(format!("{} {target}: {why}{hint}", err.yellow("agent: blocked")));
         } else if let Some(reason) = &event.reason {
             say(format!("{} {}:{}: {reason}", err.yellow("agent: warning:"), event.host, event.port));
+        }
+    })
+}
+
+/// Records each connection to a server on your loopback, and says so once
+/// per port when nothing is listening there.
+pub(crate) fn local_sink(journal: Journal, err: Paint) -> proxy::LocalSink {
+    let warned = Mutex::new(HashSet::new());
+    Arc::new(move |event: proxy::LocalEvent| {
+        let _ = journal.append("net.local", json!(event));
+        if let Some(reason) = &event.reason {
+            if warned.lock().is_ok_and(|mut seen| seen.insert(event.port)) {
+                say(format!("{} {reason}", err.yellow("agent: warning:")));
+            }
         }
     })
 }

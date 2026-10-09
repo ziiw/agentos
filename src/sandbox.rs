@@ -132,6 +132,10 @@ pub struct Spec {
     /// Host path of the egress proxy's unix socket. When set, the agent's
     /// only way out is through it (see `proxy.rs`).
     pub proxy: Option<PathBuf>,
+    /// Ports of servers on this machine's loopback that the agent reaches at
+    /// the same port on its own loopback (run mounts `local-PORT.sock` carry
+    /// them out; see `proxy::serve_local`).
+    pub locals: Vec<u16>,
     /// Host files or directories exposed as /run/agentos/<name>: the task
     /// CA (read-only), the git outbox (writable), …
     pub run_mounts: Vec<RunMount>,
@@ -574,6 +578,26 @@ fn sandbox_init(spec: &Spec, warnings: Vec<String>, report_tx: OwnedFd, stdout: 
             Err(e) => report.warnings.push(format!("proxy forwarder: {e}")),
         }
     }
+    // Servers on the host's loopback the agent was given (a local model
+    // server): the same port here, relayed out through a socket each.
+    let mut locals = Vec::new();
+    for &port in &spec.locals {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => locals.push((listener, format!("/run/agentos/local-{port}.sock"))),
+            Err(e) => report.warnings.push(format!("127.0.0.1:{port} (--local): {e}")),
+        }
+    }
+    if !locals.is_empty() {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                drop(report_tx);
+                drop(stdout);
+                forward_locals(locals)
+            }
+            Ok(ForkResult::Parent { .. }) => {}
+            Err(e) => report.warnings.push(format!("local forwarder: {e}")),
+        }
+    }
     send_report(&report_tx, &report);
     drop(report_tx);
 
@@ -928,6 +952,26 @@ fn forward(listener: TcpListener) -> ! {
         });
     }
     unsafe { libc::_exit(0) }
+}
+
+/// Like `forward`, for each local server the agent was given: connections to
+/// its port go to that port's socket.
+fn forward_locals(listeners: Vec<(TcpListener, String)>) -> ! {
+    for (listener, socket) in listeners {
+        thread::spawn(move || {
+            for tcp in listener.incoming().flatten() {
+                let socket = socket.clone();
+                thread::spawn(move || {
+                    if let Ok(unix) = UnixStream::connect(&socket) {
+                        proxy::pump(tcp, unix);
+                    }
+                });
+            }
+        });
+    }
+    loop {
+        thread::park();
+    }
 }
 
 /// Process C: becomes the agent.

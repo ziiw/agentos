@@ -62,6 +62,8 @@ pub(crate) struct Plan {
     /// Your corporate proxy from your config (else the environment's), and the hosts to skip it for.
     pub(crate) proxy: Option<String>,
     pub(crate) no_proxy: Vec<String>,
+    /// Ports on your loopback the agent reaches at the same port (a local model server).
+    pub(crate) local: Vec<u16>,
 }
 
 /// What the config files add to a task beyond its grants.
@@ -69,6 +71,7 @@ pub(crate) struct Applied {
     pub(crate) allow: Vec<String>,
     pub(crate) proxy: Option<String>,
     pub(crate) no_proxy: Vec<String>,
+    pub(crate) local: Vec<u16>,
     /// `(NAME, HOST[/HEADER])`: brokered if NAME has a value (see [`secret_value`]).
     pub(crate) secrets: Vec<(String, String)>,
     pub(crate) secret_commands: keychain::Commands,
@@ -90,7 +93,7 @@ pub(crate) fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Appl
     settings.allow.extend(approvals::remembered(store.root(), &approvals::project_root(&cwd, &home))?);
     grants.ro.extend(settings.ro);
     grants.hide.extend(settings.hide);
-    Ok(Applied { allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
+    Ok(Applied { allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, local: settings.local, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
 }
 
 /// The proxy the egress proxy goes through: your config's, else the one in
@@ -101,6 +104,18 @@ pub(crate) fn upstream_proxy(configured: Option<&str>, no_proxy: &[String]) -> R
         Some(url) => Some(proxy::Upstream::parse(url, &[]).context("[network] proxy")?.bypassing(no_proxy)),
         None => proxy::Upstream::from_env()?.map(|u| u.bypassing(no_proxy)),
     })
+}
+
+/// The loopback ports a task gets: your config's and --local's, once each.
+pub(crate) fn local_ports(configured: Vec<u16>, flags: &[u16]) -> Vec<u16> {
+    let mut ports = configured;
+    for p in flags {
+        if !ports.contains(p) {
+            ports.push(*p);
+        }
+    }
+    ports.dedup();
+    ports
 }
 
 /// The task's budget: --budget, else your config's. The gateway enforces it
@@ -276,6 +291,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         None => format!("{} (interactive)", profile.name),
     };
     let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
+    let local = local_ports(applied.local, &args.grants.local);
     let net = args.net.unwrap_or(profile.net);
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
     if net != Net::Proxy && !args.grants.allow.is_empty() {
@@ -337,6 +353,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             periodic: applied.periodic,
             proxy: applied.proxy,
             no_proxy: applied.no_proxy,
+            local,
         },
     )
 }
@@ -349,6 +366,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     let argv = args.command;
     let applied = apply_config(store, &mut args.grants)?;
     let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
+    let local = local_ports(applied.local, &args.grants.local);
     let mut secrets = parse_secrets(&args.grants.secret, &commands)?;
     let ask = args.grants.ask;
     let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask;
@@ -396,6 +414,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             periodic: applied.periodic,
             proxy: applied.proxy,
             no_proxy: applied.no_proxy,
+            local,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {

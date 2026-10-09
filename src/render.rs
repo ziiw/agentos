@@ -572,6 +572,25 @@ fn describe(p: Paint, e: &Event) -> String {
                 format!("{} {target} · {}", p.red("✗ blocked"), s(&d["reason"]))
             }
         }
+        "net.upstream" => format!("through your proxy {}", s(&d["proxy"])),
+        "task.local" => {
+            let ports: Vec<String> = d["ports"].as_array().into_iter().flatten().map(|p| format!("127.0.0.1:{p}")).collect();
+            format!("your machine's {}", ports.join(", "))
+        }
+        "net.local" => {
+            let target = format!("127.0.0.1:{}", d["port"]);
+            if d["ok"].as_bool() == Some(true) {
+                format!(
+                    "{} {target} (your machine) · ↑{} ↓{} · {}",
+                    p.green("✓"),
+                    bytes(d["bytes_out"].as_u64().unwrap_or(0)),
+                    bytes(d["bytes_in"].as_u64().unwrap_or(0)),
+                    util::duration(d["ms"].as_u64().unwrap_or(0))
+                )
+            } else {
+                format!("{} {target} (your machine) · {}", p.red("✗"), s(&d["reason"]))
+            }
+        }
         "sandbox.ready" => format!("landlock {} · seccomp {} · proc {}", s(&d["landlock"]), s(&d["seccomp"]), s(&d["proc"])),
         "agent.session" => format!("model {}", s(&d["model"])),
         "login.sealed" => format!("{} tokens moved to the vault", d["tokens"]),
