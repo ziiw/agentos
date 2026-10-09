@@ -126,15 +126,19 @@ impl Allowlist {
 }
 
 /// A proxy the egress proxy goes through to reach the internet, typically a
-/// corporate one: allowed connections are `CONNECT`ed through it instead of
-/// being made directly. It's reached by this process, outside the sandbox,
+/// corporate one (an HTTP `CONNECT` proxy, or SOCKS5): allowed connections are
+/// tunneled through it instead of being made directly. It's reached by this process, outside the sandbox,
 /// so the sandbox never sees it or its password.
 #[derive(Clone)]
 pub struct Upstream {
     host: String,
     port: u16,
-    /// `Basic …`, for `Proxy-Authorization`, from `user:password@` in the URL.
+    /// HTTP `CONNECT` (the usual corporate proxy) or SOCKS5 (an `ssh -D` tunnel, say).
+    socks: bool,
+    /// For HTTP: `Basic …`, for `Proxy-Authorization`, from `user:password@` in the URL.
     auth: Option<String>,
+    /// For SOCKS5: the user and password from the URL (RFC 1929).
+    login: Option<(String, String)>,
     /// Hosts reached directly (NO_PROXY).
     bypass: Vec<Bypass>,
 }
@@ -190,13 +194,15 @@ impl Bypass {
 }
 
 impl Upstream {
-    /// `url` is `http://[user[:password]@]host[:port]`. `no_proxy`: hosts to
-    /// reach directly (`example.com` and its subdomains, `10.0.0.0/8`, `*`).
+    /// `url` is `http://[user[:password]@]host[:port]` or `socks5://…` (the
+    /// name is resolved by the proxy either way). `no_proxy`: hosts to reach
+    /// directly (`example.com` and its subdomains, `10.0.0.0/8`, `*`).
     pub fn parse(url: &str, no_proxy: &[String]) -> Result<Upstream> {
-        let rest = match url.trim().split_once("://") {
-            Some(("http", rest)) => rest,
-            Some((scheme, _)) => bail!("{scheme}:// proxies aren't supported, only http:// ones (the tunnel to the host is TLS either way)"),
-            None => url.trim(),
+        let (socks, rest) = match url.trim().split_once("://") {
+            Some(("http", rest)) => (false, rest),
+            Some(("socks5" | "socks5h", rest)) => (true, rest),
+            Some((scheme, _)) => bail!("{scheme}:// proxies aren't supported, only http:// and socks5:// ones (the tunnel to the host is TLS either way)"),
+            None => (false, url.trim()),
         };
         let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
         let (userinfo, hostport) = authority.rsplit_once('@').map_or((None, authority), |(u, h)| (Some(u), h));
@@ -210,13 +216,20 @@ impl Upstream {
                 None => (hostport, None),
             },
         };
-        let port = port.map(|p| p.parse::<u16>().with_context(|| format!("bad proxy port {p:?}"))).transpose()?.unwrap_or(80);
+        let port = port.map(|p| p.parse::<u16>().with_context(|| format!("bad proxy port {p:?}"))).transpose()?.unwrap_or(if socks { 1080 } else { 80 });
         if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c.is_control()) {
-            bail!("expected a proxy like http://proxy.example.com:3128");
+            bail!("expected a proxy like http://proxy.example.com:3128 or socks5://127.0.0.1:1080");
         }
-        let auth = userinfo.map(|u| format!("Basic {}", crate::util::base64(percent_decode(u).as_bytes())));
+        let auth = userinfo.filter(|_| !socks).map(|u| format!("Basic {}", crate::util::base64(percent_decode(u).as_bytes())));
+        let login = userinfo.filter(|_| socks).map(|u| {
+            let (user, password) = u.split_once(':').unwrap_or((u, ""));
+            (percent_decode(user), percent_decode(password))
+        });
+        if login.as_ref().is_some_and(|(u, p)| u.len() > 255 || p.len() > 255) {
+            bail!("a SOCKS5 user name and password are at most 255 bytes each");
+        }
         let bypass = no_proxy.iter().flat_map(|l| l.split(',')).filter_map(Bypass::parse).collect();
-        Ok(Upstream { host: host.to_ascii_lowercase(), port, auth, bypass })
+        Ok(Upstream { host: host.to_ascii_lowercase(), port, socks, auth, login, bypass })
     }
 
     /// The proxy your shell uses: `HTTPS_PROXY` (or `ALL_PROXY`), minus `NO_PROXY`.
@@ -252,6 +265,10 @@ impl Upstream {
             .ok()
             .and_then(|mut addrs| addrs.find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(10)).ok()))
             .ok_or_else(|| format!("can't reach the upstream proxy {}", self.describe()))?;
+        if self.socks {
+            self.socks5(&mut stream, host, port)?;
+            return Ok(stream);
+        }
         let target = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
         let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
         if let Some(auth) = &self.auth {
@@ -277,6 +294,91 @@ impl Upstream {
             Some(407) => Err(format!("the upstream proxy {} wants a login (407): put user:password@ in its address", self.describe())),
             _ => Err(format!("the upstream proxy {} refused: {}", self.describe(), status.chars().take(80).collect::<String>())),
         }
+    }
+}
+
+impl Upstream {
+    /// SOCKS5 (RFC 1928, with RFC 1929 passwords): ask the proxy to connect to
+    /// `host:port`, by name, so that it does the lookup.
+    fn socks5(&self, stream: &mut TcpStream, host: &str, port: u16) -> std::result::Result<(), String> {
+        let proxy = self.describe();
+        let lost = |e: io::Error| format!("the upstream proxy {proxy} dropped the connection ({e})");
+        stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(lost)?;
+        // Offer "no login", and a password too if we have one.
+        let hello: &[u8] = if self.login.is_some() { &[5, 2, 0, 2] } else { &[5, 1, 0] };
+        stream.write_all(hello).map_err(lost)?;
+        let mut answer = [0u8; 2];
+        stream.read_exact(&mut answer).map_err(lost)?;
+        match answer {
+            [5, 0] => {}
+            [5, 2] => {
+                let (user, password) = self.login.as_ref().ok_or_else(|| format!("the upstream proxy {proxy} wants a login: put user:password@ in its address"))?;
+                let mut login = vec![1, user.len() as u8];
+                login.extend(user.as_bytes());
+                login.push(password.len() as u8);
+                login.extend(password.as_bytes());
+                stream.write_all(&login).map_err(lost)?;
+                let mut ok = [0u8; 2];
+                stream.read_exact(&mut ok).map_err(lost)?;
+                if ok[1] != 0 {
+                    return Err(format!("the upstream proxy {proxy} refused that login"));
+                }
+            }
+            [5, 0xff] => return Err(format!("the upstream proxy {proxy} accepts no login method we have: put user:password@ in its address")),
+            _ => return Err(format!("{proxy} doesn't answer like a SOCKS5 proxy")),
+        }
+        // CONNECT, to a name (or an address, which has its own type).
+        let mut request = vec![5, 1, 0];
+        match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => {
+                request.push(1);
+                request.extend(ip.octets());
+            }
+            Ok(IpAddr::V6(ip)) => {
+                request.push(4);
+                request.extend(ip.octets());
+            }
+            Err(_) if host.len() <= 255 => {
+                request.extend([3, host.len() as u8]);
+                request.extend(host.as_bytes());
+            }
+            Err(_) => return Err("that host name is too long for SOCKS5".into()),
+        }
+        request.extend(port.to_be_bytes());
+        stream.write_all(&request).map_err(lost)?;
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head).map_err(lost)?;
+        if head[0] != 5 {
+            return Err(format!("{proxy} doesn't answer like a SOCKS5 proxy"));
+        }
+        if head[1] != 0 {
+            let why = match head[1] {
+                1 => "a general failure",
+                2 => "the connection isn't allowed by its rules",
+                3 => "the network is unreachable",
+                4 => "the host is unreachable",
+                5 => "the connection was refused",
+                6 => "the connection timed out",
+                7 => "CONNECT isn't supported",
+                8 => "that address type isn't supported",
+                _ => "an unknown error",
+            };
+            return Err(format!("the upstream proxy {proxy} refused: {why} (SOCKS5 reply {})", head[1]));
+        }
+        // The address it bound: read and dropped, so what follows is the tunnel.
+        let skip = match head[3] {
+            1 => 4 + 2,
+            4 => 16 + 2,
+            3 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).map_err(lost)?;
+                len[0] as usize + 2
+            }
+            _ => return Err(format!("{proxy} doesn't answer like a SOCKS5 proxy")),
+        };
+        let mut rest = vec![0u8; skip];
+        stream.read_exact(&mut rest).map_err(lost)?;
+        stream.set_read_timeout(None).map_err(lost)
     }
 }
 
@@ -756,7 +858,7 @@ mod tests {
         assert_eq!(Upstream::parse("proxy:8080", &[]).unwrap().describe(), "proxy:8080");
         assert_eq!(Upstream::parse("http://proxy", &[]).unwrap().describe(), "proxy:80");
         assert_eq!(Upstream::parse("http://[::1]:3128", &[]).unwrap().describe(), "[::1]:3128");
-        for bad in ["socks5://proxy:1080", "https://proxy:443", "http://", "http://proxy:notaport", "http://[::1"] {
+        for bad in ["ftp://proxy:21", "https://proxy:443", "http://", "http://proxy:notaport", "http://[::1"] {
             assert!(Upstream::parse(bad, &[]).is_err(), "{bad}");
         }
 
@@ -910,5 +1012,105 @@ mod tests {
         handle.drain(Duration::from_secs(2));
         let events = events.lock().unwrap();
         assert!(!events[0].ok && events[0].reason.as_deref() == Some(&*format!("nothing is listening on 127.0.0.1:{port} on this machine")), "{:?}", events[0]);
+    }
+
+    /// A stand-in SOCKS5 proxy: speaks the handshake, records what it was asked
+    /// (the login and the target), answers `reply`, then echoes once.
+    fn fake_socks(want_login: Option<(&'static str, &'static str)>, reply: u8) -> (u16, thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut seen = String::new();
+            let mut hello = [0u8; 2];
+            c.read_exact(&mut hello).unwrap();
+            let mut methods = vec![0u8; hello[1] as usize];
+            c.read_exact(&mut methods).unwrap();
+            if let Some((user, password)) = want_login {
+                if !methods.contains(&2) {
+                    c.write_all(&[5, 0xff]).unwrap();
+                    return seen;
+                }
+                c.write_all(&[5, 2]).unwrap();
+                let mut v = [0u8; 2];
+                c.read_exact(&mut v).unwrap();
+                let mut u = vec![0u8; v[1] as usize];
+                c.read_exact(&mut u).unwrap();
+                let mut plen = [0u8; 1];
+                c.read_exact(&mut plen).unwrap();
+                let mut p = vec![0u8; plen[0] as usize];
+                c.read_exact(&mut p).unwrap();
+                seen += &format!("login={}:{} ", String::from_utf8_lossy(&u), String::from_utf8_lossy(&p));
+                let good = u == user.as_bytes() && p == password.as_bytes();
+                c.write_all(&[1, if good { 0 } else { 1 }]).unwrap();
+                if !good {
+                    return seen;
+                }
+            } else {
+                c.write_all(&[5, 0]).unwrap();
+            }
+            let mut head = [0u8; 4];
+            c.read_exact(&mut head).unwrap();
+            let host = match head[3] {
+                3 => {
+                    let mut len = [0u8; 1];
+                    c.read_exact(&mut len).unwrap();
+                    let mut name = vec![0u8; len[0] as usize];
+                    c.read_exact(&mut name).unwrap();
+                    String::from_utf8(name).unwrap()
+                }
+                1 => {
+                    let mut ip = [0u8; 4];
+                    c.read_exact(&mut ip).unwrap();
+                    std::net::Ipv4Addr::from(ip).to_string()
+                }
+                other => panic!("address type {other}"),
+            };
+            let mut port = [0u8; 2];
+            c.read_exact(&mut port).unwrap();
+            seen += &format!("connect={host}:{} atyp={}", u16::from_be_bytes(port), head[3]);
+            c.write_all(&[5, reply, 0, 1, 127, 0, 0, 1, 0, 80]).unwrap();
+            if reply == 0 {
+                let mut buf = [0u8; 16];
+                let n = c.read(&mut buf).unwrap();
+                c.write_all(&buf[..n]).unwrap();
+            }
+            seen
+        });
+        (port, worker)
+    }
+
+    #[test]
+    fn socks5_upstream_proxies() {
+        let u = Upstream::parse("socks5://user:p%40ss@Proxy.Corp.example", &[]).unwrap();
+        assert_eq!((u.describe().as_str(), u.socks, u.login.clone()), ("proxy.corp.example:1080", true, Some(("user".into(), "p@ss".into()))));
+        assert_eq!(Upstream::parse("socks5h://127.0.0.1:9050", &[]).unwrap().describe(), "127.0.0.1:9050");
+        assert_eq!(format!("{u:?}"), "Upstream(proxy.corp.example:1080)", "never the password");
+
+        // A name goes to the proxy as a name, and the bytes after the answer are the tunnel.
+        let (port, seen) = fake_socks(None, 0);
+        let mut tunnel = Upstream::parse(&format!("socks5://127.0.0.1:{port}"), &[]).unwrap().connect("example.com", 443).unwrap();
+        tunnel.write_all(b"hello").unwrap();
+        let mut back = [0u8; 5];
+        tunnel.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"hello");
+        assert_eq!(seen.join().unwrap(), "connect=example.com:443 atyp=3");
+        // An address goes as an address; a login, when the proxy wants one.
+        let (port, seen) = fake_socks(Some(("alice", "s3cret")), 0);
+        Upstream::parse(&format!("socks5://alice:s3cret@127.0.0.1:{port}"), &[]).unwrap().connect("93.184.216.34", 443).unwrap();
+        assert_eq!(seen.join().unwrap(), "login=alice:s3cret connect=93.184.216.34:443 atyp=1");
+        // …and it's explained when that fails.
+        let (port, seen) = fake_socks(Some(("alice", "s3cret")), 0);
+        let err = Upstream::parse(&format!("socks5://alice:wrong@127.0.0.1:{port}"), &[]).unwrap().connect("example.com", 443).unwrap_err();
+        assert!(err.contains("refused that login"), "{err}");
+        seen.join().unwrap();
+        let (port, seen) = fake_socks(Some(("alice", "s3cret")), 0);
+        let err = Upstream::parse(&format!("socks5://127.0.0.1:{port}"), &[]).unwrap().connect("example.com", 443).unwrap_err();
+        assert!(err.contains("wants a login") || err.contains("accepts no login"), "{err}");
+        drop(seen);
+        let (port, seen) = fake_socks(None, 2);
+        let err = Upstream::parse(&format!("socks5://127.0.0.1:{port}"), &[]).unwrap().connect("example.com", 443).unwrap_err();
+        assert!(err.contains("refused: the connection isn't allowed by its rules (SOCKS5 reply 2)"), "{err}");
+        seen.join().unwrap();
     }
 }

@@ -423,9 +423,9 @@ PY
   printf '[network]\nproxy = ""\n' > "$WORK/direct.toml"
   out="$(HTTPS_PROXY=http://127.0.0.1:9 AGENTOS_CONFIG="$WORK/direct.toml" "$AGENT" run --allow example.com -- $GETX 2>&1)"
   check "proxy = \"\" connects directly, whatever the environment says" grep -q HTTP200 <<<"$out"
-  out="$(HTTPS_PROXY=socks5://127.0.0.1:1080 "$AGENT" run --allow example.com -- true 2>&1)"
-  check "a proxy it can't use is an error, not a silent bypass" grep -q "socks5:// proxies aren't supported" <<<"$out"
-  check "...which a task without the network never hits" env HTTPS_PROXY=socks5://127.0.0.1:1080 "$AGENT" run -- true
+  out="$(HTTPS_PROXY=ftp://127.0.0.1:21 "$AGENT" run --allow example.com -- true 2>&1)"
+  check "a proxy it can't use is an error, not a silent bypass" grep -q "ftp:// proxies aren't supported" <<<"$out"
+  check "...which a task without the network never hits" env HTTPS_PROXY=ftp://127.0.0.1:21 "$AGENT" run -- true
   printf '[network]\nproxy = "http://127.0.0.1:%s"\n' "$UP_PORT" > .agentos.toml
   "$AGENT" trust >/dev/null 2>&1
   check "a project can't choose where your traffic goes" test $? -eq 2
@@ -452,6 +452,99 @@ PY
   kill "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null
   out="$(HTTPS_PROXY=http://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
   check "a proxy that is down is explained" grep -q "can't reach the upstream proxy" <<<"$out"
+  # A SOCKS5 proxy (an `ssh -D` tunnel, say): the name goes to it, and it connects.
+  cat > "$WORK/socks-proxy.py" <<'PY'
+import socket, struct, sys, threading
+log = open(sys.argv[1], "a", buffering=1)
+login = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+def recv(c, n):
+    b = b""
+    while len(b) < n:
+        d = c.recv(n - len(b))
+        if not d:
+            raise EOFError
+        b += d
+    return b
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+def handle(c):
+    try:
+        _, n = recv(c, 2)
+        methods = recv(c, n)
+        if login:
+            if 2 not in methods:
+                c.sendall(b"\x05\xff"); return
+            c.sendall(b"\x05\x02")
+            _, ul = recv(c, 2); user = recv(c, ul); pl = recv(c, 1)[0]; pw = recv(c, pl)
+            if f"{user.decode()}:{pw.decode()}" != login:
+                c.sendall(b"\x01\x01"); return
+            c.sendall(b"\x01\x00")
+        else:
+            c.sendall(b"\x05\x00")
+        _, _, _, atyp = recv(c, 4)
+        if atyp == 3:
+            host = recv(c, recv(c, 1)[0]).decode()
+        elif atyp == 1:
+            host = socket.inet_ntoa(recv(c, 4))
+        else:
+            c.sendall(b"\x05\x08\x00\x01" + bytes(6)); return
+        port = struct.unpack(">H", recv(c, 2))[0]
+        log.write(f"SOCKS {host}:{port} atyp={atyp}\n")
+        try:
+            u = socket.create_connection((host, port), timeout=10)
+        except OSError:
+            c.sendall(b"\x05\x05\x00\x01" + bytes(6)); return
+        c.sendall(b"\x05\x00\x00\x01" + bytes(4) + struct.pack(">H", 0))
+        t = threading.Thread(target=pipe, args=(c, u), daemon=True)
+        t.start(); pipe(u, c); t.join(5); u.close()
+    except EOFError:
+        pass
+    finally:
+        c.close()
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(16)
+print(srv.getsockname()[1], flush=True)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PY
+  start_socks() {  # LOG [USER:PASSWORD] → UP_PORT, UP_PID
+    : > "$1"
+    python3 "$WORK/socks-proxy.py" "$@" > "$WORK/upstream.port" &
+    UP_PID=$!
+    for _ in $(seq 50); do [ -s "$WORK/upstream.port" ] && break; sleep 0.1; done
+    UP_PORT="$(cat "$WORK/upstream.port")"
+    : > "$WORK/upstream.port"
+  }
+  start_socks "$WORK/socks1.log"
+  out="$(HTTPS_PROXY=socks5://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "socks5://: an allowed host is reached through the SOCKS proxy" grep -q HTTP200 <<<"$out"
+  check "...which was asked for the name, not an address" grep -q '^SOCKS example.com:443 atyp=3' "$WORK/socks1.log"
+  check "...and the journal says which proxy" grep -q "\"via\":\"127.0.0.1:$UP_PORT\"" "$(latest_task_dir)/events.jsonl"
+  out="$(ALL_PROXY=socks5://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "ALL_PROXY works too" grep -q HTTP200 <<<"$out"
+  kill "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null
+  start_socks "$WORK/socks2.log" 'alice:s3cret-socks-pw'
+  out="$(HTTPS_PROXY=socks5://alice:s3cret-socks-pw@127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "a SOCKS proxy that wants a login gets it from the address" grep -q HTTP200 <<<"$out"
+  check "...which never reaches the banner, journal or store" bash -c "! grep -rq s3cret-socks-pw '$AGENTOS_HOME'"
+  out="$(HTTPS_PROXY=socks5://alice:wrong@127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "a wrong password is explained" grep -q 'refused that login' <<<"$out"
+  out="$(HTTPS_PROXY=socks5://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "no login at all is explained too" grep -q 'accepts no login method we have' <<<"$out"
+  kill "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null
 else
   skip "the corporate proxy tests need python3"
 fi

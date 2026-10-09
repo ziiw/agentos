@@ -169,7 +169,7 @@ proxy = "http://user:password@proxy.corp.example:3128"   # "" = connect directly
 no_proxy = ["*.corp.example", "10.0.0.0/8"]               # reached directly
 ```
 
-The proxy is reached by agentos itself, outside the sandbox: the agent never sees its address or password, and it can't ask for another. Only your own config can set it, never a project's. Each connection records the hop (`via proxy.corp.example:3128`), and a proxy that says no (a login is needed, the host is blocked) is explained to the agent and in the journal. It must be a plain `http://` proxy (the tunnel to the host is TLS either way); SOCKS and `https://` proxies aren't supported, and one that isn't usable is an error, not a silent direct connection. A host name your machine can't resolve is left to the proxy to resolve; one it resolves only to private addresses is still refused.
+The proxy is reached by agentos itself, outside the sandbox: the agent never sees its address or password, and it can't ask for another. Only your own config can set it, never a project's. Each connection records the hop (`via proxy.corp.example:3128`), and a proxy that says no (a login is needed, the host is blocked) is explained to the agent and in the journal. It's an `http://` proxy (the usual `CONNECT` kind) or a `socks5://` one (an `ssh -D` tunnel, say; the host name is handed to the proxy to resolve, and `user:password@` works for both); `https://` proxies aren't supported, and one that isn't usable is an error, not a silent direct connection. A host name your machine can't resolve is left to the proxy to resolve; one it resolves only to private addresses is still refused.
 
 **A model server on your machine.** Local models (Ollama, llama.cpp, vLLM) listen on your loopback, which the sandbox can't see. Give an agent one port and it reaches that server at the same address it would use anywhere else, `127.0.0.1:PORT`, with no proxy settings:
 
@@ -676,7 +676,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 ## Limits (honest list)
 
 - **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
-- **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP and other protocols aren't supported. A corporate upstream proxy has to be a plain `http://` one.
+- **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP and other protocols aren't supported. A corporate upstream proxy has to be `http://` or `socks5://`.
 - **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work. With a budget, that includes model APIs.
 - **Rules can't loosen the hard limits.** Credentials in your home, the task store and your config are never offered, whatever a `permit` says, and folders outside your home stay read-only mid-task when Landlock is on.
 - **The agent writes its own reasons.** An agent steered by something it read can write a convincing one. Judge the request, not the prose.
