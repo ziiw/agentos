@@ -88,6 +88,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
         agentos::dbus::serve_stdio(&bus, services)?;
         return Ok(0);
     }
+    // A witness has a log of its own, not a task store.
+    if let Command::Witness { command } = cli.command {
+        return cmd_witness(command);
+    }
     let store = Store::open()?;
     match cli.command {
         Command::Do(args) => cmd_do(&store, args),
@@ -108,7 +112,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Hooks => cmd_hooks(&store),
         Command::Watches => cmd_watches(&store),
         Command::Screen { task, output } => cmd_screen(&store, task.as_deref(), output),
-        Command::Attest { task, verify, journal, trust, expect_pcr, public } => cmd_attest(&store, task.as_deref(), verify, journal, trust, expect_pcr, public),
+        Command::Attest { task, verify, journal, trust, expect_pcr, witness, public } => cmd_attest(&store, task.as_deref(), verify, journal, trust, expect_pcr, witness, public),
         Command::Install { dir, yes, digest } => cmd_install(&store, dir, yes, digest),
         Command::Search { text } => cmd_search(&store, text.as_deref()),
         Command::Registry { command } => cmd_registry(command),
@@ -128,7 +132,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         }
         Command::Revoke { target, task } => cmd_revoke(&store, target, task),
         Command::Connect { name, forget } => cmd_connect(&store, name, forget),
-        Command::Mcp { .. } | Command::DbusBridge { .. } => unreachable!(),
+        Command::Mcp { .. } | Command::DbusBridge { .. } | Command::Witness { .. } => unreachable!(),
     }
 }
 

@@ -167,9 +167,18 @@ pub(crate) enum Command {
         /// With --verify: the value you expect a PCR to have, as N=HEX (more than once for several)
         #[arg(long = "expect-pcr", value_name = "N=HEX", requires = "verify")]
         expect_pcr: Vec<String>,
+        /// With --verify: ask this witness (the address your config posts receipts to) whether it holds the receipt
+        #[arg(long, value_name = "URL", requires = "verify")]
+        witness: Option<String>,
         /// Show this machine's receipt key
         #[arg(long, conflicts_with_all = ["verify", "task"])]
         public: bool,
+    },
+    /// Run, or check the log of, a witness: somewhere else that keeps the receipts
+    /// your machines sign, so rewriting a journal can't rewrite them too
+    Witness {
+        #[command(subcommand)]
+        command: WitnessCommand,
     },
     /// Install an agent package after showing what it asks for: from a
     /// folder, or by name from your registry
@@ -264,6 +273,27 @@ pub(crate) enum Command {
         bus: String,
         #[arg(long = "service")]
         services: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WitnessCommand {
+    /// Take receipts (POST /receipts) and keep them in a log
+    Serve {
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:7979")]
+        listen: String,
+        /// Where the log is kept (default: ~/.local/share/agentos-witness)
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Take receipts only from this key (its id, a prefix of at least 8, or the whole key); more than once for several
+        #[arg(long, value_name = "KEY")]
+        trust: Vec<String>,
+    },
+    /// Check that a witness's log holds together, and show its head
+    Check {
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
     },
 }
 

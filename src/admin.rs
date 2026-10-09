@@ -398,7 +398,7 @@ pub(crate) fn cmd_packages() -> Result<i32> {
 }
 
 /// `agent attest`: sign a task's journal as it stands, or check a receipt.
-pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<PathBuf>, journal: Option<PathBuf>, trust: Option<String>, expect_pcr: Vec<String>, public: bool) -> Result<i32> {
+pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<PathBuf>, journal: Option<PathBuf>, trust: Option<String>, expect_pcr: Vec<String>, witness: Option<String>, public: bool) -> Result<i32> {
     let out = Paint::stdout();
     let (cwd, home) = (std::env::current_dir()?, home_dir()?);
     let settings = config::load(store.root(), &cwd, &home)?;
@@ -461,6 +461,24 @@ pub(crate) fn cmd_attest(store: &Store, selector: Option<&str>, verify: Option<P
                 }
                 None => {
                     println!("{} the receipt doesn't carry PCR {index}", out.red("✗"));
+                    code = 1;
+                }
+            }
+        }
+        if let Some(url) = &witness {
+            use agentos::witness::Held;
+            match agentos::witness::ask(url, &signed) {
+                Ok(Held::Yes { seq, at_ms }) => println!("{} the witness holds this receipt (#{seq}, taken {})", out.green("✓"), util::rfc3339(at_ms)),
+                Ok(Held::Different { seq, events }) => {
+                    println!("{} the witness holds another history of this task from this key at event {events} (#{seq}): one of the two has been rewritten", out.red("✗"));
+                    code = 1;
+                }
+                Ok(Held::No) => {
+                    println!("{} the witness has no receipt for this task", out.red("✗"));
+                    code = 1;
+                }
+                Err(why) => {
+                    println!("{} couldn't ask the witness {url}: {why}", out.red("✗"));
                     code = 1;
                 }
             }
@@ -668,6 +686,48 @@ pub(crate) fn cmd_watches(store: &Store) -> Result<i32> {
         println!("{}", out.dim("agentd isn't running, so nothing is watched: agent serve"));
     }
     Ok(0)
+}
+
+/// `agent witness serve` / `agent witness check`.
+pub(crate) fn cmd_witness(command: WitnessCommand) -> Result<i32> {
+    let out = Paint::stdout();
+    let default_dir = || -> Result<PathBuf> {
+        Ok(match std::env::var_os("XDG_DATA_HOME") {
+            Some(p) => PathBuf::from(p).join("agentos-witness"),
+            None => home_dir()?.join(".local/share/agentos-witness"),
+        })
+    };
+    match command {
+        WitnessCommand::Serve { listen, dir, trust } => {
+            for t in &trust {
+                if t.len() < 8 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("--trust {t:?}: a key id, a prefix of at least 8 hex characters, or a whole public key (`agent attest --public` shows them)");
+                }
+            }
+            let dir = match dir {
+                Some(d) => d,
+                None => default_dir()?,
+            };
+            agentos::witness::serve(&listen, &dir, trust)?;
+            Ok(0)
+        }
+        WitnessCommand::Check { dir } => {
+            let dir = match dir {
+                Some(d) => d,
+                None => default_dir()?,
+            };
+            match agentos::witness::check(&dir) {
+                Ok((n, head)) => {
+                    println!("{} {} held, the chain holds and every signature checks · head {head}", out.green("✓"), plural(n, "receipt"));
+                    Ok(0)
+                }
+                Err(e) => {
+                    println!("{} {e:#}", out.red("✗"));
+                    Ok(1)
+                }
+            }
+        }
+    }
 }
 
 /// `agent screen`: what a task's screen shows now (or showed last), as a PNG.

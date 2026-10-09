@@ -38,3 +38,4 @@ pub mod users;
 pub mod util;
 pub mod vault;
 pub mod watch;
+pub mod witness;

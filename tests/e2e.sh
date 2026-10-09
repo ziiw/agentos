@@ -2684,6 +2684,63 @@ printf '[journal]\nwitness = "https://witness.example.com/receipts"\n' > .agento
 check "a project can't choose who hears about your tasks" test $? -eq 2
 rm -f .agentos.toml
 
+section "a witness you run (agent witness)"
+reset_proj
+cd "$PROJ"
+WPORT=$((20000 + RANDOM % 10000))
+WURL="http://127.0.0.1:$WPORT"
+witness_up() {
+  "$AGENT" witness serve --listen "127.0.0.1:$WPORT" --dir "$WORK/witness" "$@" >"$WORK/witness.log" 2>&1 &
+  WITNESS_PID=$!
+  for _ in $(seq 50); do curl -sS -m 1 "$WURL/head" >/dev/null 2>&1 && break; sleep 0.1; done
+}
+witness_up
+printf '[journal]\nwitness = "%s/receipts"\n' "$WURL" > "$WORK/witness-config.toml"
+wc() { AGENTOS_CONFIG="$WORK/witness-config.toml" "$AGENT" "$@"; }
+wc run -- true >/dev/null 2>&1
+T="$(latest_task_dir)"
+ID="$(basename "$T")"
+check "a witness you run takes the receipt a task ends with" grep -q '1 receipts, head' <<<"$(curl -sS -m 5 "$WURL/")"
+check "...the task's journal says it was taken" grep -Eq '"kind":"receipt.signed".*"witness":\{"status":200' "${T}events.jsonl"
+check "GET /receipts/TASK lists what it holds for a task" grep -q "\"task\":\"$ID\"" <<<"$(curl -sS -m 5 "$WURL/receipts/$ID")"
+check "...and nothing for another" test "$(curl -sS -m 5 "$WURL/receipts/ffffffff")" = "[]"
+check "/head is the log's head, which commits to everything it holds" grep -Eq '"entries":1,"head":"[0-9a-f]{64}"' <<<"$(curl -sS -m 5 "$WURL/head")"
+check "agent witness check: the chain holds and every signature checks" grep -q '1 receipt held, the chain holds and every signature checks' <<<"$("$AGENT" witness check --dir "$WORK/witness" 2>&1)"
+out="$(wc attest --verify "${T}receipt.json" --witness "$WURL/receipts" 2>&1)"
+check "agent attest --verify --witness: the witness holds this receipt" grep -q 'the witness holds this receipt (#0' <<<"$out"
+# A receipt of another machine's, which the witness never saw.
+AGENTOS_HOME="$WORK/other-store" "$AGENT" run -- true >/dev/null 2>&1
+OTHER="$(ls -td "$WORK/other-store"/tasks/*/ | head -1)"
+out="$("$AGENT" attest --verify "${OTHER}receipt.json" --witness "$WURL/receipts" 2>&1)"
+check "a receipt the witness never saw is not held by it" grep -q 'the witness has no receipt for this task' <<<"$out"
+check "...and that fails the check" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" attest --verify "${OTHER}receipt.json" --witness "$WURL/receipts"
+# A receipt for a longer journal is news; the same head signed again is not.
+wc attest "$ID" >/dev/null 2>&1
+check "a receipt for a longer journal is added" grep -q '"entries":2,' <<<"$(curl -sS -m 5 "$WURL/head")"
+wc attest "$ID" >/dev/null 2>&1
+check "the same journal head signed again adds nothing" grep -q '"entries":2,' <<<"$(curl -sS -m 5 "$WURL/head")"
+# Its log is itself tamper-evident.
+kill $WITNESS_PID 2>/dev/null; wait $WITNESS_PID 2>/dev/null
+cp "$WORK/witness/log.jsonl" "$WORK/witness-log.good"
+sed -i "s/\"task\":\"$ID\"/\"task\":\"0000$(printf '%s' "$ID" | cut -c5-8)\"/" "$WORK/witness/log.jsonl"
+check "a witness's log that was changed is found out" grep -q 'line 1' <<<"$("$AGENT" witness check --dir "$WORK/witness" 2>&1)"
+check "...and it will not serve from it" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" witness serve --listen "127.0.0.1:$WPORT" --dir "$WORK/witness"
+cp "$WORK/witness-log.good" "$WORK/witness/log.jsonl"
+# Only the keys you trust.
+witness_up --trust deadbeefdeadbeef
+out="$(wc run -- true 2>&1)"
+check "a witness that takes receipts only from other keys refuses this machine's" grep -q 'the witness .* answered 403' <<<"$out"
+check "...and keeps nothing of it" grep -q '"entries":2,' <<<"$(curl -sS -m 5 "$WURL/head")"
+KEY="$("$AGENT" attest --public | cut -d' ' -f1)"
+kill $WITNESS_PID 2>/dev/null; wait $WITNESS_PID 2>/dev/null
+witness_up --trust "$KEY"
+wc run -- true >/dev/null 2>&1
+check "one that trusts this machine's key takes it" grep -q '"entries":3,' <<<"$(curl -sS -m 5 "$WURL/head")"
+check "a bad --trust is refused" bash -c '! "$@" >/dev/null 2>&1' _ "$AGENT" witness serve --listen 127.0.0.1:1 --dir "$WORK/w2" --trust zz
+check "what isn't a receipt is refused" test "$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST -d '{"not":"a receipt"}' "$WURL/receipts")" = 400
+check "...and a receipt changed after it was signed" test "$(sed 's/"events": [0-9]*/"events": 99/' "${T}receipt.json" | curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST --data-binary @- "$WURL/receipts")" = 400
+kill $WITNESS_PID 2>/dev/null; wait $WITNESS_PID 2>/dev/null
+
 section "receipts signed by the TPM (a software one here)"
 if ! command -v swtpm >/dev/null || ! command -v tpm2_createprimary >/dev/null || ! command -v tpm2_pcrextend >/dev/null; then
   skip "the TPM tests need swtpm and tpm2-tools"
