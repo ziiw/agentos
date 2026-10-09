@@ -171,6 +171,24 @@ It's verified at three levels:
 7. **agentd + API.** ✅ `agent serve` (M10): token-protected web console and JSON API; approvals reach you away from the terminal, with optional push notifications. ✅ Agents request folders and hosts mid-task, with a reason, and you answer at the terminal or in the console (M16). ✅ Your rules in Cedar answer in advance (M18). ✅ Tasks start from agentd's console too, with live output and Stop (M19). ✅ Projects ship rules that can only forbid (M20). ✅ What you grant mid-task can be taken back (M22). ✅ A team on one agentd: tokens with roles, and who did what in the journal (M36). Next: sign-in with your identity provider (OIDC) instead of tokens, per-project roles.
 8. **MCP gateway.** System services exposed as typed tools, governed by the same policy. ✅ The first server: agentos itself (M16). ✅ Your servers, run outside the sandbox with your credentials, every call journaled and governed (M17). ✅ Remote (HTTP) servers natively, with their OAuth sign-in kept in the vault (M25). Next: policy on arguments (e.g. only this repo); system services (D-Bus) as servers.
 
+## The microVM tier (design)
+
+The process sandbox shares the host's kernel, so a kernel bug reachable through the syscalls it still allows is out of scope (see the threat model). For agents you trust less, or machines shared by a team, the answer is a VM boundary under the same task model. Nothing here is built yet; this is the plan, shaped by what already exists.
+
+**The seam.** `sandbox::run(spec, …)` is the one place a task's isolation starts. It becomes one of two implementations of the same contract, chosen with `agent do --isolation vm` (or `[isolation]` in your config): the process sandbox as today, or a microVM. Everything outside it is untouched, because it already lives on the host side of sockets: the journal and receipts, the credential broker and its CA, the model gateway and budgets, the egress proxy and allowlist, the outbox and held calls, rules, taint, `agent diff`/`commit`/`rollback`.
+
+**The guest.** Cloud Hypervisor or Firecracker (small Rust VMMs, KVM only, a minimal device model), the distro's own kernel with a trimmed config, and an initramfs that holds one program: `agent` itself, as the guest's init, running the same `sandbox_init` steps it runs in a namespace today (root assembly, Landlock, seccomp, exec), so the in-guest sandbox still applies to a compromised agent that reaches its root.
+
+**Grants.** Read-only grants go in over virtiofs. A writable grant stays an overlay: lower is the virtiofs read-only view of your folder, upper is a directory in the task store shared read-write. The host reads the changeset from the upper directory exactly as `changes.rs` does now, so transactions, conflict detection, partial commit and rollback don't change, and the agent still can't write your files.
+
+**No network device at all.** The sockets that carry the proxy, the control channel, the owner channel and `--local` ports today (unix sockets mounted into the sandbox) become vsock ports. The guest forwarders already speak "connect to a socket, pump bytes"; they connect to vsock instead. On the host the VMM maps a guest vsock port to a unix socket path, so `proxy::serve`, `control::serve` and `serve_local` bind and accept as they do now. A guest with no NIC cannot reach anything but those doors.
+
+**Limits and startup.** `--memory` and `--cpus` become the VM's memory and vCPUs (enforced by the VMM and KVM, no systemd scope needed). Boot is a fraction of a second with a stripped guest; restoring from a snapshot of a booted-and-idle guest is the later optimisation. The agent's home and the task store's masking are unchanged: the guest sees only what the VMM was given.
+
+**What it doesn't change, or add.** GPU and device passthrough are out. Nested virtualisation matters in CI and on cloud VMs: GitHub's Ubuntu runners and bare-metal or nested-capable instances have `/dev/kvm`; Docker Desktop on a Mac does not, so the e2e suite keeps running the process tier there.
+
+**In order.** (1) Put `sandbox::run` behind an `Isolation` trait with the process sandbox as its first implementation, no behaviour change. (2) A guest image and init: reuse the bootc image's kernel, build the initramfs from `agent`. (3) vsock transport for the existing socket doors, tested against the process tier with the same e2e checks. (4) virtiofs grants and the shared upper directory. (5) `agent doctor` checks `/dev/kvm`; CI runs the suite under `--isolation vm` on a KVM runner. (6) Snapshots.
+
 ## Open decisions
 
 - **First user.** Developers running coding/ops agents (current bet) vs fleets on servers vs consumer desktop.
