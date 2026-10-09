@@ -1,11 +1,18 @@
 name: disk
 
-# A bootable agentos disk image (qcow2) for a VM or cloud, on demand:
-# Actions → disk → Run workflow. Builds it, boots it in QEMU, logs in over
-# SSH and runs the whole e2e suite inside the booted system, then uploads
-# the disk (~1.2 GB) as an artifact.
+# A bootable agentos disk image for a VM or cloud, on demand:
+# Actions → disk → Run workflow. Builds it and uploads it (~1.2 GB) as an
+# artifact. For the default qcow2 it also boots it in QEMU, logs in over SSH
+# and runs the whole e2e suite inside the booted system first. Other types
+# (raw, vmdk for VMware, ami for AWS, anaconda-iso) are built, not booted.
 on:
   workflow_dispatch:
+    inputs:
+      type:
+        description: Disk image type
+        type: choice
+        options: [qcow2, raw, vmdk, ami, anaconda-iso]
+        default: qcow2
 
 jobs:
   disk:
@@ -30,7 +37,9 @@ jobs:
             printf '\n[[customizations.user]]\nname = "agent"\nkey = "%s"\ngroups = ["wheel"]\n' "$SSH_KEY" >> image/disk.toml
           fi
 
-      - name: Make a qcow2 disk with bootc-image-builder
+      - name: Make the disk with bootc-image-builder
+        env:
+          TYPE: ${{ inputs.type }}
         run: |
           mkdir -p output
           sudo podman run --rm --privileged --pull=newer \
@@ -39,12 +48,13 @@ jobs:
             -v ./output:/output \
             -v /var/lib/containers/storage:/var/lib/containers/storage \
             quay.io/centos-bootc/bootc-image-builder:latest \
-            --type qcow2 --rootfs xfs \
+            --type "${TYPE:-qcow2}" --rootfs xfs \
             localhost/agentos:latest
           sudo chown -R "$(id -u)" output
-          ls -la output/qcow2
+          find output -type f -size +1M -exec ls -la {} +
 
       - name: Boot it and run agentos inside
+        if: ${{ (inputs.type || 'qcow2') == 'qcow2' }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 >/dev/null
           accel="-accel tcg"
@@ -69,6 +79,11 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: agentos-qcow2
-          path: output/qcow2/disk.qcow2
+          name: agentos-${{ inputs.type || 'qcow2' }}
+          path: |
+            output/qcow2/disk.qcow2
+            output/image/disk.raw
+            output/vmdk/disk.vmdk
+            output/bootiso/install.iso
+          if-no-files-found: error
           retention-days: 7

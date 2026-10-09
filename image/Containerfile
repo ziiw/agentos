@@ -22,7 +22,9 @@ FROM quay.io/fedora/fedora-bootc:42
 
 # What agents (and agentos itself) reach for: git for the outbox, curl,
 # python3, and util-linux for unshare (and script(1), packaged separately).
-RUN dnf -y install git-core curl python3 util-linux util-linux-script && dnf clean all
+# cloud-init applies a cloud's user data at first boot (users, SSH keys) and
+# does nothing on a machine that has none.
+RUN dnf -y install git-core curl python3 util-linux util-linux-script cloud-init && dnf clean all
 
 COPY --from=build /src/target/release/agent /usr/bin/agent
 COPY image/rootfs/ /

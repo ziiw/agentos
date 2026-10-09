@@ -7,6 +7,7 @@ What's in it on top of Fedora bootc 42:
 - `/usr/bin/agent`, the same binary CI tests
 - git, curl, python3 and util-linux, which agents and agentos reach for
 - `agentd` as a systemd user service ([the same unit the packages ship](../packaging/agentd.service)): `systemctl --user enable --now agentd`
+- cloud-init, so a cloud's user data (users, SSH keys) is applied at first boot
 - a login message that explains the basics
 
 Fedora doesn't restrict unprivileged user namespaces and its kernel has Landlock, so `agent doctor` passes out of the box, with no AppArmor profile to install.
@@ -32,7 +33,17 @@ sudo podman run --rm --privileged --pull=newer \
   --type qcow2 --rootfs xfs localhost/agentos:latest
 ```
 
-Boot `output/qcow2/disk.qcow2` in QEMU, UTM or a cloud. `--type raw`, `ami` and `anaconda-iso` work too. Or let CI do it: Actions → disk → **Run workflow** builds a qcow2, boots it in QEMU, logs in over SSH and runs agentos inside it, then uploads the disk as an artifact. It adds a user `agent` with your key if the repository secret `AGENTOS_SSH_KEY` is set. It also has a `ci` user for the boot test, whose private key is thrown away.
+Boot `output/qcow2/disk.qcow2` in QEMU, UTM or a cloud. Or let CI do it: Actions → disk → **Run workflow** builds a disk and uploads it as an artifact. Pick the type:
+
+| type | output | for |
+|---|---|---|
+| `qcow2` (default) | `disk.qcow2` | QEMU, KVM, OpenStack. CI also boots it, logs in over SSH and runs the whole end-to-end suite inside it |
+| `raw` | `disk.raw` | writing to a drive or a cloud's raw import |
+| `ami` | `disk.raw` | AWS: import it as a snapshot and register an AMI, or run bootc-image-builder yourself with its `--aws-*` options to upload directly |
+| `vmdk` | `disk.vmdk` | VMware |
+| `anaconda-iso` | `install.iso` | installing onto hardware |
+
+Only the qcow2 is booted in CI; the others are built, not tried. The disk has a user `agent` with your key if the repository secret `AGENTOS_SSH_KEY` is set, and a `ci` user for the boot test, whose private key is thrown away. On a cloud, cloud-init adds the users and keys you give it as user data.
 
 ## Move an existing machine onto it
 
@@ -42,4 +53,6 @@ On any bootc system (Fedora bootc, or Fedora Atomic such as Silverblue), once th
 sudo bootc switch ghcr.io/<you>/agentos:latest
 ```
 
-CI doesn't publish the image anywhere. Pushing it to a registry is your call.
+Then `sudo bootc upgrade` follows it, and `sudo bootc rollback` goes back. To have a machine update itself, `sudo systemctl enable --now bootc-fetch-apply-updates.timer` (it fetches the image you're tracking and reboots into it).
+
+CI doesn't publish the image anywhere. Pushing it to a registry is your call: `podman build -f image/Containerfile -t ghcr.io/<you>/agentos:latest .` and `podman push ghcr.io/<you>/agentos:latest` do it by hand.
