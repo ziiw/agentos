@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod gateway;
 pub mod held;
 pub mod journal;
+pub mod keychain;
 pub mod limits;
 pub mod mcp;
 pub mod oauth;

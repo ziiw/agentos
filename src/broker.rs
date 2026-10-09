@@ -41,12 +41,18 @@ impl Secret {
     /// `spec` is `NAME=HOST/HEADER` (header defaults to `authorization`); the
     /// real value comes from `NAME` in your environment.
     pub fn parse(spec: &str) -> Result<Secret> {
+        Secret::parse_with(spec, |env| std::env::var(env).ok())
+    }
+
+    /// Like [`Secret::parse`], with the real value of `NAME` given by `value`
+    /// (your environment, a keychain command…).
+    pub fn parse_with(spec: &str, value: impl FnOnce(&str) -> Option<String>) -> Result<Secret> {
         let (env, rest) = spec.split_once('=').with_context(|| format!("--secret {spec}: expected NAME=HOST[/HEADER]"))?;
         let (host, header) = rest.split_once('/').unwrap_or((rest, "authorization"));
         if env.is_empty() || host.is_empty() || header.is_empty() || host.contains(':') {
             bail!("--secret {spec}: expected NAME=HOST[/HEADER], e.g. ANTHROPIC_API_KEY=api.anthropic.com/x-api-key");
         }
-        let value = std::env::var(env).with_context(|| format!("--secret {spec}: {env} is not set in your environment"))?;
+        let value = value(env).with_context(|| format!("--secret {spec}: {env} is not set in your environment (or by a [secret_commands] entry)"))?;
         Ok(Secret::new(env, host, header, value))
     }
 

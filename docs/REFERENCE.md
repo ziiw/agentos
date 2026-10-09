@@ -414,6 +414,9 @@ ro = ["~/.cargo"]
 [secrets]                             # your file only
 GITHUB_TOKEN = "api.github.com"       # header defaults to authorization (Bearer)
 
+[secret_commands]                     # your file only: where a key comes from when it isn't in your environment
+GITHUB_TOKEN = ["pass", "show", "github"]
+
 [limits]                              # defaults for every task
 memory = "8G"
 cpus = 4
@@ -427,7 +430,7 @@ env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 "gpt-*" = { input = 1.25, output = 10 }   # example figures: use your provider's
 ```
 
-- **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`, `[mcp]` and `[prices]`; they're brokered whenever the variable is set in your environment and the task uses the allowlist network.
+- **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`, `[mcp]` and `[prices]`; they're brokered whenever the variable has a value (in your environment, or from its `[secret_commands]` entry) and the task uses the allowlist network.
 - **`.agentos.toml` in a project** (the current directory or a parent, below `$HOME`) can allow hosts, and hide or grant read-only paths *inside the project*. It comes with the repo, so agentos ignores it until you've read it and run `agent trust`, and again after any change. That includes a change an agent made and you committed: `agent diff` flags it. Without this, an agent could widen its own permissions for the next run, and a cloned repo could send your tokens anywhere.
 
 With an allowlist from either file, `agent run` uses the proxied network instead of none.
@@ -447,6 +450,17 @@ agent run --secret GITHUB_TOKEN=api.github.com -- my-script
 ```
 
 The script sees a placeholder in `$GITHUB_TOKEN`, and the proxy adds `Authorization: Bearer <your token>` on requests to `api.github.com`. Inside the sandbox, Node and Bun (`NODE_EXTRA_CA_CERTS`), and curl, Python, git and OpenSSL (`SSL_CERT_FILE` and friends) trust the task CA automatically.
+
+**Keys from your keychain.** A key doesn't have to live in your environment. Name a command that prints it, in your own config, and agentos runs it when a task needs the key and your environment doesn't have it:
+
+```toml
+[secret_commands]
+ANTHROPIC_API_KEY = ["secret-tool", "lookup", "service", "anthropic"]      # GNOME Keyring, KWallet
+GITHUB_TOKEN = ["pass", "show", "github"]                                  # pass
+OPENAI_API_KEY = ["op", "read", "op://Private/OpenAI/credential"]          # 1Password
+```
+
+The command runs as you, outside any sandbox, with your environment. What it prints (minus the final newline) is the value, and it goes where the variable's value would have gone: to the broker for a `[secrets]` entry, `--secret`, an agent's own secrets (`ANTHROPIC_API_KEY` for Claude), or an MCP server's `env` and `token`. A variable set in your environment wins, and the command isn't run. Tasks that can't use the network don't run it. A command that fails, prints nothing or takes more than 30 seconds is a warning, and the task goes on without that key. The warning has the command's first line of error, never its output. Only your own config can have `[secret_commands]`: a project's can't make agentos run a program.
 
 ## Agents
 
@@ -468,7 +482,7 @@ interactive = ["codex"]                    # agent do --agent codex, with no tas
 allow = ["api.openai.com"]                 # hosts it needs
 
 [secrets]                                  # brokered: the agent only sees placeholders
-OPENAI_API_KEY = "api.openai.com"
+OPENAI_API_KEY = "api.openai.com"          # (the value: your environment, or [secret_commands])
 ```
 
 An agent calling a model API other than Anthropic's or OpenAI's can list it before the first `[section]`, so its calls are metered and count against budgets: `models = [{ url = "https://openrouter.ai/api/v1/chat/completions", api = "openai" }]` (`api` is `anthropic`, `openai` or `gemini`; Gemini, Anthropic's and OpenAI's own APIs are built in; a trailing `*` in the URL matches any path under it).

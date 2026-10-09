@@ -69,8 +69,9 @@ pub(crate) struct Applied {
     pub(crate) allow: Vec<String>,
     pub(crate) proxy: Option<String>,
     pub(crate) no_proxy: Vec<String>,
-    /// Those whose variable is set in your environment.
-    pub(crate) secrets: Vec<Secret>,
+    /// `(NAME, HOST[/HEADER])`: brokered if NAME has a value (see [`secret_value`]).
+    pub(crate) secrets: Vec<(String, String)>,
+    pub(crate) secret_commands: keychain::Commands,
     pub(crate) budget: Option<Budget>,
     pub(crate) prices: Vec<(String, Price)>,
     pub(crate) mcp: Vec<agentos::mcp::Server>,
@@ -89,13 +90,7 @@ pub(crate) fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Appl
     settings.allow.extend(approvals::remembered(store.root(), &approvals::project_root(&cwd, &home))?);
     grants.ro.extend(settings.ro);
     grants.hide.extend(settings.hide);
-    let mut secrets = Vec::new();
-    for (name, target) in settings.secrets {
-        if std::env::var_os(&name).is_some() {
-            secrets.push(Secret::parse(&format!("{name}={target}"))?);
-        }
-    }
-    Ok(Applied { allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
+    Ok(Applied { allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, secrets: settings.secrets, secret_commands: settings.secret_commands, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
 }
 
 /// The proxy the egress proxy goes through: your config's, else the one in
@@ -221,8 +216,32 @@ pub(crate) fn cmd_vault(store: &Store, action: &str, agent: &str) -> Result<i32>
     Ok(0)
 }
 
-pub(crate) fn parse_secrets(specs: &[String]) -> Result<Vec<Secret>> {
-    let secrets = specs.iter().map(|s| Secret::parse(s)).collect::<Result<Vec<_>>>()?;
+/// The real value of a secret: your environment's, else what its
+/// `[secret_commands]` entry prints. A command that fails is a warning, and
+/// the secret then counts as not set.
+pub(crate) fn secret_value(name: &str, commands: &keychain::Commands) -> Option<String> {
+    match keychain::lookup(name, commands) {
+        Ok(value) => value,
+        Err(why) => {
+            eprintln!("{} {name}: {why}; going on without it", Paint::stderr().yellow("agent: warning:"));
+            None
+        }
+    }
+}
+
+/// The secrets of your config that have a value.
+pub(crate) fn resolve_config_secrets(entries: &[(String, String)], commands: &keychain::Commands) -> Result<Vec<Secret>> {
+    let mut secrets = Vec::new();
+    for (name, target) in entries {
+        if let Some(value) = secret_value(name, commands) {
+            secrets.push(Secret::parse_with(&format!("{name}={target}"), |_| Some(value))?);
+        }
+    }
+    Ok(secrets)
+}
+
+pub(crate) fn parse_secrets(specs: &[String], commands: &keychain::Commands) -> Result<Vec<Secret>> {
+    let secrets = specs.iter().map(|s| Secret::parse_with(s, |name| secret_value(name, commands))).collect::<Result<Vec<_>>>()?;
     for (i, s) in secrets.iter().enumerate() {
         if secrets[..i].iter().any(|o| o.env == s.env) {
             bail!("--secret {}: given twice", s.env);
@@ -256,7 +275,7 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
         Some(t) => format!("{}: {t}", profile.name),
         None => format!("{} (interactive)", profile.name),
     };
-    let (config_allow, config_secrets) = (applied.allow, applied.secrets);
+    let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
     let net = args.net.unwrap_or(profile.net);
     let budget = task_budget(args.mode.budget, applied.budget, net)?;
     if net != Net::Proxy && !args.grants.allow.is_empty() {
@@ -265,13 +284,15 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
     let mut allow: Vec<String> = profile.allow.iter().map(|h| h.to_string()).collect();
     allow.extend(config_allow);
     allow.extend(args.grants.allow.iter().cloned());
-    let mut secrets = parse_secrets(&args.grants.secret)?;
+    let mut secrets = parse_secrets(&args.grants.secret, &commands)?;
     let no_ask = args.grants.no_ask;
     if net == Net::Proxy {
-        let from_profile = profile.brokered.iter().filter_map(|(var, host, header)| {
-            std::env::var(var).ok().map(|value| Secret::new(var, host, header, value))
-        });
-        for secret in from_profile.chain(config_secrets) {
+        let from_profile: Vec<Secret> = profile
+            .brokered
+            .iter()
+            .filter_map(|(var, host, header)| secret_value(var, &commands).map(|value| Secret::new(var, host, header, value)))
+            .collect();
+        for secret in from_profile.into_iter().chain(resolve_config_secrets(&config_secrets, &commands)?) {
             if !secrets.iter().any(|s| s.env == secret.env) {
                 secrets.push(secret);
             }
@@ -327,8 +348,8 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     args.mode.apply_limits(store)?;
     let argv = args.command;
     let applied = apply_config(store, &mut args.grants)?;
-    let (config_allow, config_secrets) = (applied.allow, applied.secrets);
-    let mut secrets = parse_secrets(&args.grants.secret)?;
+    let (config_allow, config_secrets, commands) = (applied.allow, applied.secrets, applied.secret_commands);
+    let mut secrets = parse_secrets(&args.grants.secret, &commands)?;
     let ask = args.grants.ask;
     let asked = !args.grants.allow.is_empty() || !secrets.is_empty() || ask;
     let net = match args.net {
@@ -342,7 +363,7 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
     if net == Net::Proxy {
         allow.extend(config_allow);
         allow.extend(args.grants.allow.iter().cloned());
-        for secret in config_secrets {
+        for secret in resolve_config_secrets(&config_secrets, &commands)? {
             if !secrets.iter().any(|s| s.env == secret.env) {
                 secrets.push(secret);
             }

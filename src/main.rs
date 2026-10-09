@@ -6,6 +6,7 @@ use agentos::control::{self, Call, PathRules, PathVerdict, Reply};
 use agentos::doctor::{self, Level};
 use agentos::gateway::{self, Budget, Endpoint, Ledger, Meter, Periodic, Price, Spend};
 use agentos::journal::{Integrity, Journal};
+use agentos::keychain;
 use agentos::limits::{self, Limits};
 use agentos::outbox;
 use agentos::policy::{self, Question, Verdict};

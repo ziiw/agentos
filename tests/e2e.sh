@@ -204,6 +204,72 @@ check "the value never reaches the journal" bash -c "! grep -rq real-secret-e2e-
 check "--secret with --net host is rejected" bash -c "! '$AGENT' run --net host --secret '$SECRET' -- true 2>/dev/null"
 unset AGENTOS_E2E_TOKEN
 
+section "secrets from a command (your keychain)"
+reset_proj
+cd "$PROJ"
+# A stand-in for secret-tool, security or pass: prints the secret named by $1.
+mkdir -p "$WORK/tools"
+KC_LOG="$WORK/keychain.log"
+: > "$KC_LOG"
+cat > "$WORK/tools/keychain-get" <<SH
+#!/bin/sh
+echo "\$1" >> "$KC_LOG"
+case "\$1" in
+  github) echo "keychain-token-0123456789" ;;
+  notes) echo "keychain-notes-0123456789" ;;
+  gone) echo "no such item" >&2; exit 44 ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$WORK/tools/keychain-get"
+KCFG="$WORK/keychain.toml"
+cat > "$KCFG" <<TOML
+[secrets]
+AGENTOS_E2E_KC = "postman-echo.com/x-test-token"
+AGENTOS_E2E_GONE = "postman-echo.com/x-gone"
+[secret_commands]
+AGENTOS_E2E_KC = ["$WORK/tools/keychain-get", "github"]
+AGENTOS_E2E_GONE = ["$WORK/tools/keychain-get", "gone"]
+TOML
+ECHO_HEADERS='echo "in the sandbox: $AGENTOS_E2E_KC"; curl -sS -m 20 -H "x-test-token: $AGENTOS_E2E_KC" https://postman-echo.com/headers'
+out="$(AGENTOS_CONFIG="$KCFG" "$AGENT" run --allow postman-echo.com -- sh -c "$ECHO_HEADERS" 2>&1)"
+check "a secret that isn't in your environment comes from its command" grep -Eq '"x-test-token": *"keychain-token-0123456789"' <<<"$out"
+check "...while the sandbox only has a placeholder" grep -q 'in the sandbox: agentos-placeholder-agentos-e2e-kc-' <<<"$out"
+check "...and the value never reaches the journal or the task store" bash -c "! grep -rq keychain-token-0123456789 '$AGENTOS_HOME'"
+check "a command that fails is a warning, and the task goes on" grep -q 'AGENTOS_E2E_GONE: keychain-get exited 44: no such item; going on without it' <<<"$out"
+n="$(wc -l < "$KC_LOG")"
+out="$(AGENTOS_CONFIG="$KCFG" AGENTOS_E2E_KC=from-env "$AGENT" run --allow postman-echo.com -- sh -c "$ECHO_HEADERS" 2>&1)"
+check "your environment wins over the command" grep -Eq '"x-test-token": *"from-env"' <<<"$out"
+check "...which isn't even run" bash -c '! tail -n +$(($1 + 1)) "$2" | grep -qx github' _ "$n" "$KC_LOG"
+n="$(wc -l < "$KC_LOG")"
+AGENTOS_CONFIG="$KCFG" "$AGENT" run -- true >/dev/null 2>&1
+check "a task that can't use the network doesn't run your commands" test "$(wc -l < "$KC_LOG")" = "$n"
+out="$(AGENTOS_CONFIG="$KCFG" "$AGENT" run --secret AGENTOS_E2E_KC=postman-echo.com/x-test-token -- sh -c "$ECHO_HEADERS" 2>&1)"
+check "--secret NAME=HOST takes it from there too" grep -Eq '"x-test-token": *"keychain-token-0123456789"' <<<"$out"
+out="$(AGENTOS_CONFIG="$KCFG" "$AGENT" run --secret AGENTOS_E2E_GONE=postman-echo.com -- true 2>&1)"
+check "...and an explicit --secret that has no value is an error" grep -q 'AGENTOS_E2E_GONE is not set in your environment (or by a \[secret_commands\] entry)' <<<"$out"
+printf '[secret_commands]\nGITHUB_TOKEN = ["sh", "-c", "echo hi"]\n' > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project can't make agentos run a program for a secret" test $? -eq 2
+rm -f .agentos.toml
+if command -v python3 >/dev/null; then
+  cp "$HERE/mcp-client" ./mcp-client
+  export NOTES_FILE="$WORK/kc-notes.txt"
+  : > "$NOTES_FILE"
+  cat > "$KCFG" <<TOML
+[secret_commands]
+NOTES_TOKEN = ["$WORK/tools/keychain-get", "notes"]
+[mcp.notes]
+command = ["python3", "$HERE/fake-mcp-server"]
+env = ["NOTES_TOKEN", "NOTES_FILE"]
+TOML
+  out="$(env -u NOTES_TOKEN AGENTOS_CONFIG="$KCFG" "$AGENT" run -- sh -c 'python3 ./mcp-client notes tools/list "tools/call:read_note:{}"' 2>&1 </dev/null)"
+  check "an MCP server's variable can come from a command, too" grep -q "read_note: .*token: set" <<<"$out"
+  unset NOTES_FILE
+else
+  skip "the stand-in MCP server needs python3"
+fi
+
 section "a corporate proxy (upstream)"
 reset_proj
 cd "$PROJ"

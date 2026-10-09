@@ -170,6 +170,18 @@ pub struct Server {
     /// read-only, asked otherwise.
     #[serde(default)]
     pub tools: BTreeMap<String, Policy>,
+    /// `[secret_commands]` entries for the variables this server uses (from
+    /// your config, when it's loaded).
+    #[serde(skip)]
+    pub commands: crate::keychain::Commands,
+}
+
+impl Server {
+    /// A variable this server needs: in your environment, else from its
+    /// `[secret_commands]` entry.
+    fn secret(&self, var: &str) -> Result<Option<String>, String> {
+        crate::keychain::lookup(var, &self.commands)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,11 +582,12 @@ impl Gateway {
             }
         }
         for k in &server.env {
-            match std::env::var_os(k) {
-                Some(v) => {
+            match server.secret(k) {
+                Ok(Some(v)) => {
                     cmd.env(k, v);
                 }
-                None => (self.say)(format!("MCP server {}: {k} isn't set in your environment", server.name)),
+                Ok(None) => (self.say)(format!("MCP server {}: {k} isn't set in your environment", server.name)),
+                Err(why) => (self.say)(format!("MCP server {}: {k}: {why}", server.name)),
             }
         }
         let log = std::fs::File::create(self.log_dir.join(format!("mcp-{}.log", server.name)))?;
@@ -615,9 +628,10 @@ impl Gateway {
         let to_server: Arc<dyn Upstream> = match &server.url {
             Some(url) => {
                 let auth = match &server.token {
-                    Some(var) => match std::env::var(var) {
-                        Ok(t) => Auth::Token(t),
-                        Err(_) => return reply(Reply::error(format!("MCP server {name}: {var} isn't set in the user's environment"))),
+                    Some(var) => match server.secret(var) {
+                        Ok(Some(t)) => Auth::Token(t),
+                        Ok(None) => return reply(Reply::error(format!("MCP server {name}: {var} isn't set in the user's environment"))),
+                        Err(why) => return reply(Reply::error(format!("MCP server {name}: {var}: {why}"))),
                     },
                     None => Auth::SignIn(self.store_root.clone()),
                 };
@@ -739,7 +753,9 @@ impl Gateway {
         let upstream: Arc<dyn Upstream> = match &server.url {
             Some(url) => {
                 let auth = match &server.token {
-                    Some(var) => Auth::Token(std::env::var(var).with_context(|| format!("{var} isn't set in your environment"))?),
+                    Some(var) => Auth::Token(
+                        server.secret(var).map_err(anyhow::Error::msg).with_context(|| var.clone())?.with_context(|| format!("{var} isn't set in your environment"))?,
+                    ),
                     None => Auth::SignIn(self.store_root.clone()),
                 };
                 Arc::new(Remote {
