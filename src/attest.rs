@@ -92,10 +92,9 @@ impl Identity {
                 // Whoever links it first wins, so tasks starting together share one key.
                 let linked = fs::hard_link(&tmp, &path);
                 let _ = fs::remove_file(&tmp);
-                if let Err(e) = linked {
-                    if e.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(e).with_context(|| format!("write {}", path.display()));
-                    }
+                match linked {
+                    Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e).with_context(|| format!("write {}", path.display())),
+                    _ => {}
                 }
                 fs::read(&path)?
             }

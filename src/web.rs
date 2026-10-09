@@ -179,11 +179,11 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
     };
     match result {
         Ok(v) => {
-            if let (false, Some((task, action))) = (who.owner, touched) {
-                if let Ok(t) = store.resolve(Some(&task)) {
-                    let decision = serde_json::from_str::<Value>(&body_for_note).ok().and_then(|b| b["decision"].as_str().map(str::to_string));
-                    let _ = t.journal().append("console.action", json!({ "by": who.name, "role": who.role.name(), "action": action, "decision": decision }));
-                }
+            if let (false, Some((task, action))) = (who.owner, touched)
+                && let Ok(t) = store.resolve(Some(&task))
+            {
+                let decision = serde_json::from_str::<Value>(&body_for_note).ok().and_then(|b| b["decision"].as_str().map(str::to_string));
+                let _ = t.journal().append("console.action", json!({ "by": who.name, "role": who.role.name(), "action": action, "decision": decision }));
             }
             Reply::Json(200, v)
         }

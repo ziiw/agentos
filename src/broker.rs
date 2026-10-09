@@ -500,7 +500,7 @@ fn relay_http_with<A: Read + Write, B: Read + Write>(
                     let payload = match read_body(request_body(&req), &mut agent) {
                         Ok(p) => p,
                         Err(e) if e.kind() == io::ErrorKind::Other => {
-                            let body = format!("{{\"agentos\":\"refused\",\"message\":\"this host's writes are held for the user's review, and this one is too large to hold (1 MiB)\"}}");
+                            let body = r#"{"agentos":"refused","message":"this host's writes are held for the user's review, and this one is too large to hold (1 MiB)"}"#.to_string();
                             down += reply(&mut agent, "413 Payload Too Large", body)?;
                             return Ok(());
                         }
