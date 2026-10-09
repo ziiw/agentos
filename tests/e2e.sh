@@ -1956,6 +1956,64 @@ check "a project can't start tasks on its own" test $? -eq 2
 rm -f .agentos.toml
 export AGENTOS_HOME="$SAVED_HOME"
 
+section "events wake an agent (hooks in agentd)"
+reset_proj
+cd "$PROJ"
+SAVED_HOME="$AGENTOS_HOME"
+export AGENTOS_HOME="$WORK/store-hooks"
+mkdir -p "$AGENTOS_HOME" "$WORK/hooks/agents"
+cat > "$WORK/hooks/agents/sched-agent.toml" <<'TOML'
+run = ["sh", "-c", "echo task-was: $1", "sh", "{task}"]
+TOML
+printf '[console]\nprojects = ["%s"]\n\n[hook.ci]\nproject = "%s"\ntask = "CI failed. The event: {event}"\ntoken = "AGENTOS_E2E_HOOK_TOKEN"\nagent = "sched-agent"\nbudget = "1usd"\nmin_interval = "4s"\n' "$PROJ" "$PROJ" > "$WORK/hooks/config.toml"
+cat > "$WORK/hooks/policy.cedar" <<'CEDAR'
+@id("nothing consequential once an event started it")
+forbid (principal, action == Action::"call", resource)
+when { context.taint.contains("event") && resource.name like "delete*" };
+CEDAR
+hc() { AGENTOS_CONFIG="$WORK/hooks/config.toml" "$AGENT" "$@"; }
+start_agentd AGENTOS_CONFIG="$WORK/hooks/config.toml" AGENTOS_E2E_HOOK_TOKEN=hook-secret-123
+code() { curl -sS -m 10 -o "$WORK/hook.out" -w '%{http_code}' "$@"; }
+HOOK="$CONSOLE/api/hooks/ci"
+check "an event without the hook's token is refused" test "$(code -X POST -d x "$HOOK")" = 401
+check "...with a wrong one" test "$(code -X POST -H 'Authorization: Bearer nope' -d x "$HOOK")" = 401
+check "...with agentd's own token: that opens the console, not hooks" test "$(code -X POST -H "Authorization: Bearer $TOKEN" -d x "$HOOK")" = 401
+check "...to a hook that isn't there, the same" test "$(code -X POST -H 'Authorization: Bearer hook-secret-123' -d x "$CONSOLE/api/hooks/nope")" = 401
+check "the hook's token opens nothing else" test "$(code -H 'Authorization: Bearer hook-secret-123' "$CONSOLE/api/tasks")" = 401
+check "agent hooks lists it, and says its token is set" bash -c 'out="$(AGENTOS_E2E_HOOK_TOKEN=x AGENTOS_CONFIG="$1" "$2" hooks 2>&1)"; grep -q "ci .*POST http.*/api/hooks/ci" <<<"$out" && grep -q "AGENTOS_E2E_HOOK_TOKEN is set" <<<"$out"' _ "$WORK/hooks/config.toml" "$AGENT"
+check "an event with the token starts the task" test "$(code -X POST -H 'Authorization: Bearer hook-secret-123' -d '{"build":"red"}' "$HOOK")" = 202
+ID="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' "$WORK/hook.out")"
+for _ in $(seq 60); do grep -q task-was "$AGENTOS_HOME/tasks/$ID/output.log" 2>/dev/null && break; sleep 0.5; done
+check "...with the event's words in it" grep -q 'task-was: CI failed. The event: {"build":"red"}' "$AGENTOS_HOME/tasks/$ID/output.log"
+check "...and the journal says which hook" grep -q '"started_by":"agentd hook ci"' "$AGENTOS_HOME/tasks/$ID/events.jsonl"
+check "what came in is untrusted: the task started tainted by it" grep -q '"kind":"taint.marked".*"detail":"hook ci".*"source":"event"\|"kind":"taint.marked".*"source":"event"' "$AGENTOS_HOME/tasks/$ID/events.jsonl"
+check "...which shows in the journal as read" grep -q 'the event that started it (hook ci)\|event' <<<"$("$AGENT" log "$ID" 2>&1)"
+check "an event straight after is refused: too soon" test "$(code -X POST -H 'Authorization: Bearer hook-secret-123' -d again "$HOOK")" = 429
+sleep 4
+check "later, one with X-Gitlab-Token works" test "$(code -X POST -H 'X-Gitlab-Token: hook-secret-123' -d "$(printf 'a\033[2Jb')" "$HOOK")" = 202
+ID2="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' "$WORK/hook.out")"
+for _ in $(seq 60); do grep -q task-was "$AGENTOS_HOME/tasks/$ID2/output.log" 2>/dev/null && break; sleep 0.5; done
+check "...and control characters in the event don't reach the agent" bash -c '! grep -q "$(printf "\033")" "$1"' _ "$AGENTOS_HOME/tasks/$ID2/output.log"
+sleep 4
+check "X-Agentos-Token works too, and a long event is cut" test "$(code -X POST -H 'X-Agentos-Token: hook-secret-123' --data-binary "$(head -c 20000 /dev/zero | tr '\0' 'x')" "$HOOK")" = 202
+ID3="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' "$WORK/hook.out")"
+for _ in $(seq 60); do grep -q task-was "$AGENTOS_HOME/tasks/$ID3/output.log" 2>/dev/null && break; sleep 0.5; done
+check "...to a size an agent can be handed" test "$(awk '/^task-was:/ { print length($0) }' "$AGENTOS_HOME/tasks/$ID3/output.log" | head -1)" -lt 8200
+check "the hook's token is nowhere in the store" bash -c "! grep -rq hook-secret-123 '$AGENTOS_HOME'"
+check "agent hooks counts what happened" grep -Eq '3 runs.*last: task' <<<"$(hc hooks 2>&1)"
+check "...and what was refused" grep -q 'refused' <<<"$(hc hooks 2>&1)"
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+cp "$WORK/hooks/policy.cedar" "$WORK/hooks/policy.cedar.keep"
+check "your rules can see that an event started the task" grep -q 'forbidden by your rule .*nothing consequential' <<<"$(hc policy check call tracker.delete_issue --tainted event 2>&1)"
+check "...and --tainted takes event" bash -c '! AGENTOS_CONFIG="$1" "$2" policy check call tracker.delete_issue --tainted cookies >/dev/null 2>&1' _ "$WORK/hooks/config.toml" "$AGENT"
+printf '[hook.sneaky]\nproject = "%s"\ntask = "x"\ntoken = "T"\n' "$PROJ" > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project can't open a door into agentd" test $? -eq 2
+rm -f .agentos.toml
+printf '[hook.bad]\nproject = "%s"\ntask = "x"\ntoken = "not a variable name"\n' "$PROJ" > "$WORK/hooks/bad.toml"
+check "a token has to name a variable" grep -q 'token:' <<<"$(AGENTOS_CONFIG="$WORK/hooks/bad.toml" "$AGENT" hooks 2>&1)"
+export AGENTOS_HOME="$SAVED_HOME"
+
 section "budgets (the model gateway)"
 # A stand-in model API: httpbin's /base64/… answers with whatever body the
 # URL carries, so the "provider" reports exactly the usage we choose.

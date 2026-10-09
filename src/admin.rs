@@ -93,7 +93,8 @@ pub(crate) fn cmd_policy(command: Option<PolicyCommand>) -> Result<i32> {
                     "web" => Ok(taint::Source::Web),
                     "tool" => Ok(taint::Source::Tool),
                     "file" => Ok(taint::Source::File),
-                    other => bail!("--tainted {other}: expected web, tool or file"),
+                    "event" => Ok(taint::Source::Event),
+                    other => bail!("--tainted {other}: expected web, tool, file or event"),
                 })
                 .collect::<Result<Vec<_>>>()?;
             match policy::Policy::new(set, &agent, "check", &project).pretend_tainted(&sources).decide(&question) {
@@ -623,6 +624,44 @@ pub(crate) fn cmd_schedules(store: &Store) -> Result<i32> {
     }
     if !running {
         println!("{}", out.dim("agentd isn't running, so nothing starts: agent serve (or systemctl --user enable --now agentd)"));
+    }
+    Ok(0)
+}
+
+/// `agent hooks`: what can start a task from outside, and how it has been used.
+pub(crate) fn cmd_hooks(store: &Store) -> Result<i32> {
+    let (home, out) = (home_dir()?, Paint::stdout());
+    let settings = config::load(store.root(), &std::env::current_dir()?, &home)?;
+    if settings.hooks.is_empty() {
+        println!("no hooks: add [hook.NAME] to your config (see README: Hooks), and keep `agent serve` running");
+        return Ok(0);
+    }
+    let states = agentos::schedule::load_hooks(store.root());
+    let listen = approvals::agentd(store.root()).map(|d| d.listen).unwrap_or_else(|| "HOST:7777".into());
+    for h in &settings.hooks {
+        let state = states.get(&h.name).cloned().unwrap_or_default();
+        let token = match agentos::keychain::lookup(&h.token, &settings.secret_commands) {
+            Ok(Some(_)) => out.green(format!("{} is set", h.token)),
+            Ok(None) => out.yellow(format!("{} isn't set here (agentd needs it)", h.token)),
+            Err(e) => out.yellow(format!("{}: {e}", h.token)),
+        };
+        println!("{:<16} POST http://{listen}/api/hooks/{}", h.name, h.name);
+        println!(
+            "    {} · {} · {} · {}",
+            out.dim(util::display_path(Path::new(&h.project))),
+            token,
+            plural(state.fired as usize, "run"),
+            match &state.last_task {
+                Some(id) => format!("last: task {id}, {}", util::ago(state.last_fire_ms)),
+                None => "never fired".to_string(),
+            }
+        );
+        if state.refused > 0 {
+            println!("    {}", out.dim(format!("{} refused (a wrong token, too soon, or the last run still going)", state.refused)));
+        }
+    }
+    if approvals::agentd(store.root()).is_none() {
+        println!("{}", out.dim("agentd isn't running, so nothing listens: agent serve"));
     }
     Ok(0)
 }

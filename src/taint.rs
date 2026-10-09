@@ -10,7 +10,9 @@
 //! - **tool**: a result came back from an MCP server that reaches outside
 //!   your machine (every remote server, unless you say `taint = false`; a
 //!   local one if you say `taint = true`);
-//! - **file**: you let it read a folder outside its project, mid-task.
+//! - **file**: you let it read a folder outside its project, mid-task;
+//! - **event**: it was started by one (a webhook: the payload is in its task,
+//!   and anyone who can send the hook can write it).
 //!
 //! Taint never goes away within a task. It is context for your rules
 //! (`context.tainted`, `context.taint`), and by default a tainted task is
@@ -27,6 +29,7 @@ pub enum Source {
     Web,
     Tool,
     File,
+    Event,
 }
 
 impl Source {
@@ -35,6 +38,7 @@ impl Source {
             Source::Web => "web",
             Source::Tool => "tool",
             Source::File => "file",
+            Source::Event => "event",
         }
     }
 
@@ -43,6 +47,7 @@ impl Source {
             Source::Web => "web pages",
             Source::Tool => "tool results",
             Source::File => "files outside the project",
+            Source::Event => "the event that started it",
         }
     }
 }
@@ -114,14 +119,14 @@ impl Taint {
     /// The kinds of source seen so far, in a fixed order.
     pub fn sources(&self) -> Vec<&'static str> {
         let marks = self.marks.lock().map(|m| m.clone()).unwrap_or_default();
-        [Source::Web, Source::Tool, Source::File].into_iter().filter(|s| marks.iter().any(|(m, _)| m == s)).map(Source::name).collect()
+        [Source::Web, Source::Tool, Source::File, Source::Event].into_iter().filter(|s| marks.iter().any(|(m, _)| m == s)).map(Source::name).collect()
     }
 
     /// "web pages (evil.example, x.org), tool results (linear)": what the
     /// task read, for the prompt and the summary.
     pub fn describe(&self) -> Option<String> {
         let marks = self.marks.lock().ok()?.clone();
-        let parts: Vec<String> = [Source::Web, Source::Tool, Source::File]
+        let parts: Vec<String> = [Source::Web, Source::Tool, Source::File, Source::Event]
             .into_iter()
             .filter_map(|source| {
                 let details: Vec<&str> = marks.iter().filter(|(s, _)| *s == source).map(|(_, d)| d.as_str()).collect();

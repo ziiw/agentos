@@ -86,6 +86,8 @@ struct Parts {
     path: String,
     query: String,
     auth: Option<String>,
+    /// `X-Agentos-Token` or `X-Gitlab-Token`: the ways a webhook sender can present a hook's token.
+    token_header: Option<String>,
     body: String,
 }
 
@@ -93,7 +95,8 @@ fn request_parts(req: &Request) -> Parts {
     let url = req.url().to_string();
     let (path, query) = url.split_once('?').map(|(p, q)| (p.to_string(), q.to_string())).unwrap_or((url, String::new()));
     let auth = req.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.to_string());
-    Parts { method: req.method().clone(), path, query, auth, body: String::new() }
+    let token_header = req.headers().iter().find(|h| h.field.equiv("X-Agentos-Token") || h.field.equiv("X-Gitlab-Token")).map(|h| h.value.to_string());
+    Parts { method: req.method().clone(), path, query, auth, token_header, body: String::new() }
 }
 
 enum Reply {
@@ -141,6 +144,11 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
     if parts.method == Method::Get && (parts.path == "/" || parts.path == "/index.html") {
         return Reply::Html(INDEX);
     }
+    let segments: Vec<&str> = parts.path.trim_matches('/').split('/').collect();
+    // A hook has a token of its own and opens nothing else.
+    if let (Method::Post, ["api", "hooks", name]) = (&parts.method, segments.as_slice()) {
+        return hook(&parts, name, root);
+    }
     let bearer = parts.auth.as_deref().and_then(|a| a.strip_prefix("Bearer ")).map(str::to_string);
     let query_token = parts.query.split('&').find_map(|kv| kv.strip_prefix("token=")).map(str::to_string);
     let given = bearer.or(query_token);
@@ -152,7 +160,6 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         },
         None => return Reply::Json(401, json!({ "error": "missing or wrong token: open the link agent serve printed" })),
     };
-    let segments: Vec<&str> = parts.path.trim_matches('/').split('/').collect();
     let needed = needs(&parts.method, &segments);
     if who.role < needed {
         return Reply::Json(403, json!({ "error": format!("{} is {} {}: that needs {} {}", who.name, article(who.role), who.role.name(), article(needed), needed.name()) }));
@@ -178,7 +185,7 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
     let result = match (&parts.method, segments.as_slice()) {
         (Method::Get, ["api", "whoami"]) => Ok(json!({ "name": who.name, "role": who.role.name(), "owner": who.owner })),
         (Method::Get, ["api", "tasks"]) => tasks(&store),
-        (Method::Post, ["api", "tasks"]) => start(&store, &parts.body, &who.label()),
+        (Method::Post, ["api", "tasks"]) => start(&store, &parts.body, &who.label(), None),
         (Method::Get, ["api", "launchpad"]) => launchpad(&store),
         (Method::Get, ["api", "schedules"]) => schedules(&store),
         (Method::Post, ["api", "schedules", name, "run"]) => run_schedule_now(&store, name, &who),
@@ -356,6 +363,68 @@ struct Start {
     timeout: Option<String>,
 }
 
+/// Only one hook at a time is checked against what agentd remembers of it.
+static HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whether two secrets are the same, without telling how much of one was right.
+fn same_secret(a: &str, b: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(a.as_bytes()).iter().zip(Sha256::digest(b.as_bytes()).iter()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// `POST /api/hooks/NAME`: an event starts the hook's task. Its token is
+/// the only credential that works here, and works nowhere else; the event's
+/// words are untrusted, so the task starts tainted.
+fn hook(parts: &Parts, name: &str, root: &PathBuf) -> Reply {
+    let wrong = || Reply::Json(401, json!({ "error": "missing or wrong token for this hook" }));
+    let broken = |why: String| Reply::Json(500, json!({ "error": why }));
+    let (Ok(store), Ok(home)) = (Store::open_at(root), crate::home_dir()) else { return broken("agentd can't open its store".into()) };
+    let Ok(settings) = config::load(root, &home, &home) else { return broken("agentd can't read its config".into()) };
+    // An unknown hook and a wrong token look the same from outside.
+    let Some(h) = settings.hooks.iter().find(|h| h.name == name) else { return wrong() };
+    let given = parts.auth.as_deref().and_then(|a| a.strip_prefix("Bearer ")).map(str::to_string).or_else(|| parts.token_header.clone());
+    let Some(given) = given else { return wrong() };
+    let want = match agentos::keychain::lookup(&h.token, &settings.secret_commands) {
+        Ok(Some(v)) if !v.is_empty() => v,
+        _ => return broken(format!("the hook's token ({}) isn't set where agentd runs", h.token)),
+    };
+    let _one_at_a_time = HOOKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut states = schedule::load_hooks(root);
+    let state = states.entry(h.name.clone()).or_default();
+    if !same_secret(&given, &want) {
+        state.refused += 1;
+        let _ = schedule::save_hooks(root, &states);
+        return wrong();
+    }
+    let now = util::now_ms();
+    let every = h.min_interval().unwrap_or(Duration::from_secs(60));
+    if now < state.last_fire_ms + every.as_millis() as u64 {
+        state.refused += 1;
+        let _ = schedule::save_hooks(root, &states);
+        return Reply::Json(429, json!({ "error": format!("too soon: this hook runs at most every {}", humantime::format_duration(every)) }));
+    }
+    if state.last_task.as_deref().is_some_and(|id| store.resolve(Some(id)).is_ok_and(|t| t.is_live())) {
+        state.refused += 1;
+        let _ = schedule::save_hooks(root, &states);
+        return Reply::Json(409, json!({ "error": "the last run of this hook is still going" }));
+    }
+    let project = match h.project.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(&h.project),
+    };
+    let body = json!({ "project": project, "task": h.task_for(&parts.body), "agent": h.agent, "budget": h.budget, "timeout": h.timeout });
+    match start(&store, &body.to_string(), &format!("agentd hook {}", h.name), Some(&format!("hook {}", h.name))) {
+        Ok(v) => {
+            state.last_fire_ms = now;
+            state.last_task = v["id"].as_str().map(str::to_string);
+            state.fired += 1;
+            let _ = schedule::save_hooks(root, &states);
+            Reply::Json(202, v)
+        }
+        Err(e) => Reply::Json(400, json!({ "error": format!("{e:#}") })),
+    }
+}
+
 /// Only one thing at a time changes what agentd remembers of its schedules.
 static SCHEDULES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -402,7 +471,7 @@ fn fire(store: &Store, home: &Path, s: &Schedule, state: &mut schedule::State, n
         };
         let project = fs::canonicalize(&project).with_context(|| format!("project {}: no such folder", s.project))?;
         let body = json!({ "project": project, "task": s.task, "agent": s.agent, "budget": s.budget, "timeout": s.timeout });
-        let started = start(store, &body.to_string(), &format!("agentd schedule {}", s.name))?;
+        let started = start(store, &body.to_string(), &format!("agentd schedule {}", s.name), None)?;
         started["id"].as_str().map(str::to_string).context("agentd didn't get a task id back")
     })();
     state.last_start_ms = now;
@@ -500,7 +569,7 @@ fn article(role: Role) -> &'static str {
 
 /// Starts `agent do --bg` in one of your projects, exactly as from a
 /// terminal there. Returns the task's id.
-fn start(store: &Store, body: &str, by: &str) -> Result<Value> {
+fn start(store: &Store, body: &str, by: &str, tainted_by: Option<&str>) -> Result<Value> {
     let req: Start = serde_json::from_str(body).context("expected {project, task, agent?, budget?, timeout?}")?;
     let home = crate::home_dir()?;
     let blank = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
@@ -529,6 +598,11 @@ fn start(store: &Store, body: &str, by: &str) -> Result<Value> {
         if let Some(v) = value {
             cmd.args([flag, v]);
         }
+    }
+    // Whatever agentd's own environment says, a task is tainted at the start only by the hook that started it.
+    cmd.env_remove("AGENTOS_START_TAINT");
+    if let Some(why) = tainted_by {
+        cmd.env("AGENTOS_START_TAINT", why);
     }
     let out = cmd
         .arg("--")

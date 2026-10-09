@@ -81,6 +81,96 @@ impl Schedule {
     }
 }
 
+/// A hook: an address that starts a task when something is sent to it (a CI
+/// failure, an alert, a chat message), the event's own words in the task.
+///
+/// ```toml
+/// [hook.ci-failed]                        # your config only
+/// project = "~/code/app"
+/// task = "CI failed. Find out why and fix it. The event: {event}"
+/// token = "CI_HOOK_TOKEN"                 # a variable (or a [secret_commands] entry) with the hook's secret
+/// budget = "2usd"
+/// ```
+///
+/// `POST /api/hooks/ci-failed` with the token (`Authorization: Bearer …`,
+/// `X-Agentos-Token` or `X-Gitlab-Token`) starts it. The token opens this hook and
+/// nothing else of agentd. What came in is untrusted: the task starts tainted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hook {
+    #[serde(skip)]
+    pub name: String,
+    pub project: String,
+    /// Where `{event}` goes; without it the event is added after the task.
+    pub task: String,
+    /// The variable holding the hook's token, in agentd's environment or a `[secret_commands]` entry.
+    pub token: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub budget: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Events closer together than this are refused (default 1m).
+    #[serde(default)]
+    pub min_interval: Option<String>,
+}
+
+impl Hook {
+    pub fn min_interval(&self) -> Result<Duration> {
+        match &self.min_interval {
+            None => Ok(Duration::from_secs(60)),
+            Some(v) => humantime::parse_duration(v.trim()).with_context(|| format!("min_interval = {v:?}: expected a duration like 30s or 5m")),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        // Same rules as a schedule for the name, task, folder, budget and timeout.
+        Schedule {
+            name: self.name.clone(),
+            every: "1h".into(),
+            project: self.project.clone(),
+            task: self.task.clone(),
+            agent: self.agent.clone(),
+            budget: self.budget.clone(),
+            timeout: self.timeout.clone(),
+        }
+        .validate()?;
+        crate::keychain::validate(&self.token, &["x".to_string()]).map_err(|e| anyhow::anyhow!("token: {e}"))?;
+        self.min_interval()?;
+        Ok(())
+    }
+
+    /// The task for an event: its words, cleaned and cut to a size an agent can be handed.
+    pub fn task_for(&self, event: &str) -> String {
+        let clean: String = event.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).take(8000).collect();
+        if self.task.contains("{event}") { self.task.replace("{event}", clean.trim()) } else { format!("{}\n\nEvent received:\n{}", self.task, clean.trim()) }
+    }
+}
+
+/// What agentd remembers of a hook.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HookState {
+    pub last_fire_ms: u64,
+    pub last_task: Option<String>,
+    pub fired: u64,
+    pub refused: u64,
+}
+
+fn hooks_path(root: &Path) -> PathBuf {
+    root.join("hooks.json")
+}
+
+pub fn load_hooks(root: &Path) -> BTreeMap<String, HookState> {
+    fs::read(hooks_path(root)).ok().and_then(|raw| serde_json::from_slice(&raw).ok()).unwrap_or_default()
+}
+
+pub fn save_hooks(root: &Path, states: &BTreeMap<String, HookState>) -> Result<()> {
+    let tmp = hooks_path(root).with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(states)?)?;
+    fs::rename(&tmp, hooks_path(root)).context("save hooks.json")
+}
+
 /// What agentd remembers of a schedule, across restarts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct State {
@@ -129,6 +219,30 @@ mod tests {
 
     fn schedule(every: &str) -> Schedule {
         Schedule { name: "triage".into(), every: every.into(), project: "~/code/app".into(), task: "summarize".into(), agent: None, budget: Some("2usd".into()), timeout: Some("30m".into()) }
+    }
+
+    #[test]
+    fn a_hook_hands_the_event_to_the_task_cleaned_and_cut() {
+        let hook = Hook {
+            name: "ci".into(),
+            project: "~/code/app".into(),
+            task: "CI failed: {event}. Fix it.".into(),
+            token: "CI_HOOK_TOKEN".into(),
+            agent: None,
+            budget: None,
+            timeout: None,
+            min_interval: None,
+        };
+        hook.validate().unwrap();
+        assert_eq!(hook.min_interval().unwrap(), Duration::from_secs(60));
+        assert_eq!(hook.task_for("  {\"build\": \"red\"}\n"), "CI failed: {\"build\": \"red\"}. Fix it.");
+        assert_eq!(hook.task_for("a\u{1b}[2Jb\0c"), "CI failed: a[2Jbc. Fix it.", "no terminal escapes or NULs reach the agent's prompt");
+        assert_eq!(hook.task_for(&"x".repeat(50_000)).len(), "CI failed: . Fix it.".len() + 8000);
+        let appended = Hook { task: "Look at CI.".into(), ..hook.clone() };
+        assert_eq!(appended.task_for("red"), "Look at CI.\n\nEvent received:\nred");
+        for bad in [Hook { token: "not a var".into(), ..hook.clone() }, Hook { min_interval: Some("soon".into()), ..hook.clone() }, Hook { name: "Bad Name".into(), ..hook.clone() }, Hook { task: " ".into(), ..hook }] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

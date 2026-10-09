@@ -31,7 +31,7 @@
 //!   `Request::"POST api.github.com/repos/acme/app/issues"` {method, host, path};
 //! - context {agent, task, project, reason (the agent's own words, when it
 //!   asked), args (a tool call's arguments), tainted (the task has read
-//!   untrusted input), taint (which kinds: "web", "tool", "file")}.
+//!   untrusted input), taint (which kinds: "web", "tool", "file", "event")}.
 //!
 //! `"~/…"` in a string means your home folder.
 //!

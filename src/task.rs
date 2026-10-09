@@ -231,7 +231,12 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         trusted.extend(endpoints.iter().map(|e| e.host.clone()));
         trusted.extend(plan.secrets.iter().map(|s| s.host.clone()));
         trusted.extend(plan.login.iter().flat_map(|l| l.hosts.iter().cloned()));
-        Arc::new(taint::Taint::new(Some(journal.clone()), trusted))
+        let taint = taint::Taint::new(Some(journal.clone()), trusted);
+        // Started by an event (a hook): what came in is untrusted from the first moment.
+        if let Some(why) = std::env::var("AGENTOS_START_TAINT").ok().filter(|w| !w.is_empty()) {
+            taint.mark(taint::Source::Event, &why);
+        }
+        Arc::new(taint)
     };
     let rules = rules.map(|set| {
         let all = policy::rules(&set);

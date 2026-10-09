@@ -133,6 +133,9 @@ pub(crate) enum Command {
     /// The tasks agentd starts on a timer ([schedule.NAME] in your config), and
     /// when each next runs
     Schedules,
+    /// The hooks that start a task when an event is sent to agentd ([hook.NAME]
+    /// in your config)
+    Hooks,
     /// Save a picture of a task's screen (it needs --display)
     Screen {
         /// Task id or prefix (default: the latest task)
@@ -294,7 +297,7 @@ pub(crate) enum PolicyCommand {
         /// The agent asking
         #[arg(long, default_value = "claude")]
         agent: String,
-        /// Pretend the task has read untrusted input of this kind (web, tool or file; repeatable)
+        /// Pretend the task has read untrusted input of this kind (web, tool, file or event; repeatable)
         #[arg(long, value_name = "KIND")]
         tainted: Vec<String>,
     },

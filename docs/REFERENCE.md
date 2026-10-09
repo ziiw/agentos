@@ -104,7 +104,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent install DIR\|NAME [--yes] [--digest HEX]` / `uninstall NAME` / `packages` / `search [TEXT]` | Agent packages: install one (from a folder, or by name from your registry) after reading what it asks for, remove it, list them and whether they're intact, search your registry |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
-| `agent schedules` | The tasks agentd starts on a timer, and when each runs next |
+| `agent schedules` / `agent hooks` | The tasks agentd starts on a timer, and when each runs next; the hooks that start one when an event arrives |
 | `agent users [add NAME --role ROLE \| remove NAME]` | Who else may use agentd's console (viewer, approver, admin), with their own tokens |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 | `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
@@ -406,6 +406,7 @@ What a permit matches is sent when the task ends, from outside the sandbox with 
 An agent can be steered by any text it reads: a web page, an issue, a file it was never meant to trust. So agentos tracks whether a task has read something like that, and treats a task that has differently. A task is **tainted** once it:
 
 - reaches a host that isn't one of its own model APIs, a host of a credential you gave it, a package registry (PyPI, npm, crates.io, Go), or one you list under `[taint] trusted = ["git.corp.example", "*.docs.example"]` in your config (never a project's);
+- is started by an event (a hook, see Schedules): it begins tainted;
 - reads a result from an MCP server that reaches outside your machine: every remote server (`url = …`), and a local one only if you say `taint = true` (`taint = false` trusts a remote one);
 - is allowed, mid-task, to read a folder outside its project.
 
@@ -421,7 +422,7 @@ permit (principal, action == Action::"call", resource == Tool::"github.create_is
 when { !context.tainted };
 ```
 
-`agent policy check call github.create_issue --tainted web` asks what they'd say. The journal records each source (`taint.marked`), and the summary at the end of a tainted task says what it read, so you review its diff and held pushes with that in mind. A server's own `readOnlyHint` is still believed; it's the server's word, so give `taint = true` only to servers you'd believe it from.
+`agent policy check call github.create_issue --tainted web` (or `event`, `tool`, `file`) asks what they'd say. The journal records each source (`taint.marked`), and the summary at the end of a tainted task says what it read, so you review its diff and held pushes with that in mind. A server's own `readOnlyHint` is still believed; it's the server's word, so give `taint = true` only to servers you'd believe it from.
 
 ## Receipts: the journal's head, signed
 
@@ -537,6 +538,24 @@ agent schedules                        # what runs when
 
 Each run is a task like any other, started as from the console (its journal says `agentd schedule triage`): its own sandbox, its changes and held pushes waiting for your review, its budget. A run never starts while the last one is still going. The first run comes one interval after agentd first sees the schedule, and agentd remembers when each last ran (in the task store), so it carries on across restarts, logouts and reboots: a run that came due while agentd was off happens once, when it's back. To keep agentd up with nobody logged in, `loginctl enable-linger $USER`. The console lists schedules with their next run and a **Run now** button (admins only).
 
+**Events wake an agent too.** A hook is an address that starts a task when something is sent to it: a CI failure, an alert, a message.
+
+```toml
+[hook.ci-failed]                       # your config only
+project = "~/code/app"
+task = "CI failed. Find out why and fix it. The event: {event}"
+token = "CI_HOOK_TOKEN"                # a variable (or a [secret_commands] entry) holding the hook's secret
+budget = "2usd"
+min_interval = "5m"                    # events closer together than this are refused (default 1m)
+```
+
+```bash
+curl -X POST -H "Authorization: Bearer $CI_HOOK_TOKEN" --data @failure.json http://agentd-host:7777/api/hooks/ci-failed
+agent hooks                            # the hooks, their addresses and use
+```
+
+The token (also accepted as `X-Agentos-Token` or `X-Gitlab-Token`, for senders that can only set a header) opens that hook and nothing else of agentd, and agentd's own token doesn't open hooks. The event's words go where `{event}` is (cleaned of control characters and cut to 8,000 characters), or after the task if you leave it out. **What came in is untrusted**, so the task starts *tainted* (`event`): it is asked before every tool call that isn't read-only, and your rules see `context.taint.contains("event")`. A hook never starts a second run while the last one is going, or sooner than `min_interval` (429 and 409 say so). Put agentd behind something private (Tailscale, a reverse proxy that checks the sender): anyone who can reach it and holds the token can start the task.
+
 Rules, budgets and your questions all apply as they do to any task. With nobody at a terminal, a task's questions go to the console or are refused: give a scheduled task rules (`policy.cedar`) for what it should be allowed to do, and `release` rules for what may leave without you. Schedules are in your config only: a project can't make agentd run anything.
 
 ## Configuration
@@ -576,6 +595,11 @@ env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 every = "24h"
 project = "~/code/app"
 task = "Summarize the open issues"
+
+[hook.ci-failed]                      # your file only: POST /api/hooks/ci-failed starts this
+project = "~/code/app"
+task = "CI failed. The event: {event}"
+token = "CI_HOOK_TOKEN"
 
 [journal]                             # your file only: finished tasks' signed receipts go here
 witness = "https://witness.example/receipts"

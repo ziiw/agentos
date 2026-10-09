@@ -95,6 +95,8 @@ struct ConfigFile {
     registry: RegistrySection,
     #[serde(default)]
     schedule: BTreeMap<String, crate::schedule::Schedule>,
+    #[serde(default)]
+    hook: BTreeMap<String, crate::schedule::Hook>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -217,6 +219,8 @@ pub struct Settings {
     pub registry_key: Option<String>,
     /// Tasks agentd starts on a timer.
     pub schedules: Vec<crate::schedule::Schedule>,
+    /// Tasks an event starts.
+    pub hooks: Vec<crate::schedule::Hook>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -350,8 +354,14 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         bail!("{shown}: [journal] only belongs in your own config, never in a project's");
     }
     // …nor which tasks agentd starts on its own.
-    if project.is_some() && !file.schedule.is_empty() {
-        bail!("{shown}: [schedule] only belongs in your own config, never in a project's");
+    if project.is_some() && (!file.schedule.is_empty() || !file.hook.is_empty()) {
+        bail!("{shown}: [schedule] and [hook] only belong in your own config, never in a project's");
+    }
+    for (name, mut hook) in file.hook {
+        hook.name = name;
+        hook.validate().with_context(|| format!("{shown}: [hook.{}]", hook.name))?;
+        s.hooks.retain(|x| x.name != hook.name);
+        s.hooks.push(hook);
     }
     for (name, mut schedule) in file.schedule {
         schedule.name = name;
