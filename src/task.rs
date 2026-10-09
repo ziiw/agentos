@@ -52,6 +52,8 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         }
     }
     let allowlist = Allowlist::parse(&allow)?;
+    // Your corporate proxy, if you have one: allowed connections go through it.
+    let upstream = if plan.net == Net::Proxy { upstream_proxy(plan.proxy.as_deref(), &plan.no_proxy)?.map(Arc::new) } else { None };
     // Your rules, and the project's (forbids only): a file that doesn't
     // parse stops the task, never skipped.
     let policy_file = config::policy_path(&home);
@@ -190,6 +192,10 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         journal.append("outbox.ready", json!({ "remotes": o.remotes }))?;
     }
     eprintln!("{}", render::banner(err, &task, outbox.is_some(), plan.login.as_ref().is_some_and(|l| l.brokered)));
+    if let Some(u) = &upstream {
+        eprintln!("  {}", err.dim(format!("through your proxy {}", u.describe())));
+        journal.append("net.upstream", json!({ "proxy": u.describe() }))?;
+    }
     if !periodic.is_empty() && task.meta.net == Net::Proxy {
         eprintln!("  {}", err.dim(format!("spend: {}", ledger.status(&periodic, util::now_ms()).join(" · "))));
     }
@@ -340,7 +346,7 @@ pub(crate) fn execute(store: &Store, plan: Plan) -> Result<i32> {
         if let Some(listener) = proxy_listener.take() {
             let gate = gate(asker.clone(), rules.clone(), taint.clone(), given.clone(), journal.clone(), expected_denials.clone(), err);
             let sink = net_sink(journal.clone(), blocked.clone(), expected_denials.clone(), err);
-            proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, Some(gate), sink));
+            proxy_handle = Some(proxy::serve(listener, live_allow.clone(), broker, Some(gate), upstream.clone(), sink));
         }
         if let Some(listener) = owner_listener.take() {
             let owner = Owner {

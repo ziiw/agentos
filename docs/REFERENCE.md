@@ -147,6 +147,16 @@ Some hosts an agent reaches for stay closed on purpose. Claude, when logged in w
 
 `agent log` lists every connection: `✓ api.anthropic.com:443 · ↑1.9 kB ↓4.8 kB · 228ms`.
 
+**Behind a corporate proxy**, the allowlist still decides, and allowed connections go out through your proxy instead of straight to the host. agentos uses the proxy your shell has (`HTTPS_PROXY`, or `ALL_PROXY`, minus `NO_PROXY`), or the one in your config:
+
+```toml
+[network]
+proxy = "http://user:password@proxy.corp.example:3128"   # "" = connect directly, whatever your environment says
+no_proxy = ["*.corp.example", "10.0.0.0/8"]               # reached directly
+```
+
+The proxy is reached by agentos itself, outside the sandbox: the agent never sees its address or password, and it can't ask for another. Only your own config can set it, never a project's. Each connection records the hop (`via proxy.corp.example:3128`), and a proxy that says no (a login is needed, the host is blocked) is explained to the agent and in the journal. It must be a plain `http://` proxy (the tunnel to the host is TLS either way); SOCKS and `https://` proxies aren't supported, and one that isn't usable is an error, not a silent direct connection. A host name your machine can't resolve is left to the proxy to resolve; one it resolves only to private addresses is still refused.
+
 ## Git pushes wait in an outbox
 
 When the agent commits, its git work shows up in `agent diff` as one line, taken from git's reflog (`G  ~/app/.git  commit: Add a test for greet`), rather than as files inside `.git`. `--all` lists those files.
@@ -395,6 +405,7 @@ Two optional files, in TOML:
 ```toml
 [network]
 allow = ["@pypi", "api.github.com"]   # presets: @pypi @npm @crates @github @go
+proxy = "http://proxy.corp:3128"      # your file only: see Network (default: HTTPS_PROXY)
 
 [files]
 hide = [".env"]
@@ -469,7 +480,7 @@ To check the whole path with your real login, run `scripts/acceptance.sh`: `scri
 ## Limits (honest list)
 
 - **An allowlist limits where data can go, not what is sent there.** The agent can put anything it read into its requests to allowed hosts. Keep secrets out of granted folders (`--hide .env`).
-- **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP, other protocols, and chaining to a corporate upstream proxy aren't supported yet.
+- **The proxy speaks HTTPS (`CONNECT`) only.** Plain HTTP and other protocols aren't supported. A corporate upstream proxy has to be a plain `http://` one.
 - **Brokered hosts speak HTTP/1.1 through the proxy**, one request at a time per connection. Clients that require HTTP/2 or WebSockets to those hosts won't work. With a budget, that includes model APIs.
 - **Rules can't loosen the hard limits.** Credentials in your home, the task store and your config are never offered, whatever a `permit` says, and folders outside your home stay read-only mid-task when Landlock is on.
 - **The agent writes its own reasons.** An agent steered by something it read can write a convincing one. Judge the request, not the prose.

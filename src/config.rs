@@ -12,6 +12,8 @@
 //!
 //! [network]
 //! allow = ["@pypi", "api.github.com"]     # presets: @pypi @npm @crates @github @go
+//! proxy = "http://user:pw@proxy.corp:3128" # your file only: reach the internet through this
+//! no_proxy = ["*.corp.example"]           # proxy (default: HTTPS_PROXY and NO_PROXY); "" = direct
 //!
 //! [files]
 //! hide = [".env"]                         # in a project file: relative to the project
@@ -121,6 +123,10 @@ struct LimitsSection {
 struct Network {
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    no_proxy: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -136,6 +142,10 @@ struct Files {
 #[derive(Debug, Default)]
 pub struct Settings {
     pub allow: Vec<String>,
+    /// Your corporate proxy (`""`: none, whatever your environment says).
+    pub proxy: Option<String>,
+    /// Hosts to reach directly, not through it.
+    pub no_proxy: Vec<String>,
     /// Existing paths only: a pattern like `.env` needn't exist everywhere.
     pub hide: Vec<PathBuf>,
     pub ro: Vec<PathBuf>,
@@ -231,6 +241,17 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
     let shown = path.display();
     crate::proxy::Allowlist::parse(&file.network.allow).with_context(|| format!("{shown}: [network] allow"))?;
     s.allow.extend(file.network.allow);
+    // A cloned repo must never decide where your tasks' traffic goes.
+    if project.is_some() && (file.network.proxy.is_some() || !file.network.no_proxy.is_empty()) {
+        bail!("{shown}: [network] proxy only belongs in your own config, never in a project's");
+    }
+    if let Some(url) = file.network.proxy.as_deref().filter(|u| !u.is_empty()) {
+        crate::proxy::Upstream::parse(url, &file.network.no_proxy).with_context(|| format!("{shown}: [network] proxy"))?;
+    }
+    if file.network.proxy.is_some() {
+        s.proxy = file.network.proxy;
+    }
+    s.no_proxy.extend(file.network.no_proxy);
 
     let resolve = |entry: &str| -> Result<PathBuf> {
         let expanded = match entry.strip_prefix("~/") {

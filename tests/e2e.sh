@@ -204,6 +204,139 @@ check "the value never reaches the journal" bash -c "! grep -rq real-secret-e2e-
 check "--secret with --net host is rejected" bash -c "! '$AGENT' run --net host --secret '$SECRET' -- true 2>/dev/null"
 unset AGENTOS_E2E_TOKEN
 
+section "a corporate proxy (upstream)"
+reset_proj
+cd "$PROJ"
+if command -v python3 >/dev/null; then
+  # A stand-in corporate proxy: logs each CONNECT, optionally wants a login,
+  # and tunnels to the real host. Prints its port.
+  cat > "$WORK/upstream-proxy.py" <<'PY'
+import base64, socket, sys, threading
+log = open(sys.argv[1], "a", buffering=1)
+want = sys.argv[2] if len(sys.argv) > 2 else None
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+def handle(c):
+    head = b""
+    while b"\r\n\r\n" not in head:
+        d = c.recv(4096)
+        if not d:
+            return
+        head += d
+    first, *lines = head.decode().split("\r\n")
+    hdrs = {l.split(":", 1)[0].lower(): l.split(":", 1)[1].strip() for l in lines if ":" in l}
+    method, target, _ = first.split(" ", 2)
+    log.write(f"{method} {target} auth={'yes' if 'proxy-authorization' in hdrs else 'no'}\n")
+    if want and hdrs.get("proxy-authorization") != "Basic " + base64.b64encode(want.encode()).decode():
+        c.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+        c.close()
+        return
+    if "refuse" in sys.argv[3:]:
+        c.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+        c.close()
+        return
+    host, port = target.rsplit(":", 1)
+    try:
+        u = socket.create_connection((host, int(port)), timeout=10)
+    except OSError:
+        c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        c.close()
+        return
+    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    t = threading.Thread(target=pipe, args=(c, u), daemon=True)
+    t.start()
+    pipe(u, c)
+    t.join(5)
+    c.close()
+    u.close()
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))
+srv.listen(16)
+print(srv.getsockname()[1], flush=True)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PY
+  start_upstream() {  # LOG [USER:PASSWORD [refuse]]  → UP_PORT
+    : > "$1"
+    python3 "$WORK/upstream-proxy.py" "$@" > "$WORK/upstream.port" &
+    UP_PID=$!
+    for _ in $(seq 50); do [ -s "$WORK/upstream.port" ] && break; sleep 0.1; done
+    UP_PORT="$(cat "$WORK/upstream.port")"
+    : > "$WORK/upstream.port"
+  }
+  GETX="curl -sS -m 20 -o /dev/null -w HTTP%{http_code} https://example.com"
+
+  start_upstream "$WORK/up1.log"
+  out="$(HTTPS_PROXY=http://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "HTTPS_PROXY: an allowed host is reached through your proxy" grep -q HTTP200 <<<"$out"
+  check "...which saw the CONNECT" grep -q '^CONNECT example.com:443 auth=no' "$WORK/up1.log"
+  check "...and the banner and journal say so" grep -q "through your proxy 127.0.0.1:$UP_PORT" <<<"$out"
+  check "...with the hop on the connection" grep -q "\"via\":\"127.0.0.1:$UP_PORT\"" "$(latest_task_dir)/events.jsonl"
+  check "...which agent log shows" grep -q "example.com:443 .* via 127.0.0.1:$UP_PORT" <<<"$("$AGENT" log)"
+  inside="$(HTTPS_PROXY=http://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- env 2>/dev/null)"
+  check "the sandbox has a proxy variable of its own" grep -q '^HTTPS_PROXY=http://127.0.0.1:' <<<"$inside"
+  check "...never yours" bash -c '! grep -q "$1" <<<"$2"' _ "$UP_PORT" "$inside"
+  before="$(wc -l < "$WORK/up1.log")"
+  HTTPS_PROXY=http://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- curl -sS -m 20 https://example.org >/dev/null 2>&1
+  check "other hosts are still refused before they reach it" test "$(wc -l < "$WORK/up1.log")" = "$before"
+  out="$(NO_PROXY=example.com HTTPS_PROXY=http://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "NO_PROXY: hosts it lists are reached directly" grep -q HTTP200 <<<"$out"
+  check "...without asking your proxy" test "$(wc -l < "$WORK/up1.log")" = "$before"
+  printf '[network]\nproxy = "http://127.0.0.1:%s"\nno_proxy = ["example.org"]\n' "$UP_PORT" > "$WORK/proxy.toml"
+  out="$(AGENTOS_CONFIG="$WORK/proxy.toml" "$AGENT" run --allow example.com --allow example.org -- sh -c "$GETX; ${GETX%example.com}example.org" 2>&1)"
+  check "[network] proxy in your config does the same" test "$(grep -o HTTP200 <<<"$out" | wc -l)" -eq 2
+  check "...for the hosts its no_proxy list doesn't name" grep -q '^CONNECT example.com:443' "$WORK/up1.log"
+  check "...and not for those it does" bash -c '! grep -q example.org "$1"' _ "$WORK/up1.log"
+  out="$(HTTPS_PROXY=http://127.0.0.1:9 AGENTOS_CONFIG="$WORK/proxy.toml" "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "your config's proxy wins over the environment's" grep -q HTTP200 <<<"$out"
+  printf '[network]\nproxy = ""\n' > "$WORK/direct.toml"
+  out="$(HTTPS_PROXY=http://127.0.0.1:9 AGENTOS_CONFIG="$WORK/direct.toml" "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "proxy = \"\" connects directly, whatever the environment says" grep -q HTTP200 <<<"$out"
+  out="$(HTTPS_PROXY=socks5://127.0.0.1:1080 "$AGENT" run --allow example.com -- true 2>&1)"
+  check "a proxy it can't use is an error, not a silent bypass" grep -q "socks5:// proxies aren't supported" <<<"$out"
+  check "...which a task without the network never hits" env HTTPS_PROXY=socks5://127.0.0.1:1080 "$AGENT" run -- true
+  printf '[network]\nproxy = "http://127.0.0.1:%s"\n' "$UP_PORT" > .agentos.toml
+  "$AGENT" trust >/dev/null 2>&1
+  check "a project can't choose where your traffic goes" test $? -eq 2
+  rm -f .agentos.toml
+  out="$(HTTPS_PROXY=http://127.0.0.1:$UP_PORT AGENTOS_E2E_TOKEN=proxied-secret-value "$AGENT" run --secret AGENTOS_E2E_TOKEN=postman-echo.com/x-test-token -- sh -c 'curl -sS -m 20 -H "x-test-token: $AGENTOS_E2E_TOKEN" https://postman-echo.com/headers' 2>&1)"
+  check "brokered credentials work through it too" grep -Eq '"x-test-token": *"proxied-secret-value"' <<<"$out"
+  check "...with the CONNECT to the broker's host" grep -q '^CONNECT postman-echo.com:443' "$WORK/up1.log"
+  kill "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null
+
+  start_upstream "$WORK/up2.log" 'alice:s3cret-proxy-pw'
+  out="$(HTTPS_PROXY=http://alice:s3cret-proxy-pw@127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "a proxy that wants a login gets it from the address" grep -q HTTP200 <<<"$out"
+  check "...as Proxy-Authorization" grep -q '^CONNECT example.com:443 auth=yes' "$WORK/up2.log"
+  check "...never shown in the banner" bash -c '! grep -q s3cret-proxy-pw <<<"$1"' _ "$out"
+  check "...nor written to the journal or the task store" bash -c "! grep -rq s3cret-proxy-pw '$AGENTOS_HOME'"
+  out="$(HTTPS_PROXY=http://alice:wrong@127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "a wrong password is refused, and the agent is told why" grep -q 'wants a login (407)' <<<"$out"
+  kill "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null
+
+  start_upstream "$WORK/up3.log" "" refuse
+  out="$(HTTPS_PROXY=http://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "a proxy that refuses is explained" grep -q 'upstream proxy 127.0.0.1:[0-9]* refused: HTTP/1.1 403 Forbidden' <<<"$out"
+  check "...and the refusal is journaled" grep -q '"allowed":false.*"reason":"the upstream proxy' "$(latest_task_dir)/events.jsonl"
+  kill "$UP_PID" 2>/dev/null; wait "$UP_PID" 2>/dev/null
+  out="$(HTTPS_PROXY=http://127.0.0.1:$UP_PORT "$AGENT" run --allow example.com -- $GETX 2>&1)"
+  check "a proxy that is down is explained" grep -q "can't reach the upstream proxy" <<<"$out"
+else
+  skip "the corporate proxy tests need python3"
+fi
+
 section "configuration"
 reset_proj
 cd "$PROJ"

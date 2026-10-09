@@ -59,11 +59,16 @@ pub(crate) struct Plan {
     pub(crate) mcp: Vec<agentos::mcp::Server>,
     /// Budgets across tasks: (period, amount, this project's only).
     pub(crate) periodic: Vec<(gateway::Period, Budget, bool)>,
+    /// Your corporate proxy from your config (else the environment's), and the hosts to skip it for.
+    pub(crate) proxy: Option<String>,
+    pub(crate) no_proxy: Vec<String>,
 }
 
 /// What the config files add to a task beyond its grants.
 pub(crate) struct Applied {
     pub(crate) allow: Vec<String>,
+    pub(crate) proxy: Option<String>,
+    pub(crate) no_proxy: Vec<String>,
     /// Those whose variable is set in your environment.
     pub(crate) secrets: Vec<Secret>,
     pub(crate) budget: Option<Budget>,
@@ -90,7 +95,17 @@ pub(crate) fn apply_config(store: &Store, grants: &mut GrantArgs) -> Result<Appl
             secrets.push(Secret::parse(&format!("{name}={target}"))?);
         }
     }
-    Ok(Applied { allow: settings.allow, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
+    Ok(Applied { allow: settings.allow, proxy: settings.proxy, no_proxy: settings.no_proxy, secrets, budget: settings.budget, prices: settings.prices, mcp: settings.mcp, periodic: settings.periodic, taint_trusted: settings.taint_trusted })
+}
+
+/// The proxy the egress proxy goes through: your config's, else the one in
+/// your environment (`HTTPS_PROXY`), minus the hosts you skip it for.
+pub(crate) fn upstream_proxy(configured: Option<&str>, no_proxy: &[String]) -> Result<Option<proxy::Upstream>> {
+    Ok(match configured {
+        Some("") => None,
+        Some(url) => Some(proxy::Upstream::parse(url, &[]).context("[network] proxy")?.bypassing(no_proxy)),
+        None => proxy::Upstream::from_env()?.map(|u| u.bypassing(no_proxy)),
+    })
 }
 
 /// The task's budget: --budget, else your config's. The gateway enforces it
@@ -299,6 +314,8 @@ pub(crate) fn cmd_do(store: &Store, mut args: DoArgs) -> Result<i32> {
             taint_trusted: applied.taint_trusted.into_iter().chain(profile.allow.iter().cloned()).collect(),
             mcp: applied.mcp,
             periodic: applied.periodic,
+            proxy: applied.proxy,
+            no_proxy: applied.no_proxy,
         },
     )
 }
@@ -356,6 +373,8 @@ pub(crate) fn cmd_run(store: &Store, mut args: RunArgs) -> Result<i32> {
             taint_trusted: applied.taint_trusted,
             mcp: applied.mcp,
             periodic: applied.periodic,
+            proxy: applied.proxy,
+            no_proxy: applied.no_proxy,
         },
     )?;
     if code == 127 && argv.len() == 1 && argv[0].contains(' ') {

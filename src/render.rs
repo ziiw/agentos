@@ -541,6 +541,7 @@ fn describe(p: Paint, e: &Event) -> String {
         }
         "net.connect" => {
             let target = format!("{}:{}", s(&d["host"]), d["port"]);
+            let via = d["via"].as_str().map(|v| format!(" · via {v}")).unwrap_or_default();
             if d["brokered"].as_bool() == Some(true) && d["reason"].is_string() {
                 format!("{} {target} · {}", p.red("✗"), s(&d["reason"]))
             } else if d["brokered"].as_bool() == Some(true) {
@@ -551,7 +552,7 @@ fn describe(p: Paint, e: &Event) -> String {
                     let _ = write!(requests, ", credential added to {injected}");
                 }
                 format!(
-                    "{} {target} · {requests} · ↑{} ↓{} · {}",
+                    "{} {target} · {requests} · ↑{} ↓{} · {}{via}",
                     p.green("✓"),
                     bytes(d["bytes_out"].as_u64().unwrap_or(0)),
                     bytes(d["bytes_in"].as_u64().unwrap_or(0)),
@@ -559,7 +560,7 @@ fn describe(p: Paint, e: &Event) -> String {
                 )
             } else if d["allowed"].as_bool() == Some(true) {
                 format!(
-                    "{} {target} · ↑{} ↓{} · {}",
+                    "{} {target} · ↑{} ↓{} · {}{via}",
                     p.green("✓"),
                     bytes(d["bytes_out"].as_u64().unwrap_or(0)),
                     bytes(d["bytes_in"].as_u64().unwrap_or(0)),
