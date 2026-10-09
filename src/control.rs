@@ -145,7 +145,7 @@ pub struct PathRules<'a> {
 
 /// Credentials and keys in your home: never handed to an agent, even when
 /// it asks nicely.
-const SENSITIVE: &[&str] = &[
+pub const SENSITIVE: &[&str] = &[
     ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".netrc", ".npmrc", ".pypirc", ".git-credentials",
     ".password-store", ".config/gh", ".config/gcloud", ".local/share/keyrings", ".claude", ".claude.json",
 ];

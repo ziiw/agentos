@@ -217,7 +217,8 @@ fn permissions(def: &AgentFile) -> Vec<String> {
         lines.push(format!("{:<13}127.0.0.1:{port} (a server on your machine)", "your machine"));
     }
     for path in &def.ro {
-        lines.push(format!("{:<13}{path} (read-only)", "reads"));
+        let risk = credentials_in(path).map(|what| format!("  ← {what}")).unwrap_or_default();
+        lines.push(format!("{:<13}{path} (read-only){risk}", "reads"));
     }
     for name in &def.pass_env {
         lines.push(format!("{:<13}${name} (from your environment, when set)", "passes"));
@@ -229,6 +230,22 @@ fn permissions(def: &AgentFile) -> Vec<String> {
         lines.push(format!("{:<13}{} ({:?}, counted against budgets)", "meters", m.url, m.api));
     }
     lines
+}
+
+/// Whether reading `path` would expose your home or the credentials in it.
+fn credentials_in(path: &str) -> Option<String> {
+    let relative = match path.strip_prefix("~/") {
+        Some(rest) => rest.trim_end_matches('/'),
+        None if path == "~" || path == "~/" => "",
+        None => return None,
+    };
+    if relative.is_empty() {
+        return Some("your whole home folder, credentials included".into());
+    }
+    crate::control::SENSITIVE
+        .iter()
+        .find(|s| relative == **s || relative.starts_with(&format!("{s}/")) || s.starts_with(&format!("{relative}/")))
+        .map(|s| format!("~/{s} holds credentials"))
 }
 
 /// The agent file for an installed package: `[agent]` with `{pkg}` filled in.
@@ -424,6 +441,15 @@ mod tests {
 
     // The tests share the process environment: each uses its own AGENTOS_PACKAGES via `home`
     // (the default root is under home), so none of them sets it.
+
+    #[test]
+    fn a_package_that_reads_credentials_says_so() {
+        assert_eq!(credentials_in("~/.ssh").as_deref(), Some("~/.ssh holds credentials"));
+        assert_eq!(credentials_in("~/.ssh/id_ed25519").as_deref(), Some("~/.ssh holds credentials"));
+        assert_eq!(credentials_in("~/.config").as_deref(), Some("~/.config/gh holds credentials"), "a folder that contains one");
+        assert!(credentials_in("~").unwrap().contains("whole home"));
+        assert!(credentials_in("~/.gitconfig").is_none() && credentials_in("~/code/app").is_none() && credentials_in("/etc/hosts").is_none());
+    }
 
     #[test]
     fn names() {

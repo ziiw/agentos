@@ -195,6 +195,8 @@ fn task_json(t: &Task) -> Value {
     let open = t.is_open();
     let summary = if open { changes::scan(&t.layers()).ok().map(|c| Summary::of(&c)) } else { None };
     let pushes = if open { outbox::pending(&t.dir).map(|p| p.len()).unwrap_or(0) } else { 0 };
+    // Tool calls and API requests held for review, sent with the pushes.
+    let calls = if open { agentos::held::pending(&t.dir).map(|c| c.len()).unwrap_or(0) } else { 0 };
     let live = t.is_live();
     let events = if live { t.journal().read().unwrap_or_default() } else { Vec::new() };
     // What a running task is up to: its latest tool call or connection.
@@ -224,6 +226,7 @@ fn task_json(t: &Task) -> Value {
         "started_ms": t.meta.started_at_ms,
         "changes": summary,
         "pushes": pushes,
+        "calls": calls,
     })
 }
 
