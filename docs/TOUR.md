@@ -309,6 +309,79 @@ agent attest --verify "${T}receipt.json" --journal "${T}events.jsonl"     # now 
 
 Judge: is it clear what a receipt proves, and what it doesn't until you keep it somewhere you can't rewrite (a witness, `[journal] witness`)?
 
+## 15. A screen of its own
+
+An agent that drives a graphical program gets a virtual screen, started outside its sandbox, that you can look at (and, from agentd's console, click in). The dev container has Xvfb:
+
+```bash
+cd ~/app
+agent run --display -- sh -c '(xmessage -geometry +10+10 "hello from a task" &); sleep 4'
+agent screen -o /src/shot.png          # a PNG of what it showed; open shot.png in the repo folder, then delete it
+```
+
+Judge: would you know what to do when an agent is stuck on a dialog? (The console shows the screen live, with **Act on it**: `agent serve`.)
+
+## 16. Tasks that start themselves
+
+A timer, a webhook, or a file arriving: agentd starts the task, its journal says what did. Here, files in a folder, with a stand-in agent:
+
+```bash
+mkdir -p ~/inbox ~/.config/agentos/agents
+printf 'run = ["sh", "-c", "echo got: $1", "sh", "{task}"]\n' > ~/.config/agentos/agents/echo.toml
+cat > ~/.config/agentos/config.toml <<'TOML'
+[console]
+projects = ["~/inbox"]
+
+[watch.inbox]
+path = "~/inbox"
+task = "New files: {event}"
+agent = "echo"
+settle = "2s"
+TOML
+agent serve >/dev/null 2>&1 &
+sleep 3; touch ~/inbox/report.pdf ~/inbox/photo.jpg ~/inbox/.ignored
+sleep 10; agent ls; agent logs; agent watches
+kill %1
+```
+
+Judge: when a task starts by itself, is it obvious why, and what it was told? `agent log` says `agentd watch inbox`, and the task starts *tainted* (a file's name is someone else's words). Schedules (`[schedule.NAME]`) and hooks (`[hook.NAME]`) work the same way: see the reference.
+
+## 17. A service on your machine, as tools
+
+The session bus has your media players and notifications; the system bus has the power button. agentos makes the services you name into MCP tools, and nothing else on the bus. A private bus stands in:
+
+```bash
+dbus-daemon --session --address=unix:path=$HOME/bus --fork >/dev/null
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$HOME/bus
+printf '[mcp.bus]\ndbus = "session"\nservices = ["org.freedesktop.DBus"]\ntools = { dbus_call = "allow" }\n' > ~/.config/agentos/config.toml
+cp /src/tests/mcp-client ~/app/ && cd ~/app
+agent run -- python3 ./mcp-client bus tools/list \
+  'tools/call:dbus_services:{}' \
+  'tools/call:dbus_get:{"service":"org.freedesktop.DBus","path":"/org/freedesktop/DBus","interface":"org.freedesktop.DBus","property":"Features"}' \
+  'tools/call:dbus_call:{"service":"org.freedesktop.secrets","path":"/","interface":"x.y","method":"M"}'
+```
+
+The first two are read-only and run (a call that changes things would ask you first; `tools = { dbus_call = "allow" }` above skips that for the demo); the third names a service you didn't list, and is refused before anything reaches the bus. Judge: is the list of services the right amount of control? Would you write the `permit` that lets one method of one service through (see `context.args`)?
+
+## 18. The machine's TPM
+
+A TPM can hold the key that signs receipts (so a copy of your store can't forge them), and lock the vault's files so a copy of the store is noise. A software TPM stands in:
+
+```bash
+mkdir -p ~/tpm
+swtpm socket --tpm2 --tpmstate dir=$HOME/tpm --ctrl type=unixio,path=$HOME/tpm/sock.ctrl --server type=unixio,path=$HOME/tpm/sock --flags startup-clear >/dev/null 2>&1 &
+export TPM2TOOLS_TCTI=swtpm:path=$HOME/tpm/sock
+printf '[journal]\nkey = "tpm"\npcrs = [7]\n' > ~/.config/agentos/config.toml
+cd ~/app && agent run -- true
+T="$(ls -td ~/.local/share/agentos/tasks/*/ | head -1)"
+agent attest --verify "${T}receipt.json"       # signed by this machine's TPM, with PCR 7
+agent vault lock --pcrs 7                       # the vault's files, encrypted under a key the TPM holds
+agent vault; agent vault unlock
+kill %1
+```
+
+Judge: is it clear what the TPM adds over a key in a file, and when the PCRs mean something (only if you know what good values are)?
+
 ## Wrap-up
 
 Delete what you made, and write the friction list:

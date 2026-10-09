@@ -2798,7 +2798,7 @@ else
     # Bound to the machine's state: only while PCR 7 holds what it held.
     M1="$(printf 'secure boot policy' | sha256sum | cut -d' ' -f1)"
     tpm2_pcrextend "7:sha256=$M1" >/dev/null 2>&1
-    check "agent vault lock --pcrs 7 binds the key to PCR 7" grep -q 'comes back only while PCR 7 hold what they hold now' <<<"$(vc vault lock --pcrs 7 2>&1)"
+    check "agent vault lock --pcrs 7 binds the key to PCR 7" grep -q 'comes back only while PCR 7 holds what it holds now' <<<"$(vc vault lock --pcrs 7 2>&1)"
     check "...in the state it was locked in, the vault opens" grep -q 'signed in at' <<<"$(vc connect 2>&1)"
     tpm2_pcrextend "7:sha256=$(printf 'something else booted' | sha256sum | cut -d' ' -f1)" >/dev/null 2>&1
     out="$(vc vault 2>&1)"

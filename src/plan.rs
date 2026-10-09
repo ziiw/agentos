@@ -240,7 +240,12 @@ pub(crate) fn cmd_vault(store: &Store, action: &str, agent: &str, pcrs: &[u32]) 
                 bail!("PCR {bad} doesn't exist (0 to 23)");
             }
             let n = agentos::sealed::lock(store.root(), pcrs)?;
-            let bound = if pcrs.is_empty() { String::new() } else { format!(", and its key comes back only while PCR {} hold what they hold now", pcrs.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")) };
+            let list = pcrs.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+            let bound = match pcrs.len() {
+                0 => String::new(),
+                1 => format!(", and its key comes back only while PCR {list} holds what it holds now"),
+                _ => format!(", and its key comes back only while PCRs {list} hold what they hold now"),
+            };
             println!("{} the vault is locked to this machine's TPM ({}{bound})", out.green("✓"), plural(n, "file"));
             return Ok(0);
         }
