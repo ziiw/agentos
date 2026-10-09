@@ -96,6 +96,7 @@
   <section id="new"></section>
   <section id="over"></section>
   <section id="asks"></section>
+  <section id="schedules"></section>
   <h2>Tasks</h2>
   <section id="tasks"><p class="empty">Loading…</p></section>
 </main>
@@ -242,6 +243,23 @@
       <div class="row"><button data-spend="close">Close</button></div></div>`;
   }
 
+  // Tasks agentd starts on a timer: what, how often, when next.
+  function renderSchedules(list) {
+    if (!list || !list.length) { $("schedules").innerHTML = ""; return; }
+    const when = (ms) => {
+      if (!ms) return "once agentd sees it";
+      const s = Math.round((ms - Date.now()) / 1000);
+      if (s <= 0) return "as soon as it can";
+      if (s < 120) return "in " + s + "s"; if (s < 7200) return "in " + Math.round(s / 60) + "m";
+      if (s < 172800) return "in " + Math.round(s / 3600) + "h"; return "in " + Math.round(s / 86400) + "d";
+    };
+    $("schedules").innerHTML = `<h2>Schedules</h2>` + list.map((x) => `<div class="card">
+      <div class="title">${esc(x.name)} <span class="meta">every ${esc(x.every)} · next ${esc(when(x.next_ms))}</span></div>
+      <div class="meta">${esc(x.task.length > 90 ? x.task.slice(0, 90) + "…" : x.task)}</div>
+      <div class="meta">${x.runs} run${x.runs === 1 ? "" : "s"}${x.last_task ? ` · last: ${esc(x.last_task)}` : ""}${x.skipped ? ` · ${x.skipped} skipped` : ""}${x.error ? ` · <span class="d">${esc(x.error)}</span>` : ""}</div>
+      <div class="row"><button data-schedule="${esc(x.name)}">Run now</button></div></div>`).join("");
+  }
+
   function renderTasks(tasks) {
     if (!tasks.length) { $("tasks").innerHTML = `<p class="empty">No tasks yet. Start one with <code>agent do "…"</code>.</p>`; return; }
     $("tasks").innerHTML = tasks.map((t) => {
@@ -337,10 +355,11 @@
   async function refresh() {
     if (!token) { $("notice").innerHTML = `<div class="notice">Open the link that <code>agent serve</code> printed: it carries the access token.</div>`; return; }
     try {
-      const [asks, tasks, sp] = await Promise.all([api("/api/approvals"), api("/api/tasks"), api("/api/spend").catch(() => null)]);
+      const [asks, tasks, sp, sched] = await Promise.all([api("/api/approvals"), api("/api/tasks"), api("/api/spend").catch(() => null), api("/api/schedules").catch(() => null)]);
       $("notice").innerHTML = ""; $("dot").classList.add("live");
       if (!document.querySelector("#spend button:focus, #over button:focus")) renderSpend(sp && sp.periods ? sp : null);
       renderAsks(asks);
+      if (!document.querySelector("#schedules button:focus")) renderSchedules(Array.isArray(sched) ? sched : null);
       lastTasks = tasks;
       if (!document.querySelector("#detail button:focus")) renderTasks(tasks);
     } catch (e) {
@@ -360,6 +379,13 @@
       const y = Math.round(((ev.clientY - r.top) / r.height) * Number(box.dataset.h));
       box.focus(); actOnScreen(box.dataset.id, { kind: "click", x, y, button: 1 });
       return;
+    }
+    const run = ev.target.closest("button[data-schedule]");
+    if (run) {
+      run.disabled = true;
+      const r = await api("/api/schedules/" + run.dataset.schedule + "/run", {}).catch((e) => ({ error: e.message }));
+      if (r.error) alert(r.error); else openTask = r.id;
+      refresh(); return;
     }
     const t = ev.target.closest("button[data-takeover]");
     if (t) { takeover = takeover === t.dataset.takeover ? null : t.dataset.takeover; loadDetail(t.dataset.takeover); if (takeover) setTimeout(() => $("screenbox") && $("screenbox").focus(), 50); return; }

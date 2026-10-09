@@ -27,7 +27,7 @@ And one hard rule: **models propose, the OS decides.** No LLM inside the securit
 | Flight recorder | Every action logged in a tamper-evident, replayable record | hash-chained journal, eBPF | ◐ journal: tool calls, connections, every model call with its measured cost; the head is signed into a receipt, optionally posted to a witness (M35); not yet: a TPM-held key, eBPF |
 | Tokens are a budgeted resource | $/token/time budgets per task | model gateway | ● per-task $ or token budgets, metered on the wire (M15); time via --timeout |
 | Interfaces built for agents | System services exposed as typed tools | MCP gateway, D-Bus bridge, AT-SPI | ◐ agentos's own MCP server in every sandbox: sandbox_info, request_path_access, request_network_access (M16); your MCP servers through a gateway (M17) |
-| Agents can live for days | Sleep, wake on events, survive reboots | systemd units, CRIU | ○ Phase 3 |
+| Agents can live for days | Sleep, wake on events, survive reboots | systemd units, CRIU | ◐ tasks that start themselves on a timer, remembered across restarts and reboots (M43); not yet: waking on events, resuming one task's context |
 
 ● done ◐ partial ○ planned
 
@@ -159,6 +159,7 @@ It's verified at three levels:
 | M40: a screen of its own: `--display` (or `display = true` in an agent file or package) starts a private Xvfb outside the sandbox, with no network and no abstract socket, a cookie for the one client, shared memory off; the sandbox gets its socket as display :0 and nothing else of your displays; the framebuffer is a file in the task, so `agent screen` (PNG, now or as it ended; `-o -` for a pipe) shows it without the agent, and the latest picture with anything on it is kept at the end; `agent doctor` says whether Xvfb is there | ✅ with Xvfb installed (CI installs it) |
 | M41: watching and taking over a screen from agentd: a task's card shows its screen, live (`GET /api/tasks/ID/screen.png`, `?w=` to scale; viewers may), and **Act on it** sends clicks, keys and typed text to the running task's display with xdotool (approvers and you); every input is journaled with who did it, never the typed text; the last picture is served after the task ends | ✅ |
 | M42: the publisher's side of a registry: `agent registry pack DIR -o SITE` reviews a package, makes `NAME-VERSION.tar.gz` (sorted, no dates or owners: the same files make the same bytes) and adds its entry, with the tarball's sha256 and the package's digest, to `SITE/index.json`; with `keygen` and `sign` that's everything a static registry needs; nothing is uploaded anywhere | ✅ |
+| M43: schedules: `[schedule.NAME]` (your config only: every, project, task, agent, budget, timeout) makes agentd start the task on a timer, each run a task of its own that says `agentd schedule NAME` in its journal; never while the last run is still going; what agentd remembers (`schedules.json` in the store) means a restart or a reboot carries on: a run that came due meanwhile happens once; `agent schedules`, the console's list with **Run now** (admins) | ✅ |
 | M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and passes the whole e2e suite (179/179, Landlock and limits enforced) |
 
 ### Phase 1 backlog, in order

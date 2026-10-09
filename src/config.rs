@@ -93,6 +93,8 @@ struct ConfigFile {
     journal: JournalSection,
     #[serde(default)]
     registry: RegistrySection,
+    #[serde(default)]
+    schedule: BTreeMap<String, crate::schedule::Schedule>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -213,6 +215,8 @@ pub struct Settings {
     pub registry: Option<String>,
     /// The publisher's key the index must be signed by, if you gave one.
     pub registry_key: Option<String>,
+    /// Tasks agentd starts on a timer.
+    pub schedules: Vec<crate::schedule::Schedule>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -344,6 +348,16 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
     // A cloned repo must never choose who hears about your tasks.
     if project.is_some() && file.journal.witness.is_some() {
         bail!("{shown}: [journal] only belongs in your own config, never in a project's");
+    }
+    // …nor which tasks agentd starts on its own.
+    if project.is_some() && !file.schedule.is_empty() {
+        bail!("{shown}: [schedule] only belongs in your own config, never in a project's");
+    }
+    for (name, mut schedule) in file.schedule {
+        schedule.name = name;
+        schedule.validate().with_context(|| format!("{shown}: [schedule.{}]", schedule.name))?;
+        s.schedules.retain(|x| x.name != schedule.name);
+        s.schedules.push(schedule);
     }
     // …or where your agents come from.
     if project.is_some() && (file.registry.url.is_some() || file.registry.key.is_some()) {

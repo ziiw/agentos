@@ -591,3 +591,38 @@ pub(crate) fn cmd_screen(store: &Store, selector: Option<&str>, output: Option<P
     }
     Ok(0)
 }
+
+/// `agent schedules`: what agentd starts on its own, and when.
+pub(crate) fn cmd_schedules(store: &Store) -> Result<i32> {
+    let (home, out) = (home_dir()?, Paint::stdout());
+    let settings = config::load(store.root(), &std::env::current_dir()?, &home)?;
+    if settings.schedules.is_empty() {
+        println!("no schedules: add [schedule.NAME] to your config (see README: Schedules), and keep `agent serve` running");
+        return Ok(0);
+    }
+    let states = agentos::schedule::load(store.root());
+    let running = approvals::agentd(store.root()).is_some();
+    let now = util::now_ms();
+    for s in &settings.schedules {
+        let state = states.get(&s.name).cloned().unwrap_or_default();
+        let next = match (state.first_seen_ms, s.interval()) {
+            (0, _) | (_, Err(_)) => "once agentd sees it".to_string(),
+            (_, Ok(every)) => {
+                let at = state.next_ms(every);
+                if at <= now { "as soon as agentd can".to_string() } else { format!("in {}", humantime::format_duration(std::time::Duration::from_secs(((at - now) / 60_000).max(1) * 60))) }
+            }
+        };
+        let last = match &state.last_task {
+            Some(id) => format!("task {id}, {}", util::ago(state.last_start_ms)),
+            None => "never".to_string(),
+        };
+        println!("{:<16} every {:<6} next {:<22} last {last} · {} · {}", s.name, s.every, next, plural(state.runs as usize, "run"), out.dim(util::display_path(Path::new(&s.project))));
+        if let Some(e) = &state.last_error {
+            println!("    {} {e}", out.yellow("!"));
+        }
+    }
+    if !running {
+        println!("{}", out.dim("agentd isn't running, so nothing starts: agent serve (or systemctl --user enable --now agentd)"));
+    }
+    Ok(0)
+}

@@ -130,6 +130,9 @@ pub(crate) enum Command {
     },
     /// List the agents you can use with `agent do --agent NAME`
     Agents,
+    /// The tasks agentd starts on a timer ([schedule.NAME] in your config), and
+    /// when each next runs
+    Schedules,
     /// Save a picture of a task's screen (it needs --display)
     Screen {
         /// Task id or prefix (default: the latest task)

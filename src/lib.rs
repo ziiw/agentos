@@ -27,6 +27,7 @@ pub mod profiles;
 pub mod proxy;
 pub mod registry;
 pub mod sandbox;
+pub mod schedule;
 pub mod store;
 pub mod taint;
 pub mod users;

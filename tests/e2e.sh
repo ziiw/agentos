@@ -1900,6 +1900,62 @@ kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
 rm -f "$WORK/cfg/agents/sleeper.toml"
 : > "$CFG"
 
+section "agents that live for days (schedules in agentd)"
+reset_proj
+cd "$PROJ"
+SAVED_HOME="$AGENTOS_HOME"
+export AGENTOS_HOME="$WORK/store-sched"
+mkdir -p "$AGENTOS_HOME" "$WORK/sched/agents"
+cat > "$WORK/sched/agents/sched-agent.toml" <<'TOML'
+run = ["sh", "-c", "echo scheduled: $1", "sh", "{task}"]
+TOML
+sched_config() {  # NAME EVERY
+  printf '[console]\nprojects = ["%s"]\n\n[schedule.%s]\nevery = "%s"\nproject = "%s"\ntask = "triage the issues"\nagent = "sched-agent"\nbudget = "1usd"\ntimeout = "5m"\n' "$PROJ" "$1" "$2" "$PROJ" > "$WORK/sched/config.toml"
+}
+tasks_started() { ls -d "$AGENTOS_HOME"/tasks/*/ 2>/dev/null | wc -l; }
+sc() { AGENTOS_CONFIG="$WORK/sched/config.toml" "$AGENT" "$@"; }
+tok() { sed -n 's/.*#token=\([0-9a-f]*\).*/\1/p'; }
+# A schedule that came due while agentd was off: one run when it's back, not a catch-up of every missed one.
+sched_config overdue 1h
+printf '{"overdue":{"first_seen_ms":1000,"last_start_ms":2000,"last_task":null,"runs":4,"skipped":0,"last_error":null}}' > "$AGENTOS_HOME/schedules.json"
+check "agent schedules says it's due, and that nothing starts without agentd" bash -c 'out="$(AGENTOS_CONFIG="$1" "$2" schedules 2>&1)"; grep -q "as soon as agentd can" <<<"$out" && grep -q "agentd isn.t running" <<<"$out"' _ "$WORK/sched/config.toml" "$AGENT"
+start_agentd AGENTOS_CONFIG="$WORK/sched/config.toml" AGENTOS_MIN_SCHEDULE=1s
+api() { curl -sS -m 10 -H "Authorization: Bearer $TOKEN" "$@"; }
+for _ in $(seq 60); do [ "$(tasks_started)" -ge 1 ] && break; sleep 0.5; done
+check "a schedule that came due while agentd was off runs when it's back" test "$(tasks_started)" -ge 1
+sleep 8
+check "...once" test "$(tasks_started)" -eq 1
+FIRST="$(ls -td "$AGENTOS_HOME"/tasks/*/ | head -1)"
+check "the task says which schedule started it" grep -q '"started_by":"agentd schedule overdue"' "${FIRST}events.jsonl"
+check "...with the agent, task and budget the schedule names" grep -q 'sched-agent: triage the issues' <<<"$("$AGENT" ls)"
+check "agent schedules shows its runs, and the task" grep -Eq "overdue +every 1h .*task $(basename "$FIRST").*5 runs" <<<"$(sc schedules 2>&1)"
+check "the console lists it" grep -q '"name":"overdue".*"runs":5' <<<"$(api "$CONSOLE/api/schedules")"
+check "Run now starts another, ahead of time" grep -Eq '"id":"[0-9a-f]{8}"' <<<"$(api -X POST -d '{}' "$CONSOLE/api/schedules/overdue/run")"
+check "...and a name that isn't there is refused" grep -q 'no \[schedule.nope\]' <<<"$(api -X POST -d '{}' "$CONSOLE/api/schedules/nope/run")"
+for _ in $(seq 20); do [ "$(tasks_started)" -ge 2 ] && break; sleep 0.5; done
+check "the console's Run now made a second task" test "$(tasks_started)" -eq 2
+check "a viewer can't start one" bash -c 'tk="$("$1" users add vera --role viewer | sed -n "s/.*#token=\([0-9a-f]*\).*/\1/p")"; test "$(curl -sS -m 10 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $tk" -X POST -d "{}" "$2/api/schedules/overdue/run")" = 403' _ "$AGENT" "$CONSOLE"
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+before="$(tasks_started)"
+start_agentd AGENTOS_CONFIG="$WORK/sched/config.toml" AGENTOS_MIN_SCHEDULE=1s
+sleep 8
+check "restarted, agentd remembers: nothing runs that isn't due" test "$(tasks_started)" -eq "$before"
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+# On a timer.
+rm -rf "$AGENTOS_HOME/tasks" "$AGENTOS_HOME/schedules.json" "$AGENTOS_HOME/users.json"
+sched_config ticking 5s
+start_agentd AGENTOS_CONFIG="$WORK/sched/config.toml" AGENTOS_MIN_SCHEDULE=1s
+for _ in $(seq 80); do [ "$(tasks_started)" -ge 2 ] && break; sleep 0.5; done
+check "a schedule every few seconds keeps starting its task" test "$(tasks_started)" -ge 2
+kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+out="$(printf '[schedule.too-often]\nevery = "10s"\nproject = "%s"\ntask = "x"\n' "$PROJ" > "$WORK/sched/fast.toml"; AGENTOS_CONFIG="$WORK/sched/fast.toml" "$AGENT" schedules 2>&1)"
+check "a schedule can't be faster than a minute (unless you say otherwise)" grep -q 'not more often than every 1m' <<<"$out"
+printf '[schedule.sneaky]\nevery = "1h"\nproject = "%s"\ntask = "x"\n' "$PROJ" > .agentos.toml
+"$AGENT" trust >/dev/null 2>&1
+check "a project can't start tasks on its own" test $? -eq 2
+rm -f .agentos.toml
+export AGENTOS_HOME="$SAVED_HOME"
+
 section "budgets (the model gateway)"
 # A stand-in model API: httpbin's /base64/… answers with whatever body the
 # URL carries, so the "provider" reports exactly the usage we choose.

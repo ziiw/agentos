@@ -13,6 +13,7 @@ use agentos::approvals::{self, Agentd, Decision};
 use agentos::config;
 use agentos::gateway::{Budget, Period, Periodic};
 use agentos::profiles;
+use agentos::schedule::{self, Schedule};
 use agentos::store::Access;
 use agentos::changes::{self, Summary};
 use agentos::gateway;
@@ -56,6 +57,16 @@ pub fn serve(store: &Store, listen: &str, notify: Option<String>) -> Result<i32>
     if let Some(url) = notify {
         let root = store.root().to_path_buf();
         thread::spawn(move || notifier(root, url));
+    }
+    // Tasks on a timer ([schedule.*] in your config), kept going across restarts.
+    {
+        let root = store.root().to_path_buf();
+        thread::spawn(move || scheduler(root));
+        let home = crate::home_dir()?;
+        for s in config::load(store.root(), &home, &home).map(|c| c.schedules).unwrap_or_default() {
+            let unguarded = if s.budget.is_none() && config::load(store.root(), &home, &home).map(|c| c.budget.is_none()).unwrap_or(true) { ", and no budget" } else { "" };
+            println!("  {}", out.dim(format!("schedule {}: every {}{unguarded}", s.name, s.every)));
+        }
     }
 
     for mut request in server.incoming_requests() {
@@ -169,6 +180,8 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         (Method::Get, ["api", "tasks"]) => tasks(&store),
         (Method::Post, ["api", "tasks"]) => start(&store, &parts.body, &who.label()),
         (Method::Get, ["api", "launchpad"]) => launchpad(&store),
+        (Method::Get, ["api", "schedules"]) => schedules(&store),
+        (Method::Post, ["api", "schedules", name, "run"]) => run_schedule_now(&store, name, &who),
         (Method::Get, ["api", "tasks", id]) => task(&store, id),
         (Method::Post, ["api", "tasks", id, "revoke"]) => revoke(&store, id, &parts.body),
         (Method::Post, ["api", "tasks", id, "raise"]) => raise_task(&store, id, &parts.body),
@@ -343,8 +356,107 @@ struct Start {
     timeout: Option<String>,
 }
 
-/// Starts `agent do --bg` in one of your projects, exactly as from a
-/// terminal there. Returns the task's id.
+/// Only one thing at a time changes what agentd remembers of its schedules.
+static SCHEDULES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Checks every few seconds which schedules are due and starts them. Reads your
+/// config each time, so editing a schedule needs no restart.
+fn scheduler(root: PathBuf) {
+    loop {
+        thread::sleep(Duration::from_secs(5));
+        let (Ok(store), Ok(home)) = (Store::open_at(&root), crate::home_dir()) else { continue };
+        let Ok(settings) = config::load(&root, &home, &home) else { continue };
+        let _one_at_a_time = SCHEDULES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut states = schedule::load(&root);
+        let (now, mut changed) = (util::now_ms(), false);
+        for s in &settings.schedules {
+            let state = states.entry(s.name.clone()).or_insert_with(|| {
+                changed = true;
+                schedule::State::new(now)
+            });
+            if s.interval().is_ok_and(|every| state.due(now, every)) {
+                let _ = fire(&store, &home, s, state, now);
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = schedule::save(&root, &states);
+        }
+    }
+}
+
+/// Starts a schedule's task, unless its last one is still going. The task
+/// is started as from the console, and says which schedule started it.
+fn fire(store: &Store, home: &Path, s: &Schedule, state: &mut schedule::State, now: u64) -> Result<String> {
+    if state.last_task.as_deref().is_some_and(|id| store.resolve(Some(id)).is_ok_and(|t| t.is_live())) {
+        state.skipped += 1;
+        state.last_error = Some("the previous run is still going".into());
+        bail!("the previous run of {} is still going", s.name);
+    }
+    let started = (|| -> Result<String> {
+        let project = match s.project.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None if s.project == "~" => home.to_path_buf(),
+            None if Path::new(&s.project).is_absolute() => PathBuf::from(&s.project),
+            None => bail!("project {}: use an absolute path or ~/…", s.project),
+        };
+        let project = fs::canonicalize(&project).with_context(|| format!("project {}: no such folder", s.project))?;
+        let body = json!({ "project": project, "task": s.task, "agent": s.agent, "budget": s.budget, "timeout": s.timeout });
+        let started = start(store, &body.to_string(), &format!("agentd schedule {}", s.name))?;
+        started["id"].as_str().map(str::to_string).context("agentd didn't get a task id back")
+    })();
+    state.last_start_ms = now;
+    match started {
+        Ok(id) => {
+            state.last_task = Some(id.clone());
+            state.runs += 1;
+            state.last_error = None;
+            Ok(id)
+        }
+        Err(e) => {
+            state.last_error = Some(format!("{e:#}"));
+            Err(e)
+        }
+    }
+}
+
+/// Your schedules and where each stands.
+fn schedules(store: &Store) -> Result<Value> {
+    let home = crate::home_dir()?;
+    let settings = config::load(store.root(), &home, &home)?;
+    let states = schedule::load(store.root());
+    Ok(json!(settings
+        .schedules
+        .iter()
+        .map(|s| {
+            let state = states.get(&s.name).cloned().unwrap_or_default();
+            let next = (state.first_seen_ms > 0).then(|| s.interval().ok().map(|every| state.next_ms(every))).flatten();
+            json!({
+                "name": s.name, "every": s.every, "project": s.project, "task": s.task, "agent": s.agent,
+                "next_ms": next, "last_start_ms": state.last_start_ms, "last_task": state.last_task,
+                "runs": state.runs, "skipped": state.skipped, "error": state.last_error,
+            })
+        })
+        .collect::<Vec<_>>()))
+}
+
+/// "Run now": a schedule's task, ahead of its time. The next run is an interval from now.
+fn run_schedule_now(store: &Store, name: &str, who: &Who) -> Result<Value> {
+    let home = crate::home_dir()?;
+    let s = config::load(store.root(), &home, &home)?.schedules.into_iter().find(|s| s.name == name).with_context(|| format!("no [schedule.{name}] in your config"))?;
+    let _one_at_a_time = SCHEDULES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut states = schedule::load(store.root());
+    let now = util::now_ms();
+    let state = states.entry(s.name.clone()).or_insert_with(|| schedule::State::new(now));
+    let result = fire(store, &home, &s, state, now);
+    schedule::save(store.root(), &states)?;
+    let id = result?;
+    if let Ok(t) = store.resolve(Some(&id)) {
+        let _ = t.journal().append("console.action", json!({ "by": who.name, "role": who.role.name(), "action": format!("ran schedule {name} now"), "decision": null }));
+    }
+    Ok(json!({ "id": id }))
+}
+
 /// What a task's screen shows: live while it runs, else the picture it left.
 /// `?w=N` brings it down to N pixels wide (live pictures only).
 fn screen(store: &Store, id: &str, query: &str) -> Result<Vec<u8>> {
@@ -386,6 +498,8 @@ fn article(role: Role) -> &'static str {
     if role == Role::Viewer { "a" } else { "an" }
 }
 
+/// Starts `agent do --bg` in one of your projects, exactly as from a
+/// terminal there. Returns the task's id.
 fn start(store: &Store, body: &str, by: &str) -> Result<Value> {
     let req: Start = serde_json::from_str(body).context("expected {project, task, agent?, budget?, timeout?}")?;
     let home = crate::home_dir()?;

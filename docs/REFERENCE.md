@@ -104,6 +104,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
 | `agent install DIR\|NAME [--yes] [--digest HEX]` / `uninstall NAME` / `packages` / `search [TEXT]` | Agent packages: install one (from a folder, or by name from your registry) after reading what it asks for, remove it, list them and whether they're intact, search your registry |
 | `agent serve [--listen ADDR] [--notify URL]` | agentd: web console for tasks and approvals |
+| `agent schedules` | The tasks agentd starts on a timer, and when each runs next |
 | `agent users [add NAME --role ROLE \| remove NAME]` | Who else may use agentd's console (viewer, approver, admin), with their own tokens |
 | `agent approvals [--revoke HOST]` | List hosts you approved "always", or forget one for this project |
 | `agent revoke [TARGET] [--task ID]` | Take back a folder or host you granted while a task runs |
@@ -515,6 +516,29 @@ Questions from agents appear at the top with **Allow for this task / Always / De
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
 - `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only, or which budget ran out), and when a task finishes, with what it left for review.
 
+## Agents that live for days: schedules
+
+An agent task is a transaction, so it ends. Work that goes on for days is a sequence of tasks that start themselves: agentd, the long-lived part, starts them on a timer.
+
+```toml
+[schedule.triage]                      # your config only
+every = "24h"                          # a duration, at least a minute
+project = "~/code/app"                 # one of the folders agentd may start tasks in (see [console] projects)
+task = "Look at the open issues and write a summary in TRIAGE.md"
+budget = "2usd"                        # a task nobody is watching deserves a budget
+timeout = "30m"
+# agent = "claude"
+```
+
+```bash
+agent serve                            # agentd; or keep it running: systemctl --user enable --now agentd
+agent schedules                        # what runs when
+```
+
+Each run is a task like any other, started as from the console (its journal says `agentd schedule triage`): its own sandbox, its changes and held pushes waiting for your review, its budget. A run never starts while the last one is still going. The first run comes one interval after agentd first sees the schedule, and agentd remembers when each last ran (in the task store), so it carries on across restarts, logouts and reboots: a run that came due while agentd was off happens once, when it's back. To keep agentd up with nobody logged in, `loginctl enable-linger $USER`. The console lists schedules with their next run and a **Run now** button (admins only).
+
+Rules, budgets and your questions all apply as they do to any task. With nobody at a terminal, a task's questions go to the console or are refused: give a scheduled task rules (`policy.cedar`) for what it should be allowed to do, and `release` rules for what may leave without you. Schedules are in your config only: a project can't make agentd run anything.
+
 ## Configuration
 
 Two optional files, in TOML:
@@ -547,6 +571,11 @@ env = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 
 [prices]                              # your file only; USD per million tokens
 "gpt-*" = { input = 1.25, output = 10 }   # example figures: use your provider's
+
+[schedule.triage]                     # your file only: agentd starts this on a timer
+every = "24h"
+project = "~/code/app"
+task = "Summarize the open issues"
 
 [journal]                             # your file only: finished tasks' signed receipts go here
 witness = "https://witness.example/receipts"
@@ -725,6 +754,7 @@ src/changes.rs   reading/committing/rolling back overlay transactions
 src/journal.rs   hash-chained event log
 src/attest.rs    receipts: the journal head, signed; the witness
 src/users.rs     people besides you for agentd's console: tokens and roles
+src/schedule.rs  tasks agentd starts on a timer, and what it remembers of them
 src/display.rs   a task's virtual screen: Xvfb, its cookie, screenshots (XWD to PNG)
 src/store.rs     on-disk task store
 src/doctor.rs    environment checks
