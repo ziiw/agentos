@@ -210,6 +210,61 @@ fn load(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Seals `secret` in the TPM under the owner's primary key, wrapped as
+/// `dir/NAME.pub` and `dir/NAME.priv`. With `pcrs`, the TPM gives it back only
+/// while those PCRs (sha256) hold what they hold now.
+pub fn seal(dir: &Path, name: &str, secret: &[u8], pcrs: &[u32]) -> Result<()> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let _lock = Lock::take(dir)?;
+    let work = Work::new(dir)?;
+    primary(&work.0)?;
+    fs::write(work.0.join("secret"), secret)?;
+    let list = pcrs.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let selection = format!("sha256:{list}");
+    let mut args = vec!["-C", "primary.ctx", "-i", "secret", "-u", "sealed.pub", "-r", "sealed.priv"];
+    if pcrs.is_empty() {
+        args.extend(["-a", "fixedtpm|fixedparent|noda|userwithauth"]);
+    } else {
+        run(&work.0, "tpm2_createpolicy", &["--policy-pcr", "-l", &selection, "-L", "policy.dat"]).context("make a policy for those PCRs")?;
+        flush(&work.0);
+        // (no password to fall back on: only the policy opens it)
+        args.extend(["-L", "policy.dat", "-a", "fixedtpm|fixedparent|noda"]);
+    }
+    let created = run(&work.0, "tpm2_create", &args).context("seal a secret in the TPM");
+    flush(&work.0);
+    created?;
+    for (from, to) in [("sealed.pub", format!("{name}.pub")), ("sealed.priv", format!("{name}.priv"))] {
+        fs::set_permissions(work.0.join(from), fs::Permissions::from_mode(0o600))?;
+        fs::rename(work.0.join(from), dir.join(to))?;
+    }
+    Ok(())
+}
+
+/// What `seal` sealed, if the TPM is the same and (when it was bound to PCRs) they hold what they did.
+pub fn unseal(dir: &Path, name: &str, pcrs: &[u32]) -> Result<Vec<u8>> {
+    let _lock = Lock::take(dir)?;
+    let work = Work::new(dir)?;
+    fs::copy(dir.join(format!("{name}.pub")), work.0.join("sealed.pub")).with_context(|| format!("read {name}.pub"))?;
+    fs::copy(dir.join(format!("{name}.priv")), work.0.join("sealed.priv"))?;
+    primary(&work.0)?;
+    let loaded = run(&work.0, "tpm2_load", &["-C", "primary.ctx", "-u", "sealed.pub", "-r", "sealed.priv", "-c", "sealed.ctx"]).context("load the sealed secret into the TPM (is this the TPM that sealed it?)");
+    flush(&work.0);
+    loaded?;
+    let result = if pcrs.is_empty() {
+        run(&work.0, "tpm2_unseal", &["-c", "sealed.ctx", "-o", "secret"])
+    } else {
+        let selection = format!("sha256:{}", pcrs.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+        run(&work.0, "tpm2_startauthsession", &["--policy-session", "-S", "session.ctx"])
+            .and_then(|_| run(&work.0, "tpm2_policypcr", &["-S", "session.ctx", "-l", &selection]))
+            .and_then(|_| run(&work.0, "tpm2_unseal", &["-c", "sealed.ctx", "-p", "session:session.ctx", "-o", "secret"]))
+            .map_err(|e| anyhow::anyhow!("{e:#} (the PCRs are not what they were when it was sealed)"))
+    };
+    let _ = run(&work.0, "tpm2_flushcontext", &["session.ctx"]);
+    flush(&work.0);
+    result.context("unseal with the TPM")?;
+    fs::read(work.0.join("secret")).context("read the unsealed secret")
+}
+
 /// What `tpm2_pcrread sha256:0,7` prints, as {index: hex}.
 pub fn parse_pcrread(text: &str) -> BTreeMap<u32, String> {
     text.lines()

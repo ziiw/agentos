@@ -98,7 +98,7 @@ While working on one thing, `scripts/dev.sh e2e 'a corporate proxy' 'configurati
 | `agent log [TASK] [--json]` | Show the journal and verify its hash chain |
 | `agent doctor` | Check this machine |
 | `agent trust [FILE]` | Show a project's `.agentos.toml` and apply it from now on |
-| `agent vault [status\|seal\|unseal]` | Your agent's sealed login |
+| `agent vault [status\|seal\|unseal\|lock [--pcrs N,…]\|unlock]` | Your agent's sealed login; lock the vault's files to this machine's TPM, or unlock them |
 | `agent screen [TASK] [-o FILE]` | Save a PNG of a task's screen (a task started with `--display`), now or as it ended |
 | `agent attest [TASK]` / `--verify FILE [--journal FILE] [--trust KEY] [--expect-pcr N=HEX]` / `--public` | Sign a task's journal head (a receipt), check a receipt (and the machine state it carries), show this machine's receipt key |
 | `agent agents` | Agents you can use with `agent do --agent NAME` |
@@ -706,6 +706,17 @@ The agent never holds your real API key. With `ANTHROPIC_API_KEY` set, `agent do
 Only that header, only on that host. A placeholder pasted into a request body, another header, or a request to another host stays a placeholder. Otherwise an agent could have the real key echoed back to it, or put it in front of the model.
 
 **Logins too.** If you logged Claude in with a claude.ai account (`agent do`, then `/login`), the tokens in its home are **sealed**. The real ones move to a vault in the task store, and the agent's file keeps look-alike placeholders (`sk-ant-oat01-agentosplaceholder-…`). On API calls, the proxy swaps the access-token placeholder in `Authorization`. On Anthropic's token endpoint it works both ways: the placeholder refresh token goes out as the real one, and fresh tokens come back as new placeholders. So even a `/login` inside the sandbox never hands the agent a real token. `agent vault` shows the state, and `agent vault unseal` puts the real tokens back and stops sealing, if you ever need it. With `--net host` there's no proxy to swap tokens, so the login is unsealed for that task and sealed again afterwards.
+
+**The vault, locked to the TPM.** The vault holds real tokens (an agent's login, the sign-ins to your MCP servers). They sit in the task store as files only you can read, which protects them from every sandbox and every other user, but not from a copy of the store: a backup, a stolen disk. `agent vault lock` makes a random key, seals it in the machine's TPM (it needs `tpm2-tools` and a TPM you may open, like receipts signed by the TPM) and encrypts every file in the vault with it (AES-256-GCM; each file's name is authenticated, so one can't be passed off as another). The wrapped key is useless anywhere but on that TPM, so a copy of the store is noise anywhere else. Locking can be done with tasks running: files are encrypted as they are rewritten, and a file not yet encrypted is still read. `agent vault unlock` decrypts everything and lets the key go.
+
+```bash
+agent vault lock                  # the vault's files, encrypted under a key the TPM holds
+agent vault lock --pcrs 7         # …which the TPM gives back only while PCR 7 holds what it holds now
+agent vault                       # shows whether it's locked
+agent vault unlock                # plain files again
+```
+
+With `--pcrs`, a machine that booted something else (a different firmware, boot loader or Secure Boot policy, so other PCRs) can't read the vault until it's back in the state it was locked in; after a firmware or kernel update that changes the PCRs you have locked to, unlock it first (`agent vault unlock`, then lock again). A TPM that doesn't answer is an error, never an empty vault: a task that needs a login can't start without it, rather than overwriting what it couldn't read.
 
 Any command can use it:
 

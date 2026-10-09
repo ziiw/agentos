@@ -2737,6 +2737,86 @@ PY
   fi
 fi
 
+section "the vault, locked to the TPM (a software one here)"
+if ! command -v swtpm >/dev/null || ! command -v tpm2_createprimary >/dev/null || ! command -v tpm2_pcrextend >/dev/null; then
+  skip "the TPM tests need swtpm and tpm2-tools"
+else
+  mkdir -p "$WORK/tpm2"
+  tpm2_up() {
+    swtpm socket --tpm2 --tpmstate dir="$WORK/tpm2" --ctrl type=unixio,path="$WORK/tpm2/sock.ctrl" --server type=unixio,path="$WORK/tpm2/sock" --flags startup-clear >"$WORK/tpm2/swtpm.log" 2>&1 &
+    SWTPM2_PID=$!
+    for _ in $(seq 50); do [ -S "$WORK/tpm2/sock" ] && break; sleep 0.1; done
+  }
+  tpm2_up
+  export TPM2TOOLS_TCTI="swtpm:path=$WORK/tpm2/sock"
+  if ! tpm2_getrandom --hex 4 >/dev/null 2>&1; then
+    skip "the software TPM doesn't answer (tpm2-tools needs its swtpm interface)"
+    kill $SWTPM2_PID 2>/dev/null
+  else
+    reset_proj
+    cd "$PROJ"
+    SAVED_HOME="$AGENTOS_HOME"
+    export AGENTOS_HOME="$WORK/store-vault"
+    VAULT="$AGENTOS_HOME/vault"
+    mkdir -p "$VAULT" && chmod 700 "$VAULT"
+    # An agent's login as the vault keeps it, and a sign-in to an MCP server.
+    printf '{"tokens":[["sk-ant-oat01-agentosplaceholder-aaaa","sk-ant-oat01-e2e-real-access"]]}' > "$VAULT/claude.json"
+    printf '{"url":"https://mcp.example.com/mcp","issuer":"https://idp.example.com","token_endpoint":"https://idp.example.com/token","client_id":"c","access_token":"e2e-mcp-access-token"}' > "$VAULT/mcp-tracker.json"
+    chmod 600 "$VAULT"/*.json
+    printf '[mcp.tracker]\nurl = "https://mcp.example.com/mcp"\n' > "$WORK/vault-config.toml"
+    vc() { AGENTOS_CONFIG="$WORK/vault-config.toml" "$AGENT" "$@"; }
+    check "before locking, the vault's files are plain text" grep -q e2e-real-access "$VAULT/claude.json"
+    check "agent vault says it isn't locked" grep -q 'not locked to the TPM' <<<"$(vc vault 2>&1)"
+    out="$(vc vault lock 2>&1)"
+    check "agent vault lock locks it to the TPM" grep -q "the vault is locked to this machine's TPM (2 files)" <<<"$out"
+    check "...the files are encrypted: no token in them" bash -c '! grep -rq "e2e-real-access\|e2e-mcp-access-token" "$1" && head -c 16 "$1/claude.json" | grep -q AGENTOS-SEALED' _ "$VAULT"
+    check "...the key is only in the store as blobs only this TPM can open" test -f "$AGENTOS_HOME/identity/tpm/vault-key.priv"
+    check "...and what is in them is still there: the sign-in is read" grep -q 'signed in at https://idp.example.com' <<<"$(vc connect 2>&1)"
+    check "agent vault status says it's locked" grep -q 'the vault: locked to this machine.s TPM (2 files encrypted)' <<<"$(vc vault 2>&1)"
+    check "locking again is refused" grep -q 'locked already' <<<"$(vc vault lock 2>&1)"
+    # A write while it's locked is encrypted too: seal a login into the vault, and take it back out.
+    mkdir -p "$AGENTOS_HOME/homes/claude/.claude"
+    CREDS2="$AGENTOS_HOME/homes/claude/.claude/.credentials.json"
+    printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-e2e-second-access","refreshToken":"sk-ant-ort01-e2e-second-refresh","expiresAt":1}}' > "$CREDS2"
+    vc vault seal >/dev/null 2>&1
+    check "a login sealed into a locked vault stays encrypted there" bash -c '! grep -rq "e2e-second" "$1" && head -c 16 "$1/claude.json" | grep -q AGENTOS-SEALED' _ "$VAULT"
+    check "...and comes back out of it" bash -c 'AGENTOS_CONFIG="$1" "$2" vault unseal >/dev/null 2>&1; grep -q e2e-second-access "$3"' _ "$WORK/vault-config.toml" "$AGENT" "$CREDS2"
+    check "the other files weren't touched meanwhile" grep -q 'signed in at' <<<"$(vc connect 2>&1)"
+    # Another TPM can't read it: the blobs open only under the TPM that made them.
+    cp -r "$AGENTOS_HOME" "$WORK/store-copy"
+    kill $SWTPM2_PID 2>/dev/null; wait $SWTPM2_PID 2>/dev/null
+    mv "$WORK/tpm2" "$WORK/tpm2-first"; mkdir -p "$WORK/tpm2"; tpm2_up
+    out="$(AGENTOS_HOME="$WORK/store-copy" AGENTOS_CONFIG="$WORK/vault-config.toml" "$AGENT" vault 2>&1)"
+    check "a copy of the store on another TPM is noise: it can't be opened" grep -q "locked to this machine's TPM, which didn't give its key back" <<<"$out"
+    check "...and a sign-in in it reads as no sign-in" grep -q 'not signed in' <<<"$(AGENTOS_HOME="$WORK/store-copy" AGENTOS_CONFIG="$WORK/vault-config.toml" "$AGENT" connect 2>&1)"
+    kill $SWTPM2_PID 2>/dev/null; wait $SWTPM2_PID 2>/dev/null
+    rm -rf "$WORK/tpm2" && mv "$WORK/tpm2-first" "$WORK/tpm2"; tpm2_up
+    # Unlocking gives the plain files back.
+    out="$(vc vault unlock 2>&1)"
+    check "agent vault unlock decrypts the files" grep -q 'the vault is open again (2 files decrypted)' <<<"$out"
+    check "...they are plain again, and the key blobs are gone" bash -c 'grep -q e2e-mcp-access-token "$1/mcp-tracker.json" && test ! -e "$2/identity/tpm/vault-key.priv"' _ "$VAULT" "$AGENTOS_HOME"
+    # Bound to the machine's state: only while PCR 7 holds what it held.
+    M1="$(printf 'secure boot policy' | sha256sum | cut -d' ' -f1)"
+    tpm2_pcrextend "7:sha256=$M1" >/dev/null 2>&1
+    check "agent vault lock --pcrs 7 binds the key to PCR 7" grep -q 'comes back only while PCR 7 hold what they hold now' <<<"$(vc vault lock --pcrs 7 2>&1)"
+    check "...in the state it was locked in, the vault opens" grep -q 'signed in at' <<<"$(vc connect 2>&1)"
+    tpm2_pcrextend "7:sha256=$(printf 'something else booted' | sha256sum | cut -d' ' -f1)" >/dev/null 2>&1
+    out="$(vc vault 2>&1)"
+    check "once the machine's state differs, the TPM won't give the key" grep -q 'the PCRs are not what they were' <<<"$out"
+    check "...and no token comes out of it" bash -c '! grep -rq "e2e-mcp-access-token" "$1"' _ "$VAULT"
+    kill $SWTPM2_PID 2>/dev/null; wait $SWTPM2_PID 2>/dev/null
+    tpm2_up
+    check "after a reboot into something else, still not" grep -q 'the PCRs are not what they were' <<<"$(vc vault 2>&1)"
+    tpm2_pcrextend "7:sha256=$M1" >/dev/null 2>&1
+    check "...but back in the state it was locked in, it opens" grep -q 'locked to this machine.s TPM (2 files encrypted)' <<<"$(vc vault 2>&1)"
+    check "...and can be unlocked" grep -q 'the vault is open again' <<<"$(vc vault unlock 2>&1)"
+    check "a PCR has to exist" grep -q "PCR 24 doesn't exist" <<<"$(vc vault lock --pcrs 24 2>&1)"
+    kill $SWTPM2_PID 2>/dev/null; wait $SWTPM2_PID 2>/dev/null
+    unset TPM2TOOLS_TCTI
+    export AGENTOS_HOME="$SAVED_HOME"
+  fi
+fi
+
 section "exit codes and the audit journal"
 "$AGENT" run -- sh -c 'exit 7' 2>/dev/null
 check "agent exit code propagates" test $? -eq 7

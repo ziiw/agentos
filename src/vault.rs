@@ -34,6 +34,7 @@ struct State {
 }
 
 pub struct Vault {
+    root: PathBuf,
     path: PathBuf,
     state: Mutex<State>,
 }
@@ -47,19 +48,17 @@ impl Vault {
         let dir = store_root.join("vault");
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let path = dir.join(format!("{agent}.json"));
-        let state = match fs::read(&path) {
-            Ok(raw) => serde_json::from_slice(&raw).with_context(|| format!("{} is corrupt", path.display()))?,
-            Err(_) => State::default(),
+        // (read through the TPM-locked form, if the vault is locked: a TPM that doesn't answer is an error, not an empty vault)
+        let state = if path.exists() {
+            serde_json::from_slice(&crate::sealed::read(store_root, &path)?).with_context(|| format!("{} is corrupt", path.display()))?
+        } else {
+            State::default()
         };
-        Ok(Vault { path, state: Mutex::new(state) })
+        Ok(Vault { root: store_root.to_path_buf(), path, state: Mutex::new(state) })
     }
 
     fn save(&self, state: &State) -> Result<()> {
-        let tmp = self.path.with_extension("json.tmp");
-        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(&serde_json::to_vec_pretty(state)?)?;
-        fs::rename(&tmp, &self.path)?;
-        Ok(())
+        crate::sealed::write(&self.root, &self.path, &serde_json::to_vec_pretty(state)?)
     }
 
     pub fn disabled(&self) -> bool {

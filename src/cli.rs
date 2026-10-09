@@ -99,13 +99,17 @@ pub(crate) enum Command {
     /// Check whether this machine can run agent sandboxes
     Doctor,
     /// Your agent's sealed login: status, seal (move tokens to the vault) or
-    /// unseal (put them back and stop sealing)
+    /// unseal (put them back and stop sealing); or lock the vault's files to
+    /// this machine's TPM, or unlock them
     Vault {
-        #[arg(value_parser = ["status", "seal", "unseal"], default_value = "status")]
+        #[arg(value_parser = ["status", "seal", "unseal", "lock", "unlock"], default_value = "status")]
         action: String,
         /// Which agent
         #[arg(long, default_value = "claude")]
         agent: String,
+        /// With lock: the TPM gives the key back only while these PCRs hold what they hold now (like 7, or 0,2,7)
+        #[arg(long, value_delimiter = ',', value_name = "N,…")]
+        pcrs: Vec<u32>,
     },
     /// People besides you who can use agentd's console, with a token and a
     /// role each (viewer, approver or admin); with no subcommand, list them

@@ -117,7 +117,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),
         Command::Users { command } => cmd_users(&store, command),
         Command::Serve { listen, notify } => web::serve(&store, &listen, notify),
-        Command::Vault { action, agent } => cmd_vault(&store, &action, &agent),
+        Command::Vault { action, agent, pcrs } => cmd_vault(&store, &action, &agent, &pcrs),
         Command::Policy { command } => cmd_policy(command),
         Command::Spend => cmd_spend(&store),
         Command::Raise { amount, task, today, this_week, this_month, project } => {

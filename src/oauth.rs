@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -54,17 +54,13 @@ fn path(store_root: &Path, name: &str) -> PathBuf {
 }
 
 pub fn load(store_root: &Path, name: &str) -> Option<Tokens> {
-    serde_json::from_slice(&fs::read(path(store_root, name)).ok()?).ok()
+    serde_json::from_slice(&crate::sealed::read(store_root, &path(store_root, name)).ok()?).ok()
 }
 
 fn save(store_root: &Path, name: &str, t: &Tokens) -> Result<()> {
     let file = path(store_root, name);
     fs::DirBuilder::new().recursive(true).create(file.parent().context("vault")?)?;
-    let tmp = file.with_extension("json.tmp");
-    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-    f.write_all(&serde_json::to_vec_pretty(t)?)?;
-    fs::rename(&tmp, &file)?;
-    Ok(())
+    crate::sealed::write(store_root, &file, &serde_json::to_vec_pretty(t)?)
 }
 
 /// Forgets a sign-in. Returns whether there was one.

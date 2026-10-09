@@ -231,11 +231,29 @@ pub(crate) fn cmd_agents(store: &Store) -> Result<i32> {
     Ok(0)
 }
 
-pub(crate) fn cmd_vault(store: &Store, action: &str, agent: &str) -> Result<i32> {
+pub(crate) fn cmd_vault(store: &Store, action: &str, agent: &str, pcrs: &[u32]) -> Result<i32> {
+    let out = Paint::stdout();
+    // Locking the vault's files to the TPM isn't about one agent's login.
+    match action {
+        "lock" => {
+            if let Some(bad) = pcrs.iter().find(|i| **i > 23) {
+                bail!("PCR {bad} doesn't exist (0 to 23)");
+            }
+            let n = agentos::sealed::lock(store.root(), pcrs)?;
+            let bound = if pcrs.is_empty() { String::new() } else { format!(", and its key comes back only while PCR {} hold what they hold now", pcrs.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")) };
+            println!("{} the vault is locked to this machine's TPM ({}{bound})", out.green("✓"), plural(n, "file"));
+            return Ok(0);
+        }
+        "unlock" => {
+            let n = agentos::sealed::unlock(store.root())?;
+            println!("{} the vault is open again ({} decrypted) and its key is gone from the TPM's blobs; `agent vault lock` to lock it again", out.yellow("!"), plural(n, "file"));
+            return Ok(0);
+        }
+        _ => {}
+    }
     let login = profiles::login_for(agent).with_context(|| format!("unknown agent '{agent}'"))?;
     let vault = Vault::open(store.root(), agent)?;
     let file = store.agent_home(agent)?.join(login.file);
-    let out = Paint::stdout();
     match action {
         "seal" => {
             vault.set_disabled(false)?;
@@ -259,6 +277,12 @@ pub(crate) fn cmd_vault(store: &Store, action: &str, agent: &str) -> Result<i32>
                 "not sealed yet (sealed on the next `agent do`)".to_string()
             };
             println!("{agent}: {state}");
+            let (sealed, plain) = agentos::sealed::count(store.root());
+            if agentos::sealed::locked(store.root()) {
+                println!("the vault: locked to this machine's TPM ({} encrypted{})", plural(sealed, "file"), if plain > 0 { format!(", {plain} not yet: they are encrypted when next written") } else { String::new() });
+            } else {
+                println!("the vault: not locked to the TPM (`agent vault lock`)");
+            }
         }
     }
     Ok(0)
