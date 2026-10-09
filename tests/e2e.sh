@@ -1008,6 +1008,11 @@ check "...the files" test ! -e "$WORK/packages/e2e-pkg"
 check "...and the agent file" test ! -e "$WORK/pkgcfg/agents/e2e-pkg.toml"
 check "...but not an agent file of yours" test -f "$WORK/pkgcfg/agents/mine.toml"
 check "uninstalling what isn't installed says so" grep -q 'no package named e2e-pkg' <<<"$(pk uninstall e2e-pkg 2>&1)"
+out="$(pk install "$HERE/../examples/packages/echo-agent" --yes 2>&1)"
+check "the example package installs" grep -q 'installed to' <<<"$out"
+out="$(pk do --agent echo-agent hello there 2>&1)"
+check "...and runs in a sandbox, its own files read-only" bash -c 'grep -q "echo-agent was asked: hello there" <<<"$1" && grep -q "  yes" <<<"$1"' _ "$out"
+pk uninstall echo-agent >/dev/null 2>&1
 unset AGENTOS_PACKAGES
 
 section "a registry of agent packages"

@@ -1,0 +1,8 @@
+#!/bin/sh
+# A stand-in agent: it prints its task and shows what its sandbox looks like.
+echo "echo-agent was asked: $*"
+echo "working in: $(pwd)"
+echo "my files are read-only: $(dirname "$0")"
+if touch "$(dirname "$0")/probe" 2>/dev/null; then echo "  (they are not!)"; else echo "  yes"; fi
+echo "network: $(wc -l < /proc/net/route) route lines (1 means loopback only)"
+echo "done" > echo-agent.txt

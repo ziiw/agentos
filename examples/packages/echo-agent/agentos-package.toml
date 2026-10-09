@@ -1,0 +1,16 @@
+# A package is a folder with this file. [agent] is an agent file: what you read
+# when you run `agent install examples/packages/echo-agent` is exactly what
+# agentos will enforce.
+[package]
+name = "echo-agent"
+version = "0.1.0"
+description = "Says what it was asked, and what it can see of its sandbox"
+
+[agent]
+run = ["{pkg}/bin/run", "{task}"]      # {pkg} is where the package is installed
+# allow = ["api.example.com"]          # hosts it needs
+# local = [11434]                      # a model server on your machine
+# ro = ["~/.gitconfig"]                # files it reads
+
+# [agent.secrets]                      # brokered: it only ever sees a placeholder
+# EXAMPLE_API_KEY = "api.example.com"
