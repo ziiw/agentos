@@ -26,5 +26,6 @@ RUN dnf -y install git-core curl python3 util-linux util-linux-script && dnf cle
 
 COPY --from=build /src/target/release/agent /usr/bin/agent
 COPY image/rootfs/ /
+COPY packaging/agentd.service /usr/lib/systemd/user/agentd.service
 
 RUN bootc container lint

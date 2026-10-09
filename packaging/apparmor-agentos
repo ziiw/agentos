@@ -1,0 +1,7 @@
+# Ubuntu 23.10+ blocks unprivileged user namespaces for programs without an
+# AppArmor profile that allows them. This one allows them for agent only.
+abi <abi/4.0>,
+include <tunables/global>
+profile agentos /usr/bin/agent flags=(unconfined) {
+  userns,
+}

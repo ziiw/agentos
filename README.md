@@ -19,7 +19,15 @@ No root, no daemon, no containers: just Linux user namespaces, overlayfs and Lan
 
 ## Install
 
-Linux, kernel 5.11+, Rust 1.85+:
+Linux, kernel 5.11+. As a package (CI builds a `.deb` and an `.rpm` on every push, under Actions → ci; `scripts/package.sh` makes them locally):
+
+```bash
+sudo apt install ./agentos_*.deb     # Ubuntu, Debian: also sets up the AppArmor profile Ubuntu 23.10+ needs
+sudo dnf install ./agentos-*.rpm     # Fedora, RHEL
+agent doctor
+```
+
+Or from source, with Rust 1.85+:
 
 ```bash
 cargo build --release && sudo install -m 0755 target/release/agent /usr/local/bin/agent

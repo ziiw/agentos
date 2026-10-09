@@ -44,6 +44,74 @@ jobs:
       - name: End-to-end tests
         run: REQUIRE_LANDLOCK=1 bash tests/e2e.sh
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.runner }}
+          path: target/release/agent
+          retention-days: 1
+
+  package:
+    # The agent layer as .deb and .rpm, installed for real: the .deb on this
+    # runner, where Ubuntu restricts user namespaces (so the AppArmor profile
+    # the package loads has to work), and the .rpm in a Fedora container.
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-${{ matrix.runner }}
+          path: target/release
+
+      - name: nfpm
+        run: |
+          arch=$(uname -m | sed 's/aarch64/arm64/')
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v2.43.0/nfpm_2.43.0_Linux_${arch}.tar.gz" | sudo tar -xz -C /usr/local/bin nfpm
+          nfpm --version | grep GitVersion
+
+      - name: Build the packages
+        run: |
+          chmod +x target/release/agent
+          scripts/package.sh deb
+          scripts/package.sh rpm
+
+      - name: Install the .deb
+        run: |
+          sudo apt-get install -y ./dist/*.deb
+          dpkg -L agentos
+          test -f /etc/apparmor.d/agentos
+          agent --version
+          agent doctor
+          agent run --no-cwd -- sh -c 'echo "sandboxed as $(id -un)"'
+
+      - name: Remove it again
+        run: |
+          sudo apt-get remove -y agentos
+          test ! -e /usr/bin/agent
+          test ! -e /etc/apparmor.d/agentos
+
+      - name: Install the .rpm on Fedora
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" fedora:42 sh -c '
+            dnf install -y /dist/*.rpm >/dev/null
+            rpm -qi agentos | head -4
+            agent --version
+            dnf remove -y agentos >/dev/null
+            test ! -e /usr/bin/agent'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.runner }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          retention-days: 14
+
   image:
     # The distribution: build the bootc image and run the whole e2e suite
     # inside it, on a real kernel.

@@ -6,7 +6,7 @@ What's in it on top of Fedora bootc 42:
 
 - `/usr/bin/agent`, the same binary CI tests
 - git, curl, python3 and util-linux, which agents and agentos reach for
-- `agentd` as a systemd user service: `systemctl --user enable --now agentd`
+- `agentd` as a systemd user service ([the same unit the packages ship](../packaging/agentd.service)): `systemctl --user enable --now agentd`
 - a login message that explains the basics
 
 Fedora doesn't restrict unprivileged user namespaces and its kernel has Landlock, so `agent doctor` passes out of the box, with no AppArmor profile to install.

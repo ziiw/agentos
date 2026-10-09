@@ -1,0 +1,61 @@
+# The agent layer for Linux as .deb and .rpm: the agent binary, agentd as a
+# systemd user service, and (where Ubuntu restricts user namespaces) the
+# AppArmor profile that allows them for agent. Built by scripts/package.sh,
+# which fills in @GLIBC_MIN@: the newest glibc the binary was linked against.
+name: agentos
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: none
+section: utils
+priority: optional
+maintainer: agentos maintainers <noreply@github.com>
+homepage: https://github.com/ziiw/agentos
+license: Apache-2.0
+description: |
+  Run AI agents as transactions: sandboxed, reversible, audited.
+  Every agent task sees only what you grant, writes to an overlay you review
+  (agent diff, then agent commit or agent rollback), and is recorded in a
+  hash-chained journal the agent can't reach. No root and no daemon: Linux
+  user namespaces, overlayfs and Landlock. agentd, the web console, runs as
+  a user service: systemctl --user enable --now agentd.
+
+contents:
+  - src: dist/stage/agent
+    dst: /usr/bin/agent
+    file_info:
+      mode: 0755
+  - src: packaging/agentd.service
+    dst: /usr/lib/systemd/user/agentd.service
+  - src: packaging/apparmor-agentos
+    dst: /usr/share/agentos/apparmor/agentos
+  - src: README.md
+    dst: /usr/share/doc/agentos/README.md
+  - src: docs/TOUR.md
+    dst: /usr/share/doc/agentos/TOUR.md
+  - src: docs/REFERENCE.md
+    dst: /usr/share/doc/agentos/REFERENCE.md
+  - src: docs/DESIGN.md
+    dst: /usr/share/doc/agentos/DESIGN.md
+
+scripts:
+  postinstall: packaging/postinst.sh
+  postremove: packaging/postrm.sh
+
+overrides:
+  deb:
+    depends:
+      - libc6 (>= @GLIBC_MIN@)
+      - libgcc-s1
+    recommends:
+      - git
+      - curl
+      - util-linux
+  rpm:
+    depends:
+      - glibc >= @GLIBC_MIN@
+      - libgcc
+    recommends:
+      - git-core
+      - curl
+      - util-linux

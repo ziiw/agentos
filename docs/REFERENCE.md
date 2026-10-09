@@ -36,7 +36,16 @@ This is Phase 0 of an agent-native OS. See [docs/DESIGN.md](DESIGN.md) for the f
 
 **As a whole OS:** [image/](../image/README.md) is agentos as a Linux distribution. It's a Fedora bootc image with the runtime built in, atomic updates and rollbacks, bootable as a VM or on hardware. CI builds it and runs the end-to-end suite inside it.
 
-**On an existing Linux machine:**
+**As a package** (Linux, kernel 5.11+): CI builds a `.deb` and an `.rpm` on every push (Actions → ci → the `packages-…` artifacts), or `scripts/package.sh` makes them from a release build (it needs [nfpm](https://nfpm.goreleaser.com)):
+
+```bash
+sudo apt install ./agentos_*.deb
+sudo dnf install ./agentos-*.rpm
+```
+
+They install `agent`, agentd as a user service (`systemctl --user enable --now agentd`) and these docs under `/usr/share/doc/agentos`. On Ubuntu 23.10+ the package also loads the AppArmor profile below for `/usr/bin/agent`, and removes it with the package. They don't pull in anything to run a particular agent: Claude Code and the others come as they usually do. They require at least the glibc the binary was built against (CI builds on Ubuntu 24.04, so that's its glibc), and refuse to install on older systems; CI installs them on Ubuntu 24.04 and Fedora 42.
+
+**On an existing Linux machine, from source:**
 
 Linux, kernel 5.11+, Rust 1.85+:
 
@@ -48,7 +57,7 @@ cargo build --release && sudo install -m 0755 target/release/agent /usr/local/bi
 agent doctor
 ```
 
-**Ubuntu 23.10+** blocks unprivileged user namespaces through AppArmor. Allow them for `agent` only:
+**Ubuntu 23.10+** blocks unprivileged user namespaces through AppArmor (the package takes care of this). Allow them for `agent` only:
 
 ```bash
 sudo tee /etc/apparmor.d/agentos <<'EOF'
@@ -540,5 +549,6 @@ src/main.rs      entry point and dispatch; the rest of the CLI, one file per con
 src/render.rs    output       src/web.rs   agentd's console
 tests/e2e.sh     end-to-end tests (run as a normal user), with tests/fake-claude
 scripts/acceptance.sh   the golden path with real Claude, for a human to run
+scripts/package.sh      .deb and .rpm (nfpm), from packaging/: the unit, the AppArmor profile, install scripts
 .github/workflows/ci.yml   unit + e2e tests on real Ubuntu 24.04 (x86_64, arm64), Landlock required
 ```

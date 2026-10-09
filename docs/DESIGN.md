@@ -92,7 +92,7 @@ supervisor (host)       validates grants, writes the journal, survives Ctrl-C
 | Phase | Deliverable | Proof it works |
 |---|---|---|
 | **0. Transactions** ✅ | Sandbox, overlay transactions, diff/commit/rollback, journal, doctor | An agent's risky change, reviewed and half rolled back |
-| **1. The layer** | `agentd` + the items below, shipped as .deb/.rpm "agent layer for Linux" | Outside developers use it daily |
+| **1. The layer** ◐ | `agentd` + the items below, shipped as .deb/.rpm "agent layer for Linux" (M30) ✅; next: a signed apt/dnf repository | Outside developers use it daily |
 | **2. The distro** ◐ | bootc image with agentos and agentd built in (M11) ✅; next: microVM tier, cloud images, published updates | Teams run agent fleets on it |
 | **3. Desktop** | Wayland session with a separate display per agent (watch, take over), local model service | Early adopters use it as their daily machine |
 | **4. Ecosystem** | Agent packages that declare the permissions they need, registry, remote attestation | Other developers build on it |
@@ -146,6 +146,7 @@ It's verified at three levels:
 | M27: held tool calls: `hold` per tool, per server (`hold = true`) or \[h] when asked queues a call in the task instead of running it; the agent is told it's queued, `agent diff` lists them with arguments, `agent commit`/`push` run them in order from outside the sandbox (stdio or remote server, your credentials), `agent rollback` drops them, a failed one stays held; held calls aren't asked about when tainted | ✅ |
 | M28: corporate proxies: allowed connections can go out through your proxy (`HTTPS_PROXY`/`NO_PROXY`, or `[network] proxy` in your config only) instead of straight to the host, `CONNECT` with its login from the address, reached outside the sandbox so the agent never sees it; the hop is journaled, a proxy that says no is explained; hosts only the proxy can resolve work, ones resolving to private addresses are still refused; a CONNECT target with odd characters is refused before it's journaled or shown | ✅ |
 | M29: keys from your keychain: `[secret_commands]` (your config only) names a command that prints a key when your environment doesn't have it (`secret-tool`, `pass`, `op read`…); used for `[secrets]`, `--secret`, an agent's own keys and MCP servers' `env` and `token`; run only when a task can use it, as you and outside the sandbox, 30-second limit; a failure is a warning that never includes the output | ✅ |
+| M30: the layer as packages: `.deb` and `.rpm` (one nfpm file, `scripts/package.sh`) with `agent`, agentd as a systemd user unit (shared with the image), the docs, and on Ubuntu 23.10+ an install script that loads the AppArmor profile for `/usr/bin/agent` and takes it out with the package; CI builds them on x86_64 and arm64, installs the .deb on the Ubuntu 24.04 runner (the profile has to work: `agent doctor`, a sandboxed command), the .rpm on Fedora 42, removes both, and keeps them as artifacts | ✅ built and installed in clean Ubuntu 24.04 and Fedora 42 containers; CI job `package` |
 | M11: the distro: Fedora bootc image with agentos built in, e2e run inside it in CI, qcow2 on demand | ✅ e2e green inside the image; the qcow2 boots in QEMU (own kernel 6.19) and passes the whole e2e suite (179/179, Landlock and limits enforced) |
 
 ### Phase 1 backlog, in order
