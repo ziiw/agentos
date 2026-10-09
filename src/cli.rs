@@ -159,6 +159,11 @@ pub(crate) enum Command {
         #[arg(long, value_name = "HEX")]
         digest: Option<String>,
     },
+    /// For whoever publishes a registry: make a signing key, sign an index
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
     /// The packages in your registry, matching TEXT if you give some
     Search { text: Option<String> },
     /// Remove an installed agent package
@@ -227,6 +232,19 @@ pub(crate) enum Command {
     /// the gateway to one of yours
     #[command(hide = true)]
     Mcp { server: Option<String> },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RegistryCommand {
+    /// Make a publisher's signing key (a new file, private to you) and print its public half
+    Keygen { file: PathBuf },
+    /// Sign an index.json: writes index.json.sig next to it
+    Sign {
+        index: PathBuf,
+        /// The key `agent registry keygen` made
+        #[arg(long, value_name = "FILE")]
+        key: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

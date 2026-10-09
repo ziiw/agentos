@@ -102,6 +102,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Attest { task, verify, journal, trust, public } => cmd_attest(&store, task.as_deref(), verify, journal, trust, public),
         Command::Install { dir, yes, digest } => cmd_install(&store, dir, yes, digest),
         Command::Search { text } => cmd_search(&store, text.as_deref()),
+        Command::Registry { command } => cmd_registry(command),
         Command::Uninstall { name } => cmd_uninstall(&name),
         Command::Packages => cmd_packages(),
         Command::Approvals { revoke } => cmd_approvals(&store, revoke),

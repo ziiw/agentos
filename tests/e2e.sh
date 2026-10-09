@@ -1088,6 +1088,27 @@ JSON
   "$AGENT" trust >/dev/null 2>&1
   check "a project can't choose where your agents come from" test $? -eq 2
   rm -f .agentos.toml
+  # A signed index: the publisher's key in your config, and the index has to carry its signature.
+  PUB="$("$AGENT" registry keygen "$WORK/publisher.key" | sed -n 's/^  public key  \([0-9a-f]*\)$/\1/p')"
+  check "a publisher makes a signing key" test -n "$PUB"
+  check "agent registry sign writes index.json.sig next to the index" grep -q 'signed' <<<"$("$AGENT" registry sign "$REG/index.json" --key "$WORK/publisher.key")"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = "%s"\n' "$RPORT" "$PUB" > "$WORK/regcfg/signed.toml"
+  rs() { AGENTOS_CONFIG="$WORK/regcfg/signed.toml" "$AGENT" "$@"; }
+  check "with the publisher's key, a signed index is read" grep -q 'e2e-reg' <<<"$(rs search 2>&1)"
+  check "...and its packages install" grep -q 'installed to' <<<"$(rs install e2e-reg --yes 2>&1)"
+  cp "$REG/index.json" "$WORK/index.good"
+  sed -i 's/A package that comes from a registry/A package that was edited/' "$REG/index.json"
+  check "an index edited after signing is refused, unread" grep -q "its signature isn't the key's: nothing was read" <<<"$(rs search 2>&1)"
+  cp "$WORK/index.good" "$REG/index.json"
+  mv "$REG/index.json.sig" "$WORK/index.sig.bak"
+  check "an index without its signature is refused" grep -q 'must be signed by the key in your config' <<<"$(rs search 2>&1)"
+  mv "$WORK/index.sig.bak" "$REG/index.json.sig"
+  OTHER="$("$AGENT" registry keygen "$WORK/other.key" | sed -n 's/^  public key  \([0-9a-f]*\)$/\1/p')"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = "%s"\n' "$RPORT" "$OTHER" > "$WORK/regcfg/other.toml"
+  check "another publisher's key refuses it" grep -q "its signature isn't the key's" <<<"$(AGENTOS_CONFIG="$WORK/regcfg/other.toml" "$AGENT" search 2>&1)"
+  check "keygen never overwrites a key" bash -c '! "$@" 2>/dev/null' _ "$AGENT" registry keygen "$WORK/publisher.key"
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = "abc"\n' "$RPORT" > "$WORK/regcfg/badkey.toml"
+  check "a key that isn't a key is a config error" grep -q 'expected an Ed25519 public key' <<<"$(AGENTOS_CONFIG="$WORK/regcfg/badkey.toml" "$AGENT" search 2>&1)"
   unset AGENTOS_PACKAGES
   kill "$REG_PID" 2>/dev/null; wait "$REG_PID" 2>/dev/null
 else

@@ -534,6 +534,7 @@ witness = "https://witness.example/receipts"
 
 [registry]                            # your file only: where `agent install NAME` looks
 url = "https://agents.example.com/index.json"
+key = "…"                             # optional: the publisher's key, which must have signed the index
 ```
 
 - **`~/.config/agentos/config.toml` is yours.** It applies to every task. Only this file may define `[secrets]`, `[mcp]` and `[prices]`; they're brokered whenever the variable has a value (in your environment, or from its `[secret_commands]` entry) and the task uses the allowlist network.
@@ -653,6 +654,21 @@ agent install local-aider     # fetch, unpack, then the same review as above
 
 The tarball (32 MB at most) is checked against the `sha256` the index gives, unpacked into a folder of its own, and reviewed like any package: you read what it asks for and answer. An index entry may also give the package's `digest`, and then the package must match it. Symlinks, hard links and members that reach outside the folder are refused. The index is as trustworthy as the host you fetch it from: what the hash and the review protect is that the tarball is the one that index named, and that nothing is installed that you haven't read. A registry has to be https (or this machine, for testing), and only your own config can name one.
 
+**Signed indexes.** To not depend on the host alone, give the publisher's key:
+
+```toml
+[registry]
+url = "https://agents.example.com/index.json"
+key = "9a1f…64 hex characters…"           # the publisher's Ed25519 public key
+```
+
+agentos then also fetches `index.json.sig` and refuses an index that key didn't sign, before reading a word of it; the index's hashes then vouch for the tarballs. A publisher makes a key once, and signs each version of the index:
+
+```bash
+agent registry keygen publisher.key          # prints the public key to hand out; keep the file private
+agent registry sign index.json --key publisher.key     # writes index.json.sig next to it
+```
+
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 
 ## Limits (honest list)
@@ -697,7 +713,7 @@ src/mcp.rs       `agent mcp`: agentos's MCP server for agents, and the gateway t
 src/oauth.rs     signing in to remote MCP servers (`agent connect`), token refresh
 src/policy.rs    your rules (Cedar): answers given in advance
 src/packages.rs  agent packages: review, install, check before every run
-src/registry.rs  a registry of them: index.json, tarballs checked by hash
+src/registry.rs  a registry of them: index.json (signed, if you like), tarballs checked by hash
 src/taint.rs     whether a task has read untrusted input
 src/held.rs      held tool calls and API requests (the outbox for tools and APIs)
 src/main.rs      entry point and dispatch; the rest of the CLI, one file per concern:

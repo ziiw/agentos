@@ -100,6 +100,8 @@ struct ConfigFile {
 struct RegistrySection {
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,6 +211,8 @@ pub struct Settings {
     pub witness: Option<String>,
     /// The index `agent install NAME` and `agent search` read.
     pub registry: Option<String>,
+    /// The publisher's key the index must be signed by, if you gave one.
+    pub registry_key: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -342,12 +346,16 @@ fn apply(s: &mut Settings, file: ConfigFile, path: &Path, project: Option<&Path>
         bail!("{shown}: [journal] only belongs in your own config, never in a project's");
     }
     // …or where your agents come from.
-    if project.is_some() && file.registry.url.is_some() {
+    if project.is_some() && (file.registry.url.is_some() || file.registry.key.is_some()) {
         bail!("{shown}: [registry] only belongs in your own config, never in a project's");
     }
     if let Some(url) = &file.registry.url {
         crate::registry::valid_url(url).map_err(|e| anyhow::anyhow!("{shown}: [registry] url: {e}"))?;
         s.registry = Some(url.clone());
+    }
+    if let Some(key) = &file.registry.key {
+        crate::registry::valid_key(key).map_err(|e| anyhow::anyhow!("{shown}: [registry] key: {e}"))?;
+        s.registry_key = Some(key.to_ascii_lowercase());
     }
     if let Some(url) = &file.journal.witness {
         crate::attest::valid_witness(url).map_err(|e| anyhow::anyhow!("{shown}: [journal] witness: {e}"))?;
