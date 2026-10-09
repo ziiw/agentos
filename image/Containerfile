@@ -24,7 +24,11 @@ FROM quay.io/fedora/fedora-bootc:42
 # python3, and util-linux for unshare (and script(1), packaged separately).
 # cloud-init applies a cloud's user data at first boot (users, SSH keys) and
 # does nothing on a machine that has none.
-RUN dnf -y install git-core curl python3 util-linux util-linux-script cloud-init && dnf clean all
+# Xvfb and xdotool are for `agent do --display`: a screen of its own for an agent
+# that drives a graphical program, which you can watch and act on. The three small
+# X tools are what the end-to-end tests draw with.
+RUN dnf -y install git-core curl python3 util-linux util-linux-script cloud-init \
+        xorg-x11-server-Xvfb xdotool xmessage xwininfo xev xdpyinfo && dnf clean all
 
 COPY --from=build /src/target/release/agent /usr/bin/agent
 COPY image/rootfs/ /

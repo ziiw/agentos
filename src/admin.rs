@@ -544,6 +544,14 @@ pub(crate) fn cmd_registry(command: RegistryCommand) -> Result<i32> {
             println!("  public key  {public}");
             println!("  {}", out.dim("readers put it in their config: [registry] key = \"…\"; you sign each version of the index with `agent registry sign`"));
         }
+        RegistryCommand::Pack { dir, output } => {
+            let (tarball, entry) = agentos::registry::pack(&dir, &output)?;
+            println!("{} packed {} {} → {}", out.green("✓"), dir.display(), entry.version, display_path(&tarball));
+            println!("  sha256  {}", entry.sha256);
+            println!("  digest  {}", entry.digest.as_deref().unwrap_or_default());
+            println!("  {}", out.dim(format!("index: {}", display_path(&output.join("index.json")))));
+            println!("  {}", out.dim("next: agent registry sign the index, then put the folder on a web server"));
+        }
         RegistryCommand::Sign { index, key } => {
             let signature = agentos::registry::sign(&fs::read(&index).with_context(|| format!("read {}", index.display()))?, &key)?;
             let sig_file = PathBuf::from(format!("{}.sig", index.display()));

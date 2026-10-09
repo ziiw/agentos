@@ -246,6 +246,14 @@ pub(crate) enum Command {
 pub(crate) enum RegistryCommand {
     /// Make a publisher's signing key (a new file, private to you) and print its public half
     Keygen { file: PathBuf },
+    /// Pack a package folder for a registry: NAME-VERSION.tar.gz and its entry in index.json
+    Pack {
+        /// A folder with an agentos-package.toml
+        dir: PathBuf,
+        /// Where the tarball and index.json go (default: the current folder)
+        #[arg(short, long, value_name = "DIR", default_value = ".")]
+        output: PathBuf,
+    },
     /// Sign an index.json: writes index.json.sig next to it
     Sign {
         index: PathBuf,

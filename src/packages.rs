@@ -298,17 +298,9 @@ pub fn install(review: &Review, source: &Path, home: &Path, agents_dir: &Path) -
     if staging.exists() {
         crate::util::force_remove_dir_all(&staging)?;
     }
-    for (rel, info) in &review.files {
-        let (from, to) = (source.join(rel), staging.join(rel));
-        fs::create_dir_all(to.parent().unwrap_or(&staging))?;
-        let data = fs::read(&from).with_context(|| format!("read {}", from.display()))?;
-        // The package could change between the review and now.
-        if sha256(&data) != info.sha256 {
-            crate::util::force_remove_dir_all(&staging)?;
-            bail!("{rel} changed while it was being installed; nothing was installed");
-        }
-        fs::write(&to, &data)?;
-        fs::set_permissions(&to, fs::Permissions::from_mode(if info.exec { 0o755 } else { 0o644 }))?;
+    if let Err(e) = copy_files(review, source, &staging) {
+        let _ = crate::util::force_remove_dir_all(&staging);
+        return Err(e);
     }
     let text = render_agent(review, &target)?;
     let record = Record {
@@ -331,6 +323,23 @@ pub fn install(review: &Review, source: &Path, home: &Path, agents_dir: &Path) -
     fs::write(&tmp, &text)?;
     fs::rename(&tmp, &agent_file)?;
     Ok(target)
+}
+
+/// Copies the reviewed files of `source` into `to`, checking each against the
+/// review (the package could change between the review and now), with the
+/// modes an install gives them.
+pub fn copy_files(review: &Review, source: &Path, to: &Path) -> Result<()> {
+    for (rel, info) in &review.files {
+        let (from, dest) = (source.join(rel), to.join(rel));
+        fs::create_dir_all(dest.parent().unwrap_or(to))?;
+        let data = fs::read(&from).with_context(|| format!("read {}", from.display()))?;
+        if sha256(&data) != info.sha256 {
+            bail!("{rel} changed while it was being copied; nothing was done");
+        }
+        fs::write(&dest, &data)?;
+        fs::set_permissions(&dest, fs::Permissions::from_mode(if info.exec { 0o755 } else { 0o644 }))?;
+    }
+    Ok(())
 }
 
 /// What differs from what was approved, one problem a line (none: it's intact).

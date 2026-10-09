@@ -8,6 +8,7 @@ What's in it on top of Fedora bootc 42:
 - git, curl, python3 and util-linux, which agents and agentos reach for
 - `agentd` as a systemd user service ([the same unit the packages ship](../packaging/agentd.service)): `systemctl --user enable --now agentd`
 - cloud-init, so a cloud's user data (users, SSH keys) is applied at first boot
+- Xvfb and xdotool, so `agent do --display` works out of the box: a screen of its own for an agent that drives a graphical program, watched and taken over from agentd
 - a login message that explains the basics
 
 Fedora doesn't restrict unprivileged user namespaces and its kernel has Landlock, so `agent doctor` passes out of the box, with no AppArmor profile to install.

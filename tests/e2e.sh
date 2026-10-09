@@ -840,7 +840,9 @@ check "...and its change is held for review" grep -Eq '^  M  .*lib/lib.txt' <<<"
 check "what you deny stays invisible" grep -q 'nope: .*No such file' <<<"$out"
 check "...and the agent is told" grep -q 'Denied: the user said no' <<<"$out"
 check "credentials are refused without asking you" grep -q 'Not possible: .*holds credentials' <<<"$out"
-check "...and the question never reached you" lacks '.ssh' "$(cat "$WORK/questions")"
+# (If this ever fails in CI, say what was asked: it failed once on an arm runner, unexplained.)
+if grep -q -- '.ssh' "$WORK/questions" 2>/dev/null; then echo "    questions seen: $(head -c 1500 "$WORK/questions")"; fi
+check "...and the question never reached you" lacks '.ssh' "$(cat "$WORK/questions" 2>/dev/null)"
 check "folders outside your home can be added read-only" grep -q 'outside: outside' <<<"$out"
 if grep -q '"landlock":"enforced' "$events" || grep -q '"landlock":"partially' "$events"; then
   check "...but with Landlock, not writable mid-task (with how to rerun)" grep -q 'Not possible: .*rerun the task with --rw' <<<"$out"
@@ -1319,6 +1321,30 @@ JSON
   check "keygen never overwrites a key" bash -c '! "$@" 2>/dev/null' _ "$AGENT" registry keygen "$WORK/publisher.key"
   printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\nkey = "abc"\n' "$RPORT" > "$WORK/regcfg/badkey.toml"
   check "a key that isn't a key is a config error" grep -q 'expected an Ed25519 public key' <<<"$(AGENTOS_CONFIG="$WORK/regcfg/badkey.toml" "$AGENT" search 2>&1)"
+  # The publisher's side: pack a package, serve the folder, install it by name.
+  cp -r "$HERE/../examples/packages/echo-agent" "$WORK/pack-src"
+  PUBDIR="$WORK/published"
+  out="$("$AGENT" registry pack "$WORK/pack-src" -o "$PUBDIR" 2>&1)"
+  check "agent registry pack makes a tarball and an index entry" test -f "$PUBDIR/echo-agent-0.1.0.tar.gz" -a -f "$PUBDIR/index.json"
+  PACKED="$(sed -n 's/^  digest  \([0-9a-f]*\)$/\1/p' <<<"$out")"
+  check "...with the package's digest, which agent install shows too" grep -q "digest  ${PACKED:0:16}" <<<"$("$AGENT" install "$WORK/pack-src" </dev/null 2>&1)"
+  check "...and the program is executable in the tarball, under the package's name" bash -c 'tar tvzf "$1" | grep -Eq "^-rwxr-xr-x .*echo-agent/bin/run$"' _ "$PUBDIR/echo-agent-0.1.0.tar.gz"
+  first="$(sha256sum "$PUBDIR/echo-agent-0.1.0.tar.gz" | cut -d' ' -f1)"
+  sleep 1; touch "$WORK/pack-src/bin/run" "$WORK/pack-src/agentos-package.toml"
+  "$AGENT" registry pack "$WORK/pack-src" -o "$PUBDIR" >/dev/null 2>&1
+  check "the same files make the same tarball" test "$(sha256sum "$PUBDIR/echo-agent-0.1.0.tar.gz" | cut -d' ' -f1)" = "$first"
+  printf '# edited\n' >> "$WORK/pack-src/bin/run"
+  "$AGENT" registry pack "$WORK/pack-src" -o "$PUBDIR" >/dev/null 2>&1
+  check "...and other files, another" test "$(sha256sum "$PUBDIR/echo-agent-0.1.0.tar.gz" | cut -d' ' -f1)" != "$first"
+  PPORT=$((20000 + RANDOM % 10000))
+  python3 -m http.server "$PPORT" --bind 127.0.0.1 --directory "$PUBDIR" >/dev/null 2>&1 &
+  PUB_PID=$!
+  for _ in $(seq 50); do curl -sf -m 2 "http://127.0.0.1:$PPORT/index.json" >/dev/null 2>&1 && break; sleep 0.1; done
+  printf '[registry]\nurl = "http://127.0.0.1:%s/index.json"\n' "$PPORT" > "$WORK/regcfg/pub.toml"
+  out="$(AGENTOS_CONFIG="$WORK/regcfg/pub.toml" "$AGENT" install echo-agent --yes 2>&1)"
+  check "a package packed here installs by name from wherever the folder is served" grep -q 'installed to' <<<"$out"
+  check "...and runs" grep -q 'echo-agent was asked: from the registry' <<<"$(AGENTOS_CONFIG="$WORK/regcfg/pub.toml" "$AGENT" do --agent echo-agent from the registry 2>&1)"
+  kill "$PUB_PID" 2>/dev/null; wait "$PUB_PID" 2>/dev/null
   unset AGENTOS_PACKAGES
   kill "$REG_PID" 2>/dev/null; wait "$REG_PID" 2>/dev/null
 else

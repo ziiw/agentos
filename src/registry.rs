@@ -93,6 +93,61 @@ fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2).filter_map(|i| u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()).collect()
 }
 
+/// Packs the package in `source` for a registry: `out/NAME-VERSION.tar.gz` (the
+/// same bytes every time for the same files), and its entry in `out/index.json`
+/// with the tarball's hash and the package's digest. Nothing leaves this machine:
+/// putting `out/` on a web server is the publisher's step.
+pub fn pack(source: &Path, out: &Path) -> Result<(PathBuf, Entry)> {
+    let review = crate::packages::review(source)?;
+    fs::create_dir_all(out)?;
+    let work = out.join(format!(".pack-{}", crate::util::random_hex(6)?));
+    let result = (|| -> Result<(PathBuf, Entry)> {
+        crate::packages::copy_files(&review, source, &work.join(&review.name))?;
+        let tar = work.join("package.tar");
+        let status = Command::new("tar")
+            .args(["--sort=name", "--mtime=@0", "--owner=0", "--group=0", "--numeric-owner", "-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&work)
+            .arg(&review.name)
+            .output()
+            .context("run tar")?;
+        if !status.status.success() {
+            bail!("tar: {}", String::from_utf8_lossy(&status.stderr).lines().next().unwrap_or("failed"));
+        }
+        let status = Command::new("gzip").args(["-n", "-9", "-f"]).arg(&tar).output().context("run gzip")?;
+        if !status.status.success() {
+            bail!("gzip: {}", String::from_utf8_lossy(&status.stderr).lines().next().unwrap_or("failed"));
+        }
+        let file_name = format!("{}-{}.tar.gz", review.name, review.version);
+        let tarball = out.join(&file_name);
+        fs::rename(work.join("package.tar.gz"), &tarball)?;
+        let entry = Entry {
+            version: review.version.clone(),
+            description: review.description.clone(),
+            url: file_name,
+            sha256: hex(&Sha256::digest(&fs::read(&tarball)?)),
+            digest: Some(review.digest.clone()),
+        };
+        let index_path = out.join("index.json");
+        let mut index: serde_json::Value = match fs::read(&index_path) {
+            Ok(raw) => serde_json::from_slice(&raw).with_context(|| format!("{}: not a registry index", index_path.display()))?,
+            Err(_) => serde_json::json!({ "packages": {} }),
+        };
+        index["packages"][&review.name] = serde_json::json!({
+            "version": entry.version,
+            "description": entry.description,
+            "url": entry.url,
+            "sha256": entry.sha256,
+            "digest": entry.digest,
+        });
+        fs::write(&index_path, serde_json::to_vec_pretty(&index)? )?;
+        Ok((tarball, entry))
+    })();
+    let _ = crate::util::force_remove_dir_all(&work);
+    result
+}
+
 /// A publisher's public key as written in a config: 32 bytes, hex.
 pub fn valid_key(key: &str) -> Result<(), String> {
     if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {

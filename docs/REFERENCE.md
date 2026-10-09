@@ -685,9 +685,12 @@ key = "9a1f…64 hex characters…"           # the publisher's Ed25519 public k
 agentos then also fetches `index.json.sig` and refuses an index that key didn't sign, before reading a word of it; the index's hashes then vouch for the tarballs. A publisher makes a key once, and signs each version of the index:
 
 ```bash
+agent registry pack ./my-agent -o site/      # site/my-agent-0.1.0.tar.gz, and its entry in site/index.json
 agent registry keygen publisher.key          # prints the public key to hand out; keep the file private
-agent registry sign index.json --key publisher.key     # writes index.json.sig next to it
+agent registry sign site/index.json --key publisher.key     # writes site/index.json.sig next to it
 ```
+
+`pack` reviews the package like `install` does and makes the same tarball for the same files (sorted, no dates or owners), so you can check what you publish; the index entry carries the tarball's hash and the package's digest. Putting `site/` on a web server is your step; agentos only makes the files.
 
 To check the whole path with your real login, run `scripts/acceptance.sh`: `scripts/dev.sh exec 'bash /src/scripts/acceptance.sh'` on macOS.
 
