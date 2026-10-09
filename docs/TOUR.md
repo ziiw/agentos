@@ -1,8 +1,8 @@
 # A tour of agentos, to do yourself
 
-About 90 minutes, in ten stops. Each stop says what to type, what you should see, and what to judge. Keep a scratch file open and write down every moment you hesitated, were confused, or wished it did something else. That list is worth more than any pass or fail.
+About two hours, in fourteen stops. Each stop says what to type, what you should see, and what to judge. Keep a scratch file open and write down every moment you hesitated, were confused, or wished it did something else. That list is worth more than any pass or fail.
 
-Stops 1 to 3 need no accounts. Stops 4 to 7 need a Claude login. Stop 8 needs nothing new. Stop 9 needs an OpenAI or Gemini key and is optional. Stop 10 is for a remote MCP server you actually use.
+Stops 1 to 3 need no accounts. Stops 4 to 7 need a Claude login. Stop 8 needs nothing new. Stop 9 needs an OpenAI or Gemini key and is optional. Stop 10 is for a remote MCP server you actually use. Stops 11 to 14 need nothing new (stop 12 needs the internet).
 
 ## 0. Get a Linux shell with `agent` in it
 
@@ -238,7 +238,7 @@ export GEMINI_API_KEY=...        # or OPENAI_API_KEY for codex
 cd ~/app && agent do --agent gemini --budget 1usd "add a docstring to greet()"
 ```
 
-These recipes have never been run end to end. Expect to learn something: a host that needs allowing, a flag that changed, a login mode that bypasses the key. Write down exactly what failed. Check `agent log` for the metered cost, and whether it's priced (add a `[prices]` entry if it counts at the highest rate).
+These two recipes have never been run end to end (Aider's has: see stop 11). Expect to learn something: a host that needs allowing, a flag that changed, a login mode that bypasses the key. Write down exactly what failed. Check `agent log` for the metered cost, and whether it's priced (add a `[prices]` entry if it counts at the highest rate).
 
 ## 10. A real remote MCP server (optional)
 
@@ -256,6 +256,58 @@ agent do "list my open issues"
 ```
 
 Over Docker the browser's return address won't reach the container: paste the final address back when asked. This is the least tested path in the project, so every rough edge here matters. Then check that remote results taint the task (stop 8), and that `agent connect linear --forget` really forgets.
+
+## 11. A model server on your machine
+
+A local model server (Ollama, llama.cpp) listens on your loopback, which the sandbox can't see. Give the task that one port. Any HTTP server will stand in for it:
+
+```bash
+python3 -m http.server 8899 --bind 127.0.0.1 --directory /etc >/dev/null 2>&1 &
+cd ~/app
+agent run --local 8899 -- curl -s http://127.0.0.1:8899/hostname     # the server's answer
+agent log                                                            # the connection, with its bytes
+agent run -- curl -s -m 3 http://127.0.0.1:8899/hostname            # no --local: nothing is there (curl fails)
+kill %1
+```
+
+With a real model server, `examples/agents/aider-local.toml` is the recipe, and `scripts/verify-aider.sh` runs the real Aider against a stand-in. Judge: would you know to reach for `--local`? Is it clear nothing else on your loopback is reachable?
+
+## 12. API writes wait
+
+```bash
+cd ~/app
+agent run --hold postman-echo.com -- sh -c 'curl -s -X POST -d "note=from the agent" https://postman-echo.com/post | head -c 200; echo; curl -s "https://postman-echo.com/get?read=ok" | head -c 120'
+agent diff          # the held POST, with a preview of its body
+agent commit        # sent now, from outside the sandbox
+```
+
+The agent was told its POST was queued and the read went through. Judge: is the `202` reply clear enough to an agent that expected a result? Is the `diff` entry enough to decide?
+
+## 13. An agent you install
+
+```bash
+agent install /src/examples/packages/echo-agent       # reads what it asks for, then asks you
+agent do --agent echo-agent "hello"
+agent packages
+echo '# edited' >> ~/.local/share/agentos-packages/echo-agent/bin/run
+agent do --agent echo-agent "again"                   # refuses: it changed since you approved it
+agent uninstall echo-agent
+```
+
+Judge: could you decide from the review alone? What would you want it to say that it doesn't?
+
+## 14. A signed receipt
+
+```bash
+cd ~/app && agent run -- true
+T="$(ls -td ~/.local/share/agentos/tasks/*/ | head -1)"
+agent attest --verify "${T}receipt.json" --journal "${T}events.jsonl"
+agent attest --public                                  # this machine's key
+sed -i 's/"exit_code":0/"exit_code":9/' "${T}events.jsonl"
+agent attest --verify "${T}receipt.json" --journal "${T}events.jsonl"     # now it fails
+```
+
+Judge: is it clear what a receipt proves, and what it doesn't until you keep it somewhere you can't rewrite (a witness, `[journal] witness`)?
 
 ## Wrap-up
 
