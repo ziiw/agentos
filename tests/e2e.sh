@@ -1002,7 +1002,9 @@ mcp request_path_access '{"path":"$WORK/outside","access":"read","reason":"outsi
 echo "outside: \$(cat $WORK/outside/file 2>&1)"
 mcp request_path_access '{"path":"$WORK/outside","access":"write","reason":"and change it"}'
 mcp request_network_access '{"host":"example.org","reason":"fetch the spec"}'
-curl -sS -m 20 -o /dev/null -w 'example.org: HTTP%{http_code}\n' https://example.org
+# (example.org is a public service: a fumbled request is made again)
+for n in 1 2 3; do r="\$(curl -sS -m 20 -o /dev/null -w 'example.org: HTTP%{http_code}' https://example.org 2>&1)"; case "\$r" in *HTTP200) break;; esac; sleep 1; done
+echo "\$r"
 mcp sandbox_info '{}'
 SH
 out="$("$AGENT" run --ask --allow example.com -- sh asks.sh 2>&1 </dev/null)"
