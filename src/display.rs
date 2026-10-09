@@ -34,6 +34,78 @@ pub const DEFAULT_SIZE: &str = "1280x800";
 const FRAMEBUFFER: &str = "fb/Xvfb_screen0";
 /// Kept in the task when it ends.
 pub const FINAL: &str = "screen.png";
+/// Which display a running task's screen is, and how big.
+const INFO: &str = "display.json";
+
+/// A task's screen, as recorded when it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Info {
+    pub number: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn info(dir: &Path) -> Option<Info> {
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(dir.join(INFO)).ok()?).ok()?;
+    let field = |k: &str| v[k].as_u64().and_then(|n| u32::try_from(n).ok());
+    Some(Info { number: field("number")?, width: field("width")?, height: field("height")? })
+}
+
+/// Whether the task's screen is up right now.
+pub fn is_up(dir: &Path) -> bool {
+    dir.join(FRAMEBUFFER).is_file()
+}
+
+/// Acts on a task's screen as a person would: a click, a key, some typing
+/// (`xdotool`, run against the task's display with its cookie).
+pub fn act(dir: &Path, action: &Input) -> Result<()> {
+    let info = info(dir).context("this task has no screen")?;
+    let xdotool = crate::profiles::find_on_path("xdotool").context("acting on the screen needs xdotool (apt install xdotool, dnf install xdotool)")?;
+    let mut cmd = Command::new(xdotool);
+    match action {
+        Input::Click { x, y, button } => {
+            if *x >= info.width || *y >= info.height {
+                bail!("({x}, {y}) is outside the {}x{} screen", info.width, info.height);
+            }
+            if !(1..=5).contains(button) {
+                bail!("mouse buttons are 1 to 5");
+            }
+            cmd.args(["mousemove", "--sync", &x.to_string(), &y.to_string(), "click", &button.to_string()]);
+        }
+        Input::Key(key) => {
+            if key.is_empty() || key.len() > 40 || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+') {
+                bail!("a key is a name like Return, Tab, ctrl+c or F5");
+            }
+            cmd.args(["key", "--clearmodifiers", key]);
+        }
+        Input::Type(text) => {
+            if text.is_empty() || text.chars().count() > 500 || text.contains('\0') {
+                bail!("type between 1 and 500 characters at a time");
+            }
+            cmd.args(["type", "--delay", "8", "--clearmodifiers", "--", text]);
+        }
+    }
+    let out = cmd
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("DISPLAY", format!(":{}", info.number))
+        .env("XAUTHORITY", dir.join("xauth"))
+        .stdin(Stdio::null())
+        .output()
+        .context("run xdotool")?;
+    if !out.status.success() {
+        bail!("xdotool: {}", String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("failed"));
+    }
+    Ok(())
+}
+
+/// What a person does at a screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    Click { x: u32, y: u32, button: u32 },
+    Key(String),
+    Type(String),
+}
 
 /// `1280x800`: wide enough to be useful, small enough that a screenshot is cheap.
 pub fn parse_size(s: &str) -> Result<(u32, u32)> {
@@ -131,6 +203,8 @@ impl Display {
             }
         };
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+        // For whoever acts on this screen from another process (the console).
+        fs::write(dir.join(INFO), serde_json::json!({ "number": number, "width": size.0, "height": size.1 }).to_string())?;
         Ok(Display { child, dir: dir.to_path_buf(), number, socket, xauth, size, watcher: None, latest: Arc::default() })
     }
 

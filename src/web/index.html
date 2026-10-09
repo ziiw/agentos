@@ -55,13 +55,17 @@
   .output { white-space: pre-wrap; }
   .given { margin-top: 6px; } .given button { min-height: 32px; padding: 4px 10px; margin-left: auto; }
   pre.live { max-height: 320px; overflow-y: auto; }
+  .screen { display: block; width: 100%; height: auto; margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; background: #000; }
+  #screenbox { outline: none; }
+  #screenbox.takeover .screen { border-color: var(--warn); cursor: crosshair; }
+  #screenbox.takeover:focus .screen { box-shadow: 0 0 0 2px var(--warn); }
   h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 0; font-weight: 600; }
   .new label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
   .new select, .new textarea, .new input { font: inherit; font-size: 15px; width: 100%; color: var(--text); background: var(--bg);
                                           border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
   .new textarea { min-height: 96px; resize: vertical; }
   .new .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0 10px; }
-  .new .error { color: var(--bad); font-size: 14px; margin-top: 10px; }
+  .error { color: var(--bad); font-size: 14px; margin-top: 10px; }
   header button { margin-left: auto; }
   header .dot { margin-left: 8px; }
   header { flex-wrap: wrap; row-gap: 8px; }
@@ -266,8 +270,31 @@
     const given = (t.given || []).length ? `<h3>Granted while it runs</h3>` + t.given.map((g) => `<div class="meta given">
         <span>${esc(g.kind)}</span><strong>${esc(g.target)}</strong>${g.access ? `<span>${esc(g.access)}</span>` : ""}
         ${g.revoked ? `<span>taken back</span>` : `<button class="danger" data-revoke="${esc(g.target)}" data-id="${id}">Take back</button>`}</div>`).join("") : "";
-    el.innerHTML = `${actions}<div id="result"></div>${given}${output}<h3>Changes</h3><pre>${colorDiff(t.diff)}</pre><h3>Journal</h3><pre>${esc(t.log)}</pre>`;
+    const screen = t.screen
+      ? `<h3>Screen</h3><div class="row" id="screenbar">${t.screen.live ? `<button data-takeover="${id}">${takeover === id ? "Stop acting on it" : "Act on it"}</button>` : ""}<span class="meta">${t.screen.width}×${t.screen.height}${t.screen.live ? "" : ", as it ended"}</span></div><div id="screenbox" tabindex="0" class="${takeover === id ? "takeover" : ""}" data-w="${t.screen.width}" data-h="${t.screen.height}" data-id="${id}"></div>`
+      : "";
+    el.innerHTML = `${actions}<div id="result"></div>${given}${output}${screen}<h3>Changes</h3><pre>${colorDiff(t.diff)}</pre><h3>Journal</h3><pre>${esc(t.log)}</pre>`;
     const live = $("live"); if (live) live.scrollTop = live.scrollHeight;
+    if (t.screen) showScreen(id);
+  }
+
+  // A task's screen: the latest picture is shown at once, then replaced as a fresh one arrives.
+  // (Fetched with the token in a header, so it never appears in a URL.)
+  let screenUrl = null, screenFor = null, takeover = null, inputs = Promise.resolve();
+  async function showScreen(id) {
+    if (screenFor !== id) { if (screenUrl) URL.revokeObjectURL(screenUrl); screenUrl = null; screenFor = id; }
+    const show = (url) => { const box = $("screenbox"); if (box) box.innerHTML = `<img class="screen" src="${url}" alt="the task's screen" draggable="false">`; };
+    if (screenUrl) show(screenUrl);
+    const res = await fetch("/api/tasks/" + id + "/screen.png?w=960", { headers: { Authorization: "Bearer " + token } }).catch(() => null);
+    if (!res || !res.ok) { if (!screenUrl && $("screenbox")) $("screenbox").innerHTML = `<p class="empty">No picture yet.</p>`; return; }
+    const url = URL.createObjectURL(await res.blob());
+    if (screenUrl) URL.revokeObjectURL(screenUrl);
+    screenUrl = url;
+    show(url);
+  }
+  // Something done at the screen, in order, then a fresh picture.
+  function actOnScreen(id, body) {
+    inputs = inputs.then(() => api("/api/tasks/" + id + "/input", body)).then((r) => { if (r && r.error && $("result")) $("result").innerHTML = `<div class="error">${esc(r.error)}</div>`; setTimeout(() => showScreen(id), 250); }).catch(() => {});
   }
 
   // The "new task" form: your projects and agents, from agentd.
@@ -326,6 +353,16 @@
   $("spend-open").addEventListener("click", () => { spendOpen = !spendOpen; refresh(); });
 
   document.addEventListener("click", async (ev) => {
+    const box = ev.target.closest("#screenbox");
+    if (box && takeover === box.dataset.id && ev.target.tagName === "IMG") {
+      const r = ev.target.getBoundingClientRect();
+      const x = Math.round(((ev.clientX - r.left) / r.width) * Number(box.dataset.w));
+      const y = Math.round(((ev.clientY - r.top) / r.height) * Number(box.dataset.h));
+      box.focus(); actOnScreen(box.dataset.id, { kind: "click", x, y, button: 1 });
+      return;
+    }
+    const t = ev.target.closest("button[data-takeover]");
+    if (t) { takeover = takeover === t.dataset.takeover ? null : t.dataset.takeover; loadDetail(t.dataset.takeover); if (takeover) setTimeout(() => $("screenbox") && $("screenbox").focus(), 50); return; }
     const b = ev.target.closest("button");
     if (b && b.dataset.new === "close") { $("new").innerHTML = ""; return; }
     if (b && b.dataset.new === "start") return startTask(b);
@@ -380,6 +417,22 @@
     const card = ev.target.closest(".task");
     if (card && !ev.target.closest("#detail")) { openTask = openTask === card.dataset.id ? null : card.dataset.id; renderTasks(lastTasks); }
   });
+
+  // At the screen, the keyboard goes to the task.
+  const KEYS = { Enter: "Return", Backspace: "BackSpace", Delete: "Delete", Tab: "Tab", Escape: "Escape", ArrowUp: "Up", ArrowDown: "Down",
+                 ArrowLeft: "Left", ArrowRight: "Right", Home: "Home", End: "End", PageUp: "Prior", PageDown: "Next", " ": "space" };
+  document.addEventListener("keydown", (ev) => {
+    const box = ev.target.closest && ev.target.closest("#screenbox");
+    if (!box || takeover !== box.dataset.id || ev.metaKey) return;
+    const named = KEYS[ev.key] || (/^F([1-9]|1[0-2])$/.test(ev.key) ? ev.key : null);
+    const mods = [ev.ctrlKey && "ctrl", ev.altKey && "alt", (ev.shiftKey && (named || ev.ctrlKey || ev.altKey)) && "shift"].filter(Boolean);
+    if (ev.key.length === 1 && !ev.ctrlKey && !ev.altKey) actOnScreen(box.dataset.id, { kind: "type", text: ev.key });
+    else if (named || (ev.key.length === 1 && /^[A-Za-z0-9]$/.test(ev.key))) actOnScreen(box.dataset.id, { kind: "key", key: [...mods, named || ev.key.toLowerCase()].join("+") });
+    else return;
+    ev.preventDefault();
+  });
+  // A running task's screen moves faster than the rest of the page.
+  setInterval(() => { if (openTask && $("screenbox") && document.visibilityState === "visible") showScreen(openTask); }, 1000);
 
   // A fresh link from `agent serve` opened in this same tab.
   window.addEventListener("hashchange", () => {

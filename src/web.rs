@@ -88,16 +88,18 @@ fn request_parts(req: &Request) -> Parts {
 enum Reply {
     Html(&'static str),
     Json(u16, Value),
+    Png(Vec<u8>),
 }
 
 fn respond(req: Request, reply: Reply) -> std::io::Result<()> {
     let (status, body, kind) = match reply {
-        Reply::Html(html) => (200, html.to_string(), "text/html; charset=utf-8"),
-        Reply::Json(status, value) => (status, value.to_string(), "application/json"),
+        Reply::Html(html) => (200, html.as_bytes().to_vec(), "text/html; charset=utf-8"),
+        Reply::Json(status, value) => (status, value.to_string().into_bytes(), "application/json"),
+        Reply::Png(png) => (200, png, "image/png"),
     };
     let header = Header::from_bytes("Content-Type", kind).expect("static header");
     let nocache = Header::from_bytes("Cache-Control", "no-store").expect("static header");
-    req.respond(Response::from_string(body).with_status_code(StatusCode(status)).with_header(header).with_header(nocache))
+    req.respond(Response::from_data(body).with_status_code(StatusCode(status)).with_header(header).with_header(nocache))
 }
 
 /// Who is asking: you (agentd's own token), or someone you gave a token and a role.
@@ -119,7 +121,7 @@ impl Who {
 fn needs(method: &Method, segments: &[&str]) -> Role {
     match (method, segments) {
         (Method::Get, _) => Role::Viewer,
-        (Method::Post, ["api", "approvals", _]) | (Method::Post, ["api", "tasks", _, "stop" | "revoke"]) => Role::Approver,
+        (Method::Post, ["api", "approvals", _]) | (Method::Post, ["api", "tasks", _, "stop" | "revoke" | "input"]) => Role::Approver,
         _ => Role::Admin,
     }
 }
@@ -155,6 +157,13 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         _ => None,
     };
     let body_for_note = parts.body.clone();
+    // A picture, not JSON: what a task's screen shows (as it is now, or as it ended).
+    if let (Method::Get, ["api", "tasks", id, "screen.png"]) = (&parts.method, segments.as_slice()) {
+        return match screen(&store, id, &parts.query) {
+            Ok(png) => Reply::Png(png),
+            Err(e) => Reply::Json(404, json!({ "error": format!("{e:#}") })),
+        };
+    }
     let result = match (&parts.method, segments.as_slice()) {
         (Method::Get, ["api", "whoami"]) => Ok(json!({ "name": who.name, "role": who.role.name(), "owner": who.owner })),
         (Method::Get, ["api", "tasks"]) => tasks(&store),
@@ -165,6 +174,7 @@ fn handle_request(mut parts: Parts, root: &PathBuf, token: &str) -> Reply {
         (Method::Post, ["api", "tasks", id, "raise"]) => raise_task(&store, id, &parts.body),
         (Method::Get, ["api", "spend"]) => spend(&store),
         (Method::Post, ["api", "spend", "raise"]) => raise_shared(&store, &parts.body),
+        (Method::Post, ["api", "tasks", id, "input"]) => input(&store, id, &parts.body, &who),
         (Method::Post, ["api", "tasks", id, action]) if ["commit", "push", "rollback", "stop"].contains(action) => run_cli(&store, action, id),
         (Method::Get, ["api", "approvals"]) => {
             // A task that ended while asking leaves its question behind.
@@ -227,6 +237,9 @@ fn task_json(t: &Task) -> Value {
         "changes": summary,
         "pushes": pushes,
         "calls": calls,
+        "screen": agentos::display::info(&t.dir)
+            .filter(|_| agentos::display::is_up(&t.dir) || t.dir.join(agentos::display::FINAL).is_file())
+            .map(|i| json!({ "width": i.width, "height": i.height, "live": t.is_live() && agentos::display::is_up(&t.dir) })),
     })
 }
 
@@ -332,6 +345,43 @@ struct Start {
 
 /// Starts `agent do --bg` in one of your projects, exactly as from a
 /// terminal there. Returns the task's id.
+/// What a task's screen shows: live while it runs, else the picture it left.
+/// `?w=N` brings it down to N pixels wide (live pictures only).
+fn screen(store: &Store, id: &str, query: &str) -> Result<Vec<u8>> {
+    let t = store.resolve(Some(id))?;
+    let width = query.split('&').find_map(|kv| kv.strip_prefix("w=")).and_then(|v| v.parse::<u32>().ok()).map(|w| w.clamp(160, 3840));
+    if t.is_live() && agentos::display::is_up(&t.dir) {
+        return agentos::display::screenshot_file(&t.dir.join("fb/Xvfb_screen0"), width);
+    }
+    fs::read(t.dir.join(agentos::display::FINAL)).with_context(|| format!("task {} has no screen", t.id()))
+}
+
+/// A person acting on a running task's screen: a click, a key, some typing.
+/// The text typed is never journaled, only that something was.
+fn input(store: &Store, id: &str, body: &str, who: &Who) -> Result<Value> {
+    use agentos::display::Input;
+    let t = store.resolve(Some(id))?;
+    if !t.is_live() || !agentos::display::is_up(&t.dir) {
+        bail!("task {} has no screen up: it isn't running, or wasn't started with --display", t.id());
+    }
+    let v: Value = serde_json::from_str(body).context("expected {kind: click|key|type, …}")?;
+    let num = |k: &str| v[k].as_u64().and_then(|n| u32::try_from(n).ok());
+    let action = match v["kind"].as_str() {
+        Some("click") => Input::Click { x: num("x").context("click needs x")?, y: num("y").context("click needs y")?, button: num("button").unwrap_or(1) },
+        Some("key") => Input::Key(v["key"].as_str().context("key needs {key}")?.to_string()),
+        Some("type") => Input::Type(v["text"].as_str().context("type needs {text}")?.to_string()),
+        _ => bail!("kind is click, key or type"),
+    };
+    agentos::display::act(&t.dir, &action)?;
+    let what = match &action {
+        Input::Click { x, y, button } => json!({ "kind": "click", "x": x, "y": y, "button": button }),
+        Input::Key(key) => json!({ "kind": "key", "key": key }),
+        Input::Type(text) => json!({ "kind": "type", "characters": text.chars().count() }),
+    };
+    let _ = t.journal().append("display.input", json!({ "by": who.name, "input": what }));
+    Ok(json!({ "ok": true }))
+}
+
 fn article(role: Role) -> &'static str {
     if role == Role::Viewer { "a" } else { "an" }
 }

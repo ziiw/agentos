@@ -48,6 +48,26 @@ reset_proj() {
 }
 
 latest_task_dir() { ls -td "$AGENTOS_HOME"/tasks/*/ | head -1; }
+# Reads a PNG made by `agent screen`: prints "WIDTH HEIGHT NONZERO-BYTES".
+png_info() {
+  [ -f "$WORK/png-info.py" ] || cat > "$WORK/png-info.py" <<'PY'
+import struct, sys, zlib
+d = open(sys.argv[1], "rb").read() if sys.argv[1] != "-" else sys.stdin.buffer.read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+i, idat, w, h = 8, b"", 0, 0
+while i < len(d):
+    n = struct.unpack(">I", d[i:i + 4])[0]
+    kind, body = d[i + 4:i + 8], d[i + 8:i + 8 + n]
+    assert zlib.crc32(d[i + 4:i + 8 + n]) == struct.unpack(">I", d[i + 8 + n:i + 12 + n])[0], "bad checksum"
+    if kind == b"IHDR": w, h = struct.unpack(">II", body[:8])
+    if kind == b"IDAT": idat += body
+    i += 12 + n
+raw = zlib.decompress(idat)
+assert len(raw) == h * (1 + 3 * w), "wrong amount of pixels"
+print(w, h, sum(1 for b in raw if b))
+PY
+  python3 "$WORK/png-info.py" "$@"
+}
 
 section "doctor"
 check "agent doctor passes" "$AGENT" doctor
@@ -327,23 +347,6 @@ section "a screen of its own (--display)"
 reset_proj
 cd "$PROJ"
 if command -v Xvfb >/dev/null && command -v xmessage >/dev/null && command -v xwininfo >/dev/null && command -v python3 >/dev/null; then
-  # Reads a PNG made by `agent screen`: prints "WIDTH HEIGHT NONZERO-BYTES".
-  cat > "$WORK/png-info.py" <<'PY'
-import struct, sys, zlib
-d = open(sys.argv[1], "rb").read() if sys.argv[1] != "-" else sys.stdin.buffer.read()
-assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
-i, idat, w, h = 8, b"", 0, 0
-while i < len(d):
-    n = struct.unpack(">I", d[i:i + 4])[0]
-    kind, body = d[i + 4:i + 8], d[i + 8:i + 8 + n]
-    assert zlib.crc32(d[i + 4:i + 8 + n]) == struct.unpack(">I", d[i + 8 + n:i + 12 + n])[0], "bad checksum"
-    if kind == b"IHDR": w, h = struct.unpack(">II", body[:8])
-    if kind == b"IDAT": idat += body
-    i += 12 + n
-raw = zlib.decompress(idat)
-assert len(raw) == h * (1 + 3 * w), "wrong amount of pixels"
-print(w, h, sum(1 for b in raw if b))
-PY
   DRAW='echo "display=$DISPLAY auth=$XAUTHORITY"; xdpyinfo | grep dimensions; ls /tmp/.X11-unix; (xmessage -geometry +10+10 "hello from the agent" &); sleep 2; echo "windows=$(xwininfo -root -children | grep -c xmessage)"'
   out="$("$AGENT" run --display -- sh -c "$DRAW" 2>&1)"
   events="$(latest_task_dir)/events.jsonl"
@@ -356,10 +359,10 @@ PY
   check "...and journal that it ended with a picture" grep -q '"kind":"display.ended".*"screenshot":true' "$events"
   check "the screen ends with the task" bash -c '! pgrep -x Xvfb >/dev/null'
   "$AGENT" screen -o "$WORK/shot.png" >/dev/null 2>&1
-  info="$(python3 "$WORK/png-info.py" "$WORK/shot.png" 2>&1)"
+  info="$(png_info "$WORK/shot.png" 2>&1)"
   check "agent screen saves the last picture as a PNG of the right size" grep -Eq '^1280 800 ' <<<"$info"
   check "...with what the agent drew in it" test "$(cut -d' ' -f3 <<<"$info")" -gt 10000
-  check "agent screen -o - writes it to a pipe" grep -Eq '^1280 800 ' <<<"$("$AGENT" screen "$TASK" -o - | python3 "$WORK/png-info.py" - 2>&1)"
+  check "agent screen -o - writes it to a pipe" grep -Eq '^1280 800 ' <<<"$("$AGENT" screen "$TASK" -o - | png_info - 2>&1)"
   if command -v script >/dev/null; then
     check "...and not to a terminal" grep -q 'not for your terminal' <<<"$(script -qec "$AGENT screen -o -" /dev/null 2>&1)"
   fi
@@ -374,7 +377,7 @@ PY
   id="$("$AGENT" run --bg --display -- sh -c '(xmessage -geometry +10+10 "still here" &); sleep 12' 2>/dev/null | tail -1)"
   nonzero=0
   for _ in $(seq 40); do
-    "$AGENT" screen "$id" -o "$WORK/live.png" >/dev/null 2>&1 && nonzero="$(python3 "$WORK/png-info.py" "$WORK/live.png" 2>/dev/null | cut -d' ' -f3)"
+    "$AGENT" screen "$id" -o "$WORK/live.png" >/dev/null 2>&1 && nonzero="$(png_info "$WORK/live.png" 2>/dev/null | cut -d' ' -f3)"
     [ "${nonzero:-0}" -gt 10000 ] && break
     sleep 0.25
   done
@@ -384,6 +387,52 @@ PY
   "$AGENT" rollback >/dev/null 2>&1
 else
   skip "screens need Xvfb, xmessage and xwininfo (Debian, Ubuntu: apt install xvfb x11-utils)"
+fi
+
+section "the console shows a screen, and lets you act on it"
+reset_proj
+cd "$PROJ"
+if command -v Xvfb >/dev/null && command -v xev >/dev/null && command -v stdbuf >/dev/null && command -v xdotool >/dev/null && command -v python3 >/dev/null; then
+  start_agentd
+  as() { local t="$1"; shift; curl -sS -m 10 -H "Authorization: Bearer $t" "$@"; }
+  # How much of a picture isn't black (0 when it can't be fetched).
+  drawn() { as "$1" "$CONSOLE/api/tasks/$2/screen.png${3:-}" 2>/dev/null | png_info - 2>/dev/null | cut -d' ' -f3; }
+  tok() { sed -n 's/.*#token=\([0-9a-f]*\).*/\1/p'; }
+  WATCHER="$("$AGENT" users add vera --role viewer | tok)"
+  HELPER="$("$AGENT" users add alex --role approver | tok)"
+  # xev shows what the window is sent: the output of a background task is kept in its folder.
+  id="$("$AGENT" run --bg --display -- sh -c '(stdbuf -oL xev -geometry 300x200+0+0 -event button -event keyboard &); sleep 40' 2>/dev/null | tail -1)"
+  n=0
+  for _ in $(seq 60); do n="$(drawn "$TOKEN" "$id")"; [ "${n:-0}" -gt 10000 ] && break; sleep 0.25; done
+  check "the console serves a running task's screen as a PNG" test "${n:-0}" -gt 10000
+  check "...also scaled down, for a phone" test "$(as "$TOKEN" "$CONSOLE/api/tasks/$id/screen.png?w=320" | png_info - | cut -d' ' -f1)" -eq 320
+  check "...to a viewer too" test "$(drawn "$WATCHER" "$id")" -gt 10000
+  check "the task says it has a screen" grep -q '"screen":{"width":1280,"height":800,"live":true}' <<<"$(as "$TOKEN" "$CONSOLE/api/tasks/$id")"
+  "$AGENT" run -- true >/dev/null 2>&1
+  check "a task without one says nothing of the kind" grep -q '"screen":null' <<<"$(as "$TOKEN" "$CONSOLE/api/tasks" | tr -d ' ')"
+  check "the page offers to act on it" grep -q 'Act on it' <<<"$(curl -sS -m 10 "$CONSOLE/")"
+  OUT="$AGENTOS_HOME/tasks/$id/output.log"
+  check "a viewer can't act on the screen" test "$(as "$WATCHER" -o /dev/null -w '%{http_code}' -X POST -d '{"kind":"key","key":"Return"}' "$CONSOLE/api/tasks/$id/input")" = 403
+  check "a bad key name is refused" grep -q 'a key is a name like' <<<"$(as "$HELPER" -X POST -d '{"kind":"key","key":"Return; rm -rf"}' "$CONSOLE/api/tasks/$id/input")"
+  check "a click outside the screen is refused" grep -q 'outside the 1280x800 screen' <<<"$(as "$HELPER" -X POST -d '{"kind":"click","x":5000,"y":5}' "$CONSOLE/api/tasks/$id/input")"
+  waits() { for _ in $(seq 40); do grep -q "$1" "$OUT" 2>/dev/null && return 0; sleep 0.25; done; return 1; }
+  check "an approver clicks in the window: the program is sent a ButtonPress" bash -c 'curl -sS -m 10 -H "Authorization: Bearer $1" -X POST -d "{\"kind\":\"click\",\"x\":100,\"y\":100}" "$2/api/tasks/$3/input" | grep -q "\"ok\":true"' _ "$HELPER" "$CONSOLE" "$id"
+  check "...and the click arrives" waits ButtonPress
+  as "$HELPER" -X POST -d '{"kind":"key","key":"Return"}' "$CONSOLE/api/tasks/$id/input" >/dev/null
+  check "pressing Return arrives as that key" waits 'keysym 0xff0d, Return'
+  as "$HELPER" -X POST -d '{"kind":"type","text":"q"}' "$CONSOLE/api/tasks/$id/input" >/dev/null
+  check "typing arrives as the typed key" waits 'keysym 0x71, q'
+  check "what was done at the screen is journaled, by whom" grep -q '"kind":"display.input".*"by":"alex"' "$AGENTOS_HOME/tasks/$id/events.jsonl"
+  as "$HELPER" -X POST -d '{"kind":"type","text":"s3cret-typed-text"}' "$CONSOLE/api/tasks/$id/input" >/dev/null
+  check "...but never what was typed" bash -c "! grep -q s3cret-typed-text '$AGENTOS_HOME/tasks/$id/events.jsonl'"
+  "$AGENT" stop "$id" >/dev/null 2>&1; "$AGENT" wait "$id" >/dev/null 2>&1
+  check "after the task, its last picture is still served" test "$(drawn "$TOKEN" "$id")" -gt 10000
+  check "...and acting on it isn't possible any more" grep -q 'has no screen up' <<<"$(as "$TOKEN" -X POST -d '{"kind":"key","key":"Return"}' "$CONSOLE/api/tasks/$id/input")"
+  kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null
+  rm -f "$AGENTOS_HOME/users.json"
+  "$AGENT" rollback >/dev/null 2>&1
+else
+  skip "the console's screen needs Xvfb, xev, stdbuf and xdotool (Debian, Ubuntu: apt install xvfb x11-utils xdotool)"
 fi
 
 section "a corporate proxy (upstream)"

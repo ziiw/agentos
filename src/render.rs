@@ -592,6 +592,7 @@ fn describe(p: Paint, e: &Event) -> String {
             format!("signed receipt · key {} · head {} ({} events){witness}", s(&d["key"]), s(&d["head"]).chars().take(12).collect::<String>(), d["events"])
         }
         "task.display" => format!("a screen of its own: {}x{} (:{} here)", d["width"], d["height"], d["display"]),
+        "display.input" => format!("{} at its screen: {}", s(&d["by"]), d["input"]),
         "display.ended" => {
             if d["screenshot"].as_bool() == Some(true) { "its last screen is kept (agent screen)".to_string() } else { "no last screen was kept".to_string() }
         }

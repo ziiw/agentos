@@ -189,6 +189,8 @@ agent do --display "open the settings page and screenshot it"     # or --display
 agent screen                                                       # a PNG of what's on it now, or as the task left it
 ```
 
+agentd's console shows the screen live too, and lets you take over the mouse and keyboard (see below).
+
 The task gets a private X display. Xvfb (`apt install xvfb`, `dnf install xorg-x11-server-Xvfb`) runs outside the sandbox, started by agentos; the sandbox gets that one socket and a cookie, as `DISPLAY=:0`, and sees no other display of your machine. The server listens on neither the network nor an abstract socket, and shared memory isn't offered to clients (the sandbox has its own IPC namespace; they fall back to the plain protocol). The screen's framebuffer is a file in the task, so `agent screen` shows what's on it without going through the agent, while it runs, and the latest picture that had anything on it is kept when the task ends. `agent screen -o -` writes the PNG to a pipe. An agent file or a package can ask for a screen with `display = true` (and `display_size`).
 
 Browsers and other programs that build their own sandbox out of namespaces can't inside agentos's (new namespaces are denied): run them with their sandbox off, the way you would in a container. Wayland-only programs and GPU access aren't covered.
@@ -504,11 +506,12 @@ Questions from agents appear at the top with **Allow for this task / Always / De
 
   | role | may |
   |---|---|
-  | `viewer` | read tasks, diffs, journals and what agents are asking |
-  | `approver` | also answer questions, stop tasks, take back what an agent was given |
+  | `viewer` | read tasks, diffs, journals and what agents are asking, and watch a task's screen |
+  | `approver` | also answer questions, stop tasks, take back what an agent was given, act on a task's screen |
   | `admin` | also start tasks, commit, push, roll back and raise budgets |
 
   What a named person does to a task (an answer, a commit, a stop) is written into that task's journal under their name (`console.action`), and a task they start says who started it. `agent users` lists them, `agent users remove NAME` takes a token back at once. Put agentd on a private network (`--listen 0.0.0.0:7777` over Tailscale, say), not the open internet: it's a plain-HTTP console and the token is a bearer token. A viewer sees every task's diff and journal, so give that role the way you'd give read access to the repositories.
+- **A task with a screen** (`--display`) shows it in its card, refreshed every second, scaled to fit. **Act on it** hands you the mouse and keyboard: click on the picture and type, and your input goes to the task's screen as a person's would (through `xdotool`, which must be installed on the machine running agentd). It's for stepping in when an agent is stuck on a dialog; every click, key and typed run is journaled with your name, never the text you typed. A viewer can watch; acting needs an approver or you. Once the task has ended the card shows its last picture.
 - `--listen 0.0.0.0:7777` to reach it from your phone, ideally over a private network such as Tailscale. Every API call needs the token.
 - `--notify https://ntfy.sh/<your-topic>` sends a push notification for each new question (host and task title only, or which budget ran out), and when a task finishes, with what it left for review.
 
