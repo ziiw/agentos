@@ -1,3 +1,14 @@
+> 👋 This is a side project made for fun
+
+> I want to build a computer for agents.
+> For now it looks closely to a "Sandbox code exec"
+> If you look in details, it's quite different
+
+> The core is a custom made agent harness that wraps, agents.
+> Then all the good things a sandbox should have
+> And finally the `diff`, `commit`, `rollback`
+> You should try this it's quite fun
+
 # agentos
 
 Run AI agents with full autonomy, and undo anything.
